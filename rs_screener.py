@@ -191,7 +191,7 @@ def main():
     if not all_stocks:
         print("No stocks with sufficient data found.")
         results_df = pd.DataFrame(columns=[
-            "symbol", "rs_score", "rs_rating", "green_dot",
+            "symbol", "composite_score", "rs_score", "rs_rating", "blue_dot", "green_dot",
             "trend_template", "tt_criteria", "last_close"])
         write_to_sheet(results_df)
         return
@@ -202,23 +202,39 @@ def main():
     # scanned universe today -- this mirrors IBD's RS Rating scale.
     universe_df["rs_rating"] = (universe_df["rs_score"].rank(pct=True) * 98 + 1).round(0).astype(int)
 
-    # Final output = Blue Dot stocks only, enriched with Trend Template + RS Rating.
-    blue_dot_df = universe_df[universe_df["blue_dot"]].copy()
-    blue_dot_df["trend_template"] = blue_dot_df["tt_pass"].map(
+    # Composite Score (0-100) for the FULL universe: blends RS strength, trend
+    # structure, and breakout timing into one sortable number -- same weighted-
+    # composite spirit as your Nifty 750 system.
+    #   50% RS Rating          -- raw relative strength, the core signal
+    #   30% Trend Template     -- structural health (Minervini's MA/52wk criteria, /7)
+    #   20% Green Dot bonus    -- rewards RS leading price (only applies if Blue Dot fired)
+    universe_df["trend_template"] = universe_df["tt_pass"].map(
         {True: "PASS", False: "FAIL", None: "N/A"})
-    blue_dot_df["green_dot"] = blue_dot_df["green_dot"].map({True: "YES", False: ""})
-    blue_dot_df["tt_criteria"] = blue_dot_df["tt_criteria_met"].apply(
+    universe_df["blue_dot_label"] = universe_df["blue_dot"].map({True: "YES", False: ""})
+    universe_df["green_dot_label"] = universe_df["green_dot"].map({True: "YES", False: ""})
+    universe_df["tt_criteria"] = universe_df["tt_criteria_met"].apply(
         lambda x: f"{x}/7" if pd.notna(x) else "N/A")
 
-    results_df = blue_dot_df[[
-        "symbol", "rs_score", "rs_rating", "green_dot",
-        "trend_template", "tt_criteria", "last_close"
-    ]].sort_values("rs_score", ascending=False)
+    tt_component = (universe_df["tt_criteria_met"].fillna(0) / 7 * 100)
+    green_component = universe_df["green_dot_label"].map({"YES": 100, "": 0})
+    universe_df["composite_score"] = (
+        0.50 * universe_df["rs_rating"] +
+        0.30 * tt_component +
+        0.20 * green_component
+    ).round(1)
 
+    results_df = universe_df[[
+        "symbol", "composite_score", "rs_score", "rs_rating",
+        "blue_dot_label", "green_dot_label",
+        "trend_template", "tt_criteria", "last_close"
+    ]].rename(columns={"blue_dot_label": "blue_dot", "green_dot_label": "green_dot"})
+    results_df = results_df.sort_values("composite_score", ascending=False)
+
+    n_blue = (results_df["blue_dot"] == "YES").sum()
     n_green = (results_df["green_dot"] == "YES").sum()
     n_tt_pass = (results_df["trend_template"] == "PASS").sum()
-    print(f"Universe scanned: {len(universe_df)} stocks.")
-    print(f"Blue Dot: {len(results_df)} | Green Dot: {n_green} | Trend Template PASS: {n_tt_pass}")
+    print(f"Universe scanned: {len(universe_df)} stocks (all shown in output).")
+    print(f"Blue Dot: {n_blue} | Green Dot: {n_green} | Trend Template PASS: {n_tt_pass}")
 
     write_to_sheet(results_df)
 
@@ -237,18 +253,25 @@ def write_to_sheet(df):
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
 
+    n_rows_needed = len(df) + 10   # + buffer for header/timestamp rows
+    n_cols_needed = len(df.columns) + 2
+
     sh = gc.open_by_key(sheet_id)
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
+        # Resize up if your stock list has grown since the sheet was first created
+        if ws.row_count < n_rows_needed or ws.col_count < n_cols_needed:
+            ws.resize(rows=max(ws.row_count, n_rows_needed),
+                      cols=max(ws.col_count, n_cols_needed))
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=10)
+        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=n_rows_needed, cols=n_cols_needed)
 
     ws.clear()
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
     ws.update([[f"Last updated: {timestamp}"]], "A1")
-    header = ["Symbol", "RS Score", "RS Rating (1-99)", "Green Dot (Breakout Watch)",
-              "Trend Template", "TT Criteria Met", "Last Close"]
+    header = ["Symbol", "Composite Score", "RS Score", "RS Rating (1-99)", "Blue Dot",
+              "Green Dot (Breakout Watch)", "Trend Template", "TT Criteria Met", "Last Close"]
     ws.update([header] + df.values.tolist(), "A3")
     print("Google Sheet updated successfully.")
 
