@@ -28,7 +28,31 @@ CREDS_ENV = "GOOGLE_CREDENTIALS"  # GitHub secret name holding service account J
 WORKSHEET_NAME = "RS_Screener"
 MIN_PRICE = 10                 # filter: ignore penny stocks
 MIN_AVG_VOLUME = 10000         # filter: ignore illiquid stocks
+
+# ---- Portfolio construction (quant layer) ----
+TOP_N = 10                     # target portfolio size
+RANK_BUFFER = 20               # hold existing positions until they fall past this rank
+                                # (reduces whipsaw/charge drag vs re-ranking to exactly top 10 daily)
+BREADTH_RISK_ON = 60           # % of universe above 50DMA -> full-size new entries allowed
+BREADTH_RISK_CAUTION = 40      # % above 50DMA -> half-size / caution zone
+                                # below this -> no new entries, existing holdings still managed
+BREADTH_CIRCUIT_BREAKER = 25   # % above 50DMA -> full defensive exit, sell everything regardless of rank
+RS_HISTORY_DAYS = 90            # days of RS-line history to store for the sparkline chart
+HOLDINGS_WORKSHEET = "Holdings"
+PORTFOLIO_WORKSHEET = "Portfolio"
+CONFIG_WORKSHEET = "Config"
+RS_HISTORY_WORKSHEET = "RS_History"
+STOP_LOSS_PCT = 0.08           # 8% below entry as a hard floor (classic O'Neil stop)
 # -----------------------------------------
+
+
+def col_letter(n):
+    """Converts a 1-indexed column number to a spreadsheet column letter (1=A, 27=AA, etc.)."""
+    letters = ""
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
 
 
 def load_tickers():
@@ -173,6 +197,16 @@ def main():
                 blue_dot, green_dot = flags
                 tt_result = compute_trend_template(close)
 
+                sma50_latest = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
+                above_50dma = bool(close.iloc[-1] > sma50_latest) if pd.notna(sma50_latest) else None
+                sma50_value = round(float(sma50_latest), 2) if pd.notna(sma50_latest) else None
+
+                # RS ratio history for the sparkline chart (stock/benchmark, last N days)
+                aligned = pd.concat([close, bench_close], axis=1, join="inner").dropna()
+                aligned.columns = ["s", "b"]
+                rs_ratio_series = (aligned["s"] / aligned["b"]).tail(RS_HISTORY_DAYS)
+                rs_history = [round(float(v), 4) for v in rs_ratio_series.tolist()]
+
                 all_stocks.append({
                     "symbol": symbol.replace(".NS", ""),
                     "rs_score": rs_score,
@@ -181,6 +215,9 @@ def main():
                     "last_close": round(float(close.iloc[-1]), 2),
                     "tt_pass": tt_result[0] if tt_result else None,
                     "tt_criteria_met": tt_result[1] if tt_result else None,
+                    "above_50dma": above_50dma,
+                    "sma50": sma50_value,
+                    "rs_history": rs_history,
                 })
             except Exception as e:
                 print(f"Skipping {symbol}: {e}")
@@ -229,6 +266,8 @@ def main():
         "trend_template", "tt_criteria", "last_close"
     ]].rename(columns={"blue_dot_label": "blue_dot", "green_dot_label": "green_dot"})
     results_df = results_df.sort_values("composite_score", ascending=False)
+    results_df["rank"] = range(1, len(results_df) + 1)
+    results_df = results_df[["rank"] + [c for c in results_df.columns if c != "rank"]]
 
     n_blue = (results_df["blue_dot"] == "YES").sum()
     n_green = (results_df["green_dot"] == "YES").sum()
@@ -237,6 +276,254 @@ def main():
     print(f"Blue Dot: {n_blue} | Green Dot: {n_green} | Trend Template PASS: {n_tt_pass}")
 
     write_to_sheet(results_df)
+
+    # ---- Regime / breadth filter ----
+    valid_breadth = universe_df["above_50dma"].dropna()
+    breadth_pct = round(100 * valid_breadth.mean(), 1) if len(valid_breadth) else 0
+
+    if breadth_pct >= BREADTH_RISK_ON:
+        regime = "RISK-ON (full size)"
+        allow_new_entries = True
+    elif breadth_pct >= BREADTH_RISK_CAUTION:
+        regime = "CAUTION (half size)"
+        allow_new_entries = True
+    elif breadth_pct >= BREADTH_CIRCUIT_BREAKER:
+        regime = "RISK-OFF (no new entries)"
+        allow_new_entries = False
+    else:
+        regime = "CIRCUIT BREAKER (reduce to cash)"
+        allow_new_entries = False
+
+    circuit_breaker = breadth_pct < BREADTH_CIRCUIT_BREAKER
+    print(f"Breadth (% above 50DMA): {breadth_pct}% -> Regime: {regime}")
+
+    # ---- Portfolio construction: rank buffer + persistent holdings ----
+    sma50_lookup = dict(zip(universe_df["symbol"], universe_df["sma50"]))
+    rs_history_lookup = dict(zip(universe_df["symbol"], universe_df["rs_history"]))
+    build_portfolio(results_df, breadth_pct, regime, allow_new_entries, sma50_lookup,
+                     rs_history_lookup, circuit_breaker)
+
+
+def read_config(sh):
+    """Reads user-editable settings (available capital, etc.) from the Config tab.
+    Creates the tab with a default row if it doesn't exist yet -- edit the value
+    cell directly in Google Sheets to update your available investment fund."""
+    try:
+        cfg_ws = sh.worksheet(CONFIG_WORKSHEET)
+        records = cfg_ws.get_all_records()
+        settings = {row["Setting"]: row["Value"] for row in records if row.get("Setting")}
+    except gspread.WorksheetNotFound:
+        cfg_ws = sh.add_worksheet(title=CONFIG_WORKSHEET, rows=10, cols=3)
+        cfg_ws.update([
+            ["Setting", "Value", "Notes"],
+            ["Total Capital (INR)", 0, "EDIT ME: your available investment fund for this strategy"],
+        ], "A1")
+        settings = {"Total Capital (INR)": 0}
+
+    try:
+        capital = float(settings.get("Total Capital (INR)", 0) or 0)
+    except (ValueError, TypeError):
+        capital = 0
+    return capital
+
+
+def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_lookup,
+                     rs_history_lookup, circuit_breaker):
+    """
+    Reads current holdings + available capital, applies rank-buffer logic
+    (hold until rank falls past RANK_BUFFER, only add new names from top TOP_N
+    when a slot opens), sizes positions equal-weight (scaled by regime), tracks
+    entry price for real P&L, and computes a stop-loss level per position.
+    Writes everything to the 'Portfolio' tab.
+    """
+    sheet_id = os.environ.get(SHEET_ID_ENV)
+    creds_json = os.environ.get(CREDS_ENV)
+    if not sheet_id or not creds_json:
+        print("Missing SHEET_ID/GOOGLE_CREDENTIALS -- skipping portfolio construction.")
+        return
+
+    creds_dict = json.loads(creds_json)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(sheet_id)
+
+    capital = read_config(sh)
+
+    # Read current holdings: symbol, entry_price, entry_date
+    try:
+        holdings_ws = sh.worksheet(HOLDINGS_WORKSHEET)
+        existing = holdings_ws.get_all_records()
+        current_holdings = {
+            row["symbol"]: {"entry_price": float(row.get("entry_price") or 0),
+                             "entry_date": row.get("entry_date", "")}
+            for row in existing if row.get("symbol")
+        }
+    except gspread.WorksheetNotFound:
+        holdings_ws = sh.add_worksheet(title=HOLDINGS_WORKSHEET, rows=100, cols=5)
+        holdings_ws.update([["symbol", "entry_price", "entry_date"]], "A1")
+        current_holdings = {}
+
+    rank_lookup = dict(zip(ranked_df["symbol"], ranked_df["rank"]))
+    price_lookup = dict(zip(ranked_df["symbol"], ranked_df["last_close"]))
+
+    # Keep existing holdings whose rank hasn't fallen past the buffer.
+    # Circuit breaker overrides everything -- full defensive exit regardless of rank.
+    if circuit_breaker:
+        kept = []
+        sold = list(current_holdings.keys())
+    else:
+        kept = [s for s in current_holdings if rank_lookup.get(s, 9999) <= RANK_BUFFER]
+        sold = [s for s in current_holdings if s not in kept]
+
+    slots_open = TOP_N - len(kept)
+    new_adds = []
+    if allow_new_entries and slots_open > 0:
+        candidates = ranked_df[~ranked_df["symbol"].isin(kept)].sort_values("rank")
+        new_adds = candidates.head(slots_open)["symbol"].tolist()
+
+    final_holdings = kept + new_adds
+
+    # Position sizing: equal-weight across TOP_N, scaled down in caution regime
+    if regime.startswith("RISK-ON"):
+        size_multiplier = 1.0
+    elif regime.startswith("CAUTION"):
+        size_multiplier = 0.5
+    else:
+        size_multiplier = 0.0  # no new entries; existing holdings keep prior sizing
+    slot_capital = (capital / TOP_N) * size_multiplier if capital > 0 else 0
+
+    from datetime import datetime
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    rows = []
+    updated_holdings = {}
+    for s in final_holdings:
+        r = ranked_df[ranked_df["symbol"] == s].iloc[0]
+        current_price = price_lookup.get(s, 0)
+
+        if s in new_adds:
+            action = "BUY"
+            entry_price = current_price
+            entry_date = today_str
+            position_value = round(slot_capital, 0)
+        else:
+            action = "HOLD"
+            entry_price = current_holdings[s]["entry_price"] or current_price
+            entry_date = current_holdings[s]["entry_date"] or today_str
+            # Recompute an indicative position value at original entry sizing basis
+            position_value = round((capital / TOP_N), 0) if capital > 0 else 0
+
+        updated_holdings[s] = {"entry_price": entry_price, "entry_date": entry_date}
+
+        qty = int(position_value / entry_price) if entry_price > 0 else 0
+        pnl_pct = round(((current_price / entry_price) - 1) * 100, 2) if entry_price > 0 else 0
+
+        sma50_val = sma50_lookup.get(s)
+        stop_loss = None
+        if sma50_val:
+            stop_loss = round(max(sma50_val, entry_price * (1 - STOP_LOSS_PCT)), 2)
+        elif entry_price:
+            stop_loss = round(entry_price * (1 - STOP_LOSS_PCT), 2)
+
+        rows.append([
+            action, s, int(r["rank"]), r["composite_score"],
+            entry_price, entry_date, current_price, qty, position_value,
+            f"{pnl_pct}%", stop_loss,
+            r["blue_dot"], r["green_dot"], r["trend_template"]
+        ])
+
+    for s in sold:
+        entry_price = current_holdings[s]["entry_price"]
+        current_price = price_lookup.get(s, 0)
+        pnl_pct = round(((current_price / entry_price) - 1) * 100, 2) if entry_price > 0 else 0
+        rows.append([
+            "SELL", s, rank_lookup.get(s, "N/A"), "",
+            entry_price, current_holdings[s]["entry_date"], current_price, "", "",
+            f"{pnl_pct}%", "", "", "", ""
+        ])
+
+    try:
+        port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        port_ws = sh.add_worksheet(title=PORTFOLIO_WORKSHEET, rows=50, cols=15)
+
+    port_ws.clear()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
+    invested = sum(r[8] for r in rows if isinstance(r[8], (int, float)))
+    summary = (f"Last updated: {timestamp}  |  Breadth: {breadth_pct}%  |  Regime: {regime}  |  "
+               f"Capital: Rs.{capital:,.0f}  |  Deployed (approx): Rs.{invested:,.0f}")
+    if circuit_breaker:
+        summary = "*** CIRCUIT BREAKER TRIGGERED: REDUCE TO CASH ***  |  " + summary
+    if capital == 0:
+        summary += "  |  SET YOUR CAPITAL in the Config tab"
+    port_ws.update([[summary]], "A1")
+    header = ["Action", "Symbol", "Rank", "Composite Score", "Entry Price", "Entry Date",
+              "Current Price", "Qty", "Position Value (Rs)", "P&L %", "Stop-Loss",
+              "Blue Dot", "Green Dot", "Trend Template", "RS Line"]
+    # Add a blank placeholder for the RS Line column -- filled in separately below via
+    # a formula-mode update, since sparkline formulas need value_input_option='USER_ENTERED'.
+    rows_with_placeholder = [r + [""] for r in rows]
+    port_ws.update([header] + rows_with_placeholder, "A3")
+
+    # ---- RS Line sparkline: store history data + insert SPARKLINE() formulas ----
+    write_rs_history_and_sparklines(sh, rows, rs_history_lookup)
+
+    # Persist updated holdings state (with entry price/date) for next run
+    holdings_ws.clear()
+    holdings_rows = [["symbol", "entry_price", "entry_date"]] + [
+        [s, updated_holdings[s]["entry_price"], updated_holdings[s]["entry_date"]]
+        for s in final_holdings
+    ]
+    holdings_ws.update(holdings_rows, "A1")
+
+    print(f"Portfolio updated: {len(kept)} held, {len(new_adds)} bought, {len(sold)} sold. "
+          f"Capital: Rs.{capital:,.0f}")
+
+
+def write_rs_history_and_sparklines(sh, rows, rs_history_lookup):
+    """
+    Writes RS-ratio history (last RS_HISTORY_DAYS values) for every symbol in the
+    Portfolio tab into a dedicated RS_History tab, then inserts a SPARKLINE()
+    formula into the Portfolio tab's 'RS Line' column referencing that data --
+    giving you a mini RS-line chart inline in each row.
+    """
+    if not rows:
+        return
+
+    n_cols_needed = RS_HISTORY_DAYS + 2
+    n_rows_needed = len(rows) + 5
+    try:
+        hist_ws = sh.worksheet(RS_HISTORY_WORKSHEET)
+        if hist_ws.row_count < n_rows_needed or hist_ws.col_count < n_cols_needed:
+            hist_ws.resize(rows=max(hist_ws.row_count, n_rows_needed),
+                            cols=max(hist_ws.col_count, n_cols_needed))
+    except gspread.WorksheetNotFound:
+        hist_ws = sh.add_worksheet(title=RS_HISTORY_WORKSHEET, rows=n_rows_needed, cols=n_cols_needed)
+
+    hist_header = ["symbol"] + [f"d-{RS_HISTORY_DAYS - 1 - i}" for i in range(RS_HISTORY_DAYS)]
+    hist_rows = []
+    for r in rows:
+        symbol = r[1]
+        history = rs_history_lookup.get(symbol, [])
+        # pad on the left if a symbol has less than RS_HISTORY_DAYS of data
+        padded = [""] * (RS_HISTORY_DAYS - len(history)) + history
+        hist_rows.append([symbol] + padded)
+
+    hist_ws.clear()
+    hist_ws.update([hist_header] + hist_rows, "A1")
+
+    # Insert SPARKLINE formulas into the Portfolio tab's RS Line column (column O)
+    last_col_letter = col_letter(1 + RS_HISTORY_DAYS)  # data spans B..this column
+    port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
+    formulas = []
+    for i in range(len(rows)):
+        hist_row = i + 2  # RS_History data starts at row 2 (row 1 is header)
+        formulas.append([f"=SPARKLINE('RS_History'!B{hist_row}:{last_col_letter}{hist_row})"])
+
+    first_port_row = 4  # Portfolio data starts at row 4 (row 3 is header, row 1 is summary)
+    last_port_row = first_port_row + len(rows) - 1
+    port_ws.update(f"O{first_port_row}:O{last_port_row}", formulas, value_input_option="USER_ENTERED")
 
 
 def write_to_sheet(df):
