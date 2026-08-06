@@ -93,13 +93,55 @@ def compute_flags(stock_close, bench_close):
     return blue_dot, green_dot
 
 
+def compute_trend_template(close_series):
+    """
+    Mark Minervini's 8-point Trend Template.
+    Returns (pass_bool, criteria_met_count_out_of_8) or None if insufficient history.
+    Needs at least 252 + 20 trading days of data (52-week high/low + 200DMA slope check).
+    """
+    if len(close_series) < 273:
+        return None
+
+    price = close_series.iloc[-1]
+    sma50 = close_series.rolling(50).mean().iloc[-1]
+    sma150 = close_series.rolling(150).mean().iloc[-1]
+    sma200_series = close_series.rolling(200).mean()
+    sma200 = sma200_series.iloc[-1]
+    sma200_1mo_ago = sma200_series.iloc[-21]  # ~1 month of trading days back
+
+    if any(pd.isna(x) for x in [sma50, sma150, sma200, sma200_1mo_ago]):
+        return None
+
+    low_52w = close_series.tail(252).min()
+    high_52w = close_series.tail(252).max()
+
+    criteria = [
+        price > sma150 and price > sma200,                      # 1
+        sma150 > sma200,                                          # 2
+        sma200 > sma200_1mo_ago,                                  # 3: 200DMA trending up
+        sma50 > sma150 and sma50 > sma200,                        # 4
+        price > sma50,                                            # 5
+        price >= 1.25 * low_52w,                                  # 6: at least 25% above 52wk low
+        price >= 0.75 * high_52w,                                 # 7: within 25% of 52wk high
+    ]
+    # 8th IBD criterion (RS Rating >= 70) is applied separately using the full-universe
+    # percentile rank, since it requires comparing against all other scanned stocks.
+    met = sum(criteria)
+    passed = met == len(criteria)
+    return passed, met
+
+
 def main():
     tickers = load_tickers()
     print(f"Loaded {len(tickers)} tickers.")
 
     bench_close = download_benchmark()
 
-    results = []
+    # First pass: collect RS Score + Trend Template data for the WHOLE universe.
+    # We need the full universe's RS scores to compute IBD-style RS Rating percentiles
+    # (RS Rating >=70 = Minervini's 8th criterion), which only makes sense relative
+    # to everyone else scanned, not any single stock in isolation.
+    all_stocks = []
     batch_size = 50
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
@@ -114,10 +156,7 @@ def main():
 
         for symbol in batch:
             try:
-                if len(batch) == 1:
-                    sdata = data
-                else:
-                    sdata = data[symbol]
+                sdata = data if len(batch) == 1 else data[symbol]
                 close = sdata["Close"].dropna()
                 volume = sdata["Volume"].dropna()
                 if close.empty or len(close) < LOOKBACK_DAYS + 2:
@@ -132,28 +171,54 @@ def main():
                 if rs_score is None or flags is None:
                     continue
                 blue_dot, green_dot = flags
+                tt_result = compute_trend_template(close)
 
-                if blue_dot:  # only keep stocks that made an RS new high today
-                    results.append({
-                        "symbol": symbol.replace(".NS", ""),
-                        "rs_score": rs_score,
-                        "blue_dot": "YES",
-                        "green_dot": "YES" if green_dot else "",
-                        "last_close": round(float(close.iloc[-1]), 2),
-                    })
+                all_stocks.append({
+                    "symbol": symbol.replace(".NS", ""),
+                    "rs_score": rs_score,
+                    "blue_dot": blue_dot,
+                    "green_dot": green_dot,
+                    "last_close": round(float(close.iloc[-1]), 2),
+                    "tt_pass": tt_result[0] if tt_result else None,
+                    "tt_criteria_met": tt_result[1] if tt_result else None,
+                })
             except Exception as e:
                 print(f"Skipping {symbol}: {e}")
                 continue
 
         time.sleep(1)  # be polite to Yahoo's servers
 
-    if not results:
-        print("No RS new-high stocks found today.")
-        results_df = pd.DataFrame(columns=["symbol", "rs_score", "blue_dot", "green_dot", "last_close"])
-    else:
-        results_df = pd.DataFrame(results).sort_values("rs_score", ascending=False)
+    if not all_stocks:
+        print("No stocks with sufficient data found.")
+        results_df = pd.DataFrame(columns=[
+            "symbol", "rs_score", "rs_rating", "green_dot",
+            "trend_template", "tt_criteria", "last_close"])
+        write_to_sheet(results_df)
+        return
 
-    print(f"Found {len(results_df)} Blue Dot stocks ({(results_df['green_dot'] == 'YES').sum()} Green Dot).")
+    universe_df = pd.DataFrame(all_stocks)
+
+    # RS Rating: percentile rank (1-99) of each stock's RS Score across the whole
+    # scanned universe today -- this mirrors IBD's RS Rating scale.
+    universe_df["rs_rating"] = (universe_df["rs_score"].rank(pct=True) * 98 + 1).round(0).astype(int)
+
+    # Final output = Blue Dot stocks only, enriched with Trend Template + RS Rating.
+    blue_dot_df = universe_df[universe_df["blue_dot"]].copy()
+    blue_dot_df["trend_template"] = blue_dot_df["tt_pass"].map(
+        {True: "PASS", False: "FAIL", None: "N/A"})
+    blue_dot_df["green_dot"] = blue_dot_df["green_dot"].map({True: "YES", False: ""})
+    blue_dot_df["tt_criteria"] = blue_dot_df["tt_criteria_met"].apply(
+        lambda x: f"{x}/7" if pd.notna(x) else "N/A")
+
+    results_df = blue_dot_df[[
+        "symbol", "rs_score", "rs_rating", "green_dot",
+        "trend_template", "tt_criteria", "last_close"
+    ]].sort_values("rs_score", ascending=False)
+
+    n_green = (results_df["green_dot"] == "YES").sum()
+    n_tt_pass = (results_df["trend_template"] == "PASS").sum()
+    print(f"Universe scanned: {len(universe_df)} stocks.")
+    print(f"Blue Dot: {len(results_df)} | Green Dot: {n_green} | Trend Template PASS: {n_tt_pass}")
 
     write_to_sheet(results_df)
 
@@ -182,7 +247,8 @@ def write_to_sheet(df):
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
     ws.update([[f"Last updated: {timestamp}"]], "A1")
-    header = ["Symbol", "RS Score", "Blue Dot", "Green Dot (Breakout Watch)", "Last Close"]
+    header = ["Symbol", "RS Score", "RS Rating (1-99)", "Green Dot (Breakout Watch)",
+              "Trend Template", "TT Criteria Met", "Last Close"]
     ws.update([header] + df.values.tolist(), "A3")
     print("Google Sheet updated successfully.")
 
