@@ -38,12 +38,25 @@ BREADTH_RISK_CAUTION = 40      # % above 50DMA -> half-size / caution zone
                                 # below this -> no new entries, existing holdings still managed
 BREADTH_CIRCUIT_BREAKER = 25   # % above 50DMA -> full defensive exit, sell everything regardless of rank
 RS_HISTORY_DAYS = 90            # days of RS-line history to store for the sparkline chart
+INTRADAY_INTERVAL = "5m"        # granularity for live preview price
 HOLDINGS_WORKSHEET = "Holdings"
 PORTFOLIO_WORKSHEET = "Portfolio"
 CONFIG_WORKSHEET = "Config"
 RS_HISTORY_WORKSHEET = "RS_History"
 STOP_LOSS_PCT = 0.08           # 8% below entry as a hard floor (classic O'Neil stop)
 # -----------------------------------------
+
+
+def get_run_mode():
+    """
+    GitHub Actions automatically sets GITHUB_EVENT_NAME for every run:
+      'schedule'         -> the automated 4:45 PM IST run, using final EOD prices
+      'workflow_dispatch' -> a manual 'Run workflow' click, treated as an intraday
+                             preview (doesn't touch Holdings/Portfolio, so nothing
+                             gets locked in on an unsettled price)
+    """
+    event = os.environ.get("GITHUB_EVENT_NAME", "manual")
+    return "EOD" if event == "schedule" else "PREVIEW"
 
 
 def col_letter(n):
@@ -62,17 +75,58 @@ def load_tickers():
     return [s if s.endswith(".NS") else s + ".NS" for s in symbols]
 
 
-def download_benchmark():
+def download_benchmark(run_mode):
     for tkr in (BENCHMARK, BENCHMARK_FALLBACK):
         try:
             data = yf.download(tkr, period=HISTORY_PERIOD, interval="1d",
                                 auto_adjust=True, progress=False)
             if not data.empty:
                 print(f"Benchmark loaded: {tkr}")
-                return data["Close"]
+                close = data["Close"]
+                if run_mode == "PREVIEW":
+                    live = fetch_intraday_last_price([tkr])
+                    close = append_preview_price(close, live.get(tkr))
+                return close
         except Exception as e:
             print(f"Benchmark {tkr} failed: {e}")
     raise RuntimeError("Could not download any benchmark index data.")
+
+
+def fetch_intraday_last_price(tickers):
+    """Batch-fetches today's latest available intraday price for a list of tickers.
+    Returns {ticker: last_price}. Used only in PREVIEW mode (manual runs before close)."""
+    prices = {}
+    try:
+        data = yf.download(tickers, period="1d", interval=INTRADAY_INTERVAL,
+                            progress=False, group_by="ticker", threads=True)
+        for tkr in tickers:
+            try:
+                sdata = data if len(tickers) == 1 else data[tkr]
+                last_valid = sdata["Close"].dropna()
+                if not last_valid.empty:
+                    prices[tkr] = float(last_valid.iloc[-1])
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Intraday batch fetch failed: {e}")
+    return prices
+
+
+def append_preview_price(close_series, live_price):
+    """Appends today's live intraday price as the latest point in a daily close
+    series, ONLY if today's date isn't already the last bar (avoids duplicating
+    a bar that yfinance may have already started forming)."""
+    if live_price is None:
+        return close_series
+    today = pd.Timestamp.now(tz=close_series.index.tz).normalize() if close_series.index.tz \
+        else pd.Timestamp.now().normalize()
+    last_date = close_series.index[-1].normalize()
+    if last_date == today:
+        updated = close_series.copy()
+        updated.iloc[-1] = live_price
+        return updated
+    new_point = pd.Series([live_price], index=[today])
+    return pd.concat([close_series, new_point])
 
 
 def compute_rs_score(close_series):
@@ -159,7 +213,11 @@ def main():
     tickers = load_tickers()
     print(f"Loaded {len(tickers)} tickers.")
 
-    bench_close = download_benchmark()
+    run_mode = get_run_mode()
+    print(f"Run mode: {run_mode}"
+          + (" (manual preview -- Holdings/Portfolio will NOT be updated)" if run_mode == "PREVIEW" else ""))
+
+    bench_close = download_benchmark(run_mode)
 
     # First pass: collect RS Score + Trend Template data for the WHOLE universe.
     # We need the full universe's RS scores to compute IBD-style RS Rating percentiles
@@ -178,6 +236,8 @@ def main():
             print(f"Batch download failed: {e}")
             continue
 
+        intraday_batch_prices = fetch_intraday_last_price(batch) if run_mode == "PREVIEW" else {}
+
         for symbol in batch:
             try:
                 sdata = data if len(batch) == 1 else data[symbol]
@@ -185,6 +245,8 @@ def main():
                 volume = sdata["Volume"].dropna()
                 if close.empty or len(close) < LOOKBACK_DAYS + 2:
                     continue
+                if run_mode == "PREVIEW":
+                    close = append_preview_price(close, intraday_batch_prices.get(symbol))
                 if close.iloc[-1] < MIN_PRICE:
                     continue
                 if volume.tail(20).mean() < MIN_AVG_VOLUME:
@@ -230,7 +292,7 @@ def main():
         results_df = pd.DataFrame(columns=[
             "symbol", "composite_score", "rs_score", "rs_rating", "blue_dot", "green_dot",
             "trend_template", "tt_criteria", "last_close"])
-        write_to_sheet(results_df)
+        write_to_sheet(results_df, run_mode)
         return
 
     universe_df = pd.DataFrame(all_stocks)
@@ -275,9 +337,14 @@ def main():
     print(f"Universe scanned: {len(universe_df)} stocks (all shown in output).")
     print(f"Blue Dot: {n_blue} | Green Dot: {n_green} | Trend Template PASS: {n_tt_pass}")
 
-    write_to_sheet(results_df)
+    write_to_sheet(results_df, run_mode)
 
-    # ---- Regime / breadth filter ----
+    if run_mode == "PREVIEW":
+        print("Preview mode: RS_Screener tab updated with live intraday prices. "
+              "Holdings/Portfolio left untouched -- nothing locked in on an unsettled price.")
+        return
+
+    # ---- Regime / breadth filter (EOD run only) ----
     valid_breadth = universe_df["above_50dma"].dropna()
     breadth_pct = round(100 * valid_breadth.mean(), 1) if len(valid_breadth) else 0
 
@@ -526,7 +593,7 @@ def write_rs_history_and_sparklines(sh, rows, rs_history_lookup):
     port_ws.update(f"O{first_port_row}:O{last_port_row}", formulas, value_input_option="USER_ENTERED")
 
 
-def write_to_sheet(df):
+def write_to_sheet(df, run_mode="EOD"):
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
     if not sheet_id or not creds_json:
@@ -556,7 +623,8 @@ def write_to_sheet(df):
     ws.clear()
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
-    ws.update([[f"Last updated: {timestamp}"]], "A1")
+    label = "PREVIEW (intraday, not final)" if run_mode == "PREVIEW" else "EOD FINAL"
+    ws.update([[f"Last updated: {timestamp}  |  {label}"]], "A1")
     header = ["Symbol", "Composite Score", "RS Score", "RS Rating (1-99)", "Blue Dot",
               "Green Dot (Breakout Watch)", "Trend Template", "TT Criteria Met", "Last Close"]
     ws.update([header] + df.values.tolist(), "A3")
