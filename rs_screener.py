@@ -39,6 +39,12 @@ BREADTH_RISK_CAUTION = 40      # % above 50DMA -> half-size / caution zone
 BREADTH_CIRCUIT_BREAKER = 25   # % above 50DMA -> full defensive exit, sell everything regardless of rank
 RS_HISTORY_DAYS = 90            # days of RS-line history to store for the sparkline chart
 INTRADAY_INTERVAL = "5m"        # granularity for live preview price
+
+# Must exactly match the ONE cron expression in daily_rs_screener.yml that you
+# want treated as the real end-of-day run (the only one that updates
+# Portfolio/Holdings). Any other scheduled time you add there automatically
+# runs as a PREVIEW scan instead -- no code change needed, just edit the YAML.
+EOD_CRON = "15 11 * * 1-5"      # 4:45 PM IST
 HOLDINGS_WORKSHEET = "Holdings"
 PORTFOLIO_WORKSHEET = "Portfolio"
 CONFIG_WORKSHEET = "Config"
@@ -57,14 +63,22 @@ PORTFOLIO_HEADER = [
 
 def get_run_mode():
     """
-    GitHub Actions automatically sets GITHUB_EVENT_NAME for every run:
-      'schedule'         -> the automated 4:45 PM IST run, using final EOD prices
-      'workflow_dispatch' -> a manual 'Run workflow' click, treated as an intraday
-                             preview (doesn't touch Holdings/Portfolio, so nothing
-                             gets locked in on an unsettled price)
+    Three ways this can run:
+      1) Scheduled, matching EOD_CRON       -> real EOD (updates Portfolio/Holdings)
+      2) Scheduled, any OTHER cron time     -> automatic PREVIEW (live prices,
+                                                ranking tab only, e.g. a midday check)
+      3) Manual 'workflow_dispatch' click   -> PREVIEW by default, or EOD if the
+                                                'force_eod' checkbox was ticked
+    This lets you add as many scan times as you like in the YAML -- only the
+    one matching EOD_CRON ever touches your real holdings.
     """
     event = os.environ.get("GITHUB_EVENT_NAME", "manual")
-    return "EOD" if event == "schedule" else "PREVIEW"
+    force_eod = os.environ.get("FORCE_EOD", "false").strip().lower() == "true"
+
+    if event == "schedule":
+        triggering_cron = os.environ.get("SCHEDULE_CRON", "").strip()
+        return "EOD" if triggering_cron == EOD_CRON else "PREVIEW"
+    return "EOD" if force_eod else "PREVIEW"
 
 
 def col_letter(n):
