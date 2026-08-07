@@ -31,8 +31,17 @@ MIN_AVG_VOLUME = 10000         # filter: ignore illiquid stocks
 
 # ---- Portfolio construction (quant layer) ----
 TOP_N = 10                     # target portfolio size
-RANK_BUFFER = 20               # hold existing positions until they fall past this rank
-                                # (reduces whipsaw/charge drag vs re-ranking to exactly top 10 daily)
+RANK_BUFFER = 20               # (unused when STRICT_DAILY_REBALANCE=True, see below)
+
+# Selection rule: Blue Dot (new RS high) + Trend Template PASS (strict, all 7
+# Minervini criteria), sorted by raw RS Score, top 10, rebalanced daily to
+# exact membership. NOTE: your own audit found daily rebalance costs ~24% of
+# gross returns to charges vs a rank-buffer approach -- this trades that off
+# deliberately for simplicity/discipline. Set False to restore the buffered
+# (lower-turnover) approach using Composite Score instead.
+STRICT_DAILY_REBALANCE = True
+REQUIRE_TREND_TEMPLATE_PASS = True
+SELECTION_SORT_METRIC = "rs_score"   # or "composite_score"
 BREADTH_RISK_ON = 60           # % of universe above 50DMA -> full-size new entries allowed
 BREADTH_RISK_CAUTION = 40      # % above 50DMA -> half-size / caution zone
                                 # below this -> no new entries, existing holdings still managed
@@ -541,23 +550,39 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
         holdings_ws.update([["symbol", "entry_price", "entry_date"]], "A1")
         current_holdings = {}
 
-    rank_lookup = dict(zip(ranked_df["symbol"], ranked_df["rank"]))
     price_lookup = dict(zip(ranked_df["symbol"], ranked_df["last_close"]))
 
-    # Circuit breaker overrides everything -- full defensive exit regardless of rank
-    if circuit_breaker:
-        kept = []
-        pending_sell = list(current_holdings.keys())
-    else:
-        kept = [s for s in current_holdings if rank_lookup.get(s, 9999) <= RANK_BUFFER]
-        pending_sell = [s for s in current_holdings if s not in kept]
+    if STRICT_DAILY_REBALANCE:
+        # Build today's target top-10: Blue Dot required, Trend Template PASS
+        # required (if enabled), sorted by the chosen metric, take top N.
+        pool = ranked_df[ranked_df["blue_dot"] == "YES"]
+        if REQUIRE_TREND_TEMPLATE_PASS:
+            pool = pool[pool["trend_template"] == "PASS"]
+        pool = pool.sort_values(SELECTION_SORT_METRIC, ascending=False)
+        target_symbols = pool.head(TOP_N)["symbol"].tolist()
 
-    slots_open = TOP_N - len(kept)
-    pending_buy = []
-    if allow_new_entries and slots_open > 0:
-        already_spoken_for = set(kept) | set(pending_sell)
-        candidates = ranked_df[~ranked_df["symbol"].isin(already_spoken_for)].sort_values("rank")
-        pending_buy = candidates.head(slots_open)["symbol"].tolist()
+        if circuit_breaker:
+            target_symbols = []  # full defensive exit overrides everything
+
+        kept = [s for s in current_holdings if s in target_symbols]
+        pending_sell = [s for s in current_holdings if s not in target_symbols]
+        pending_buy = [] if not allow_new_entries else \
+            [s for s in target_symbols if s not in current_holdings]
+    else:
+        rank_lookup = dict(zip(ranked_df["symbol"], ranked_df["rank"]))
+        if circuit_breaker:
+            kept = []
+            pending_sell = list(current_holdings.keys())
+        else:
+            kept = [s for s in current_holdings if rank_lookup.get(s, 9999) <= RANK_BUFFER]
+            pending_sell = [s for s in current_holdings if s not in kept]
+
+        slots_open = TOP_N - len(kept)
+        pending_buy = []
+        if allow_new_entries and slots_open > 0:
+            already_spoken_for = set(kept) | set(pending_sell)
+            candidates = ranked_df[~ranked_df["symbol"].isin(already_spoken_for)].sort_values("rank")
+            pending_buy = candidates.head(slots_open)["symbol"].tolist()
 
     if regime.startswith("RISK-ON"):
         size_multiplier = 1.0
