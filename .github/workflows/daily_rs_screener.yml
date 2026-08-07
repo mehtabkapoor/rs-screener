@@ -2,9 +2,32 @@ name: Daily RS Screener
 
 on:
   schedule:
-    # Runs at 11:15 UTC = 4:45 PM IST, Mon-Fri (after NSE close + settle time)
-    - cron: '15 11 * * 1-5'
-  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab to test
+    # ---- Add or edit as many scan times as you like below ----
+    # Format: 'MINUTE HOUR * * DAYS' in UTC. IST = UTC + 5:30.
+    # DAYS: 1-5 = Mon-Fri.
+    #
+    # The EOD_CRON value in rs_screener.py must exactly match ONE of these --
+    # that one becomes the real end-of-day run (updates Portfolio/Holdings).
+    # Every other time listed here runs as an automatic PREVIEW scan (updates
+    # the RS_Screener ranking tab with live prices, never touches Portfolio).
+    #
+    # Quick IST -> UTC reference:
+    #   9:30 AM IST  -> 04:00 UTC
+    #   12:00 PM IST -> 06:30 UTC
+    #   1:00 PM IST  -> 07:30 UTC
+    #   3:00 PM IST  -> 09:30 UTC
+    #   4:45 PM IST  -> 11:15 UTC   <-- designated EOD run (matches EOD_CRON below)
+    - cron: '15 11 * * 1-5'   # 4:45 PM IST -- EOD (real Portfolio/Holdings update)
+    # - cron: '00 06 * * 1-5'   # example: 11:30 AM IST -- automatic preview scan
+    # - cron: '30 09 * * 1-5'   # example: 3:00 PM IST  -- automatic preview scan
+
+  workflow_dispatch:
+    inputs:
+      force_eod:
+        description: 'Force real EOD mode (updates Portfolio/Holdings) instead of preview'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-screener:
@@ -25,4 +48,6 @@ jobs:
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          FORCE_EOD: ${{ inputs.force_eod }}
+          SCHEDULE_CRON: ${{ github.event.schedule }}
         run: python rs_screener.py
