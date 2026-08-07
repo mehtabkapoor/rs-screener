@@ -58,7 +58,7 @@ PORTFOLIO_HEADER = [
 def get_run_mode():
     """
     GitHub Actions automatically sets GITHUB_EVENT_NAME for every run:
-      'schedule'         -> the automated 2:47 PM IST run, using final EOD prices
+      'schedule'         -> the automated 4:45 PM IST run, using final EOD prices
       'workflow_dispatch' -> a manual 'Run workflow' click, treated as an intraday
                              preview (doesn't touch Holdings/Portfolio, so nothing
                              gets locked in on an unsettled price)
