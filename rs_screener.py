@@ -44,6 +44,14 @@ PORTFOLIO_WORKSHEET = "Portfolio"
 CONFIG_WORKSHEET = "Config"
 RS_HISTORY_WORKSHEET = "RS_History"
 STOP_LOSS_PCT = 0.08           # 8% below entry as a hard floor (classic O'Neil stop)
+
+# Canonical Portfolio tab column layout. Used for both writing and reading back
+# (so confirmed-execution parsing always matches what was written).
+PORTFOLIO_HEADER = [
+    "Action", "Executed", "Execution Price", "Symbol", "Rank", "Composite Score",
+    "Entry Price", "Entry Date", "Current Price", "Qty", "Position Value (Rs)",
+    "P&L %", "Stop-Loss", "Blue Dot", "Green Dot", "Trend Template", "RS Line",
+]
 # -----------------------------------------
 
 
@@ -290,7 +298,7 @@ def main():
     if not all_stocks:
         print("No stocks with sufficient data found.")
         results_df = pd.DataFrame(columns=[
-            "symbol", "composite_score", "rs_score", "rs_rating", "blue_dot", "green_dot",
+            "rank", "symbol", "composite_score", "rs_score", "rs_rating", "blue_dot", "green_dot",
             "trend_template", "tt_criteria", "last_close"])
         write_to_sheet(results_df, run_mode)
         return
@@ -394,14 +402,99 @@ def read_config(sh):
     return capital
 
 
+def apply_confirmed_executions(sh):
+    """
+    Reads the Portfolio tab as it stood BEFORE this run. Any BUY or SELL row
+    you marked Executed = Y (or YES) gets applied to Holdings now -- using the
+    Execution Price you typed in if provided, otherwise falling back to the
+    suggested price shown that day. This is the ONLY place Holdings ever
+    changes. A signal firing does NOT change Holdings by itself -- only your
+    explicit confirmation does.
+    """
+    try:
+        port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        return  # nothing to confirm on the very first run ever
+
+    try:
+        prior_rows = port_ws.get_all_records(head=3)  # header is on row 3
+    except Exception as e:
+        print(f"Could not read prior Portfolio tab for confirmations: {e}")
+        return
+
+    try:
+        holdings_ws = sh.worksheet(HOLDINGS_WORKSHEET)
+        existing = holdings_ws.get_all_records()
+        holdings = {
+            row["symbol"]: {"entry_price": float(row.get("entry_price") or 0),
+                             "entry_date": row.get("entry_date", "")}
+            for row in existing if row.get("symbol")
+        }
+    except gspread.WorksheetNotFound:
+        holdings_ws = sh.add_worksheet(title=HOLDINGS_WORKSHEET, rows=100, cols=5)
+        holdings_ws.update([["symbol", "entry_price", "entry_date"]], "A1")
+        holdings = {}
+
+    from datetime import datetime
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    changed = False
+
+    for row in prior_rows:
+        executed = str(row.get("Executed", "")).strip().upper()
+        if executed not in ("Y", "YES"):
+            continue
+        action = str(row.get("Action", "")).strip().upper()
+        symbol = str(row.get("Symbol", "")).strip()
+        if not symbol:
+            continue
+
+        if action == "BUY":
+            exec_price_raw = row.get("Execution Price") or row.get("Entry Price")
+            try:
+                exec_price = float(exec_price_raw)
+            except (ValueError, TypeError):
+                print(f"Skipping confirmed BUY for {symbol}: no valid price found.")
+                continue
+            holdings[symbol] = {"entry_price": exec_price, "entry_date": today_str}
+            changed = True
+            print(f"Confirmed BUY applied: {symbol} @ {exec_price}")
+
+        elif action == "SELL":
+            if symbol in holdings:
+                del holdings[symbol]
+                changed = True
+                print(f"Confirmed SELL applied: {symbol}")
+
+    if changed:
+        holdings_ws.clear()
+        rows_out = [["symbol", "entry_price", "entry_date"]] + [
+            [s, v["entry_price"], v["entry_date"]] for s, v in holdings.items()
+        ]
+        holdings_ws.update(rows_out, "A1")
+        print("Holdings updated based on your confirmed executions.")
+    else:
+        print("No confirmed executions found since last run (nothing marked Executed=Y).")
+
+
+def compute_stop_loss(sma50_val, entry_price):
+    """Stop-loss = the tighter of 50DMA or 8% below entry (classic O'Neil stop)."""
+    if sma50_val:
+        return round(max(sma50_val, entry_price * (1 - STOP_LOSS_PCT)), 2)
+    elif entry_price:
+        return round(entry_price * (1 - STOP_LOSS_PCT), 2)
+    return None
+
+
 def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_lookup,
                      rs_history_lookup, circuit_breaker):
     """
-    Reads current holdings + available capital, applies rank-buffer logic
-    (hold until rank falls past RANK_BUFFER, only add new names from top TOP_N
-    when a slot opens), sizes positions equal-weight (scaled by regime), tracks
-    entry price for real P&L, and computes a stop-loss level per position.
-    Writes everything to the 'Portfolio' tab.
+    Two-step model, so nothing gets locked in on an assumed price:
+      1) Apply any executions YOU confirmed since the last run (Executed=Y)
+         to Holdings -- see apply_confirmed_executions().
+      2) Compute today's suggestions (HOLD / pending BUY / pending SELL) off
+         the now-current Holdings, using rank buffer + regime + circuit breaker.
+    A pending BUY/SELL stays pending, reappearing each run, until you mark it
+    Executed=Y after actually trading in Kite.
     """
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
@@ -417,7 +510,10 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
 
     capital = read_config(sh)
 
-    # Read current holdings: symbol, entry_price, entry_date
+    # Step 1: apply anything you confirmed executed since the last run
+    apply_confirmed_executions(sh)
+
+    # Step 2: read Holdings fresh (now reflecting any confirmations just applied)
     try:
         holdings_ws = sh.worksheet(HOLDINGS_WORKSHEET)
         existing = holdings_ws.get_all_records()
@@ -434,126 +530,119 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
     rank_lookup = dict(zip(ranked_df["symbol"], ranked_df["rank"]))
     price_lookup = dict(zip(ranked_df["symbol"], ranked_df["last_close"]))
 
-    # Keep existing holdings whose rank hasn't fallen past the buffer.
-    # Circuit breaker overrides everything -- full defensive exit regardless of rank.
+    # Circuit breaker overrides everything -- full defensive exit regardless of rank
     if circuit_breaker:
         kept = []
-        sold = list(current_holdings.keys())
+        pending_sell = list(current_holdings.keys())
     else:
         kept = [s for s in current_holdings if rank_lookup.get(s, 9999) <= RANK_BUFFER]
-        sold = [s for s in current_holdings if s not in kept]
+        pending_sell = [s for s in current_holdings if s not in kept]
 
     slots_open = TOP_N - len(kept)
-    new_adds = []
+    pending_buy = []
     if allow_new_entries and slots_open > 0:
-        candidates = ranked_df[~ranked_df["symbol"].isin(kept)].sort_values("rank")
-        new_adds = candidates.head(slots_open)["symbol"].tolist()
+        already_spoken_for = set(kept) | set(pending_sell)
+        candidates = ranked_df[~ranked_df["symbol"].isin(already_spoken_for)].sort_values("rank")
+        pending_buy = candidates.head(slots_open)["symbol"].tolist()
 
-    final_holdings = kept + new_adds
-
-    # Position sizing: equal-weight across TOP_N, scaled down in caution regime
     if regime.startswith("RISK-ON"):
         size_multiplier = 1.0
     elif regime.startswith("CAUTION"):
         size_multiplier = 0.5
     else:
-        size_multiplier = 0.0  # no new entries; existing holdings keep prior sizing
+        size_multiplier = 0.0
     slot_capital = (capital / TOP_N) * size_multiplier if capital > 0 else 0
 
     from datetime import datetime
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    rows = []  # list of dicts, keyed by PORTFOLIO_HEADER column names
 
-    rows = []
-    updated_holdings = {}
-    for s in final_holdings:
+    # HOLD rows -- already-confirmed positions, no action needed from you
+    for s in kept:
         r = ranked_df[ranked_df["symbol"] == s].iloc[0]
+        entry_price = current_holdings[s]["entry_price"]
+        entry_date = current_holdings[s]["entry_date"]
         current_price = price_lookup.get(s, 0)
-
-        if s in new_adds:
-            action = "BUY"
-            entry_price = current_price
-            entry_date = today_str
-            position_value = round(slot_capital, 0)
-        else:
-            action = "HOLD"
-            entry_price = current_holdings[s]["entry_price"] or current_price
-            entry_date = current_holdings[s]["entry_date"] or today_str
-            # Recompute an indicative position value at original entry sizing basis
-            position_value = round((capital / TOP_N), 0) if capital > 0 else 0
-
-        updated_holdings[s] = {"entry_price": entry_price, "entry_date": entry_date}
-
+        position_value = round((capital / TOP_N), 0) if capital > 0 else 0
         qty = int(position_value / entry_price) if entry_price > 0 else 0
         pnl_pct = round(((current_price / entry_price) - 1) * 100, 2) if entry_price > 0 else 0
 
-        sma50_val = sma50_lookup.get(s)
-        stop_loss = None
-        if sma50_val:
-            stop_loss = round(max(sma50_val, entry_price * (1 - STOP_LOSS_PCT)), 2)
-        elif entry_price:
-            stop_loss = round(entry_price * (1 - STOP_LOSS_PCT), 2)
+        rows.append({
+            "Action": "HOLD", "Symbol": s, "Rank": int(r["rank"]),
+            "Composite Score": r["composite_score"],
+            "Entry Price": entry_price, "Entry Date": entry_date, "Current Price": current_price,
+            "Qty": qty, "Position Value (Rs)": position_value, "P&L %": f"{pnl_pct}%",
+            "Stop-Loss": compute_stop_loss(sma50_lookup.get(s), entry_price),
+            "Blue Dot": r["blue_dot"], "Green Dot": r["green_dot"],
+            "Trend Template": r["trend_template"],
+        })
 
-        rows.append([
-            action, s, int(r["rank"]), r["composite_score"],
-            entry_price, entry_date, current_price, qty, position_value,
-            f"{pnl_pct}%", stop_loss,
-            r["blue_dot"], r["green_dot"], r["trend_template"]
-        ])
+    # PENDING BUY -- suggestion only. Mark Executed=Y once you actually buy in Kite.
+    for s in pending_buy:
+        r = ranked_df[ranked_df["symbol"] == s].iloc[0]
+        current_price = price_lookup.get(s, 0)
+        position_value = round(slot_capital, 0)
+        qty = int(position_value / current_price) if current_price > 0 else 0
 
-    for s in sold:
+        rows.append({
+            "Action": "BUY", "Symbol": s, "Rank": int(r["rank"]),
+            "Composite Score": r["composite_score"],
+            "Entry Price": current_price, "Entry Date": "PENDING", "Current Price": current_price,
+            "Qty": qty, "Position Value (Rs)": position_value, "P&L %": "",
+            "Stop-Loss": compute_stop_loss(sma50_lookup.get(s), current_price),
+            "Blue Dot": r["blue_dot"], "Green Dot": r["green_dot"],
+            "Trend Template": r["trend_template"],
+        })
+
+    # PENDING SELL -- still technically held until you confirm the exit
+    for s in pending_sell:
         entry_price = current_holdings[s]["entry_price"]
         current_price = price_lookup.get(s, 0)
         pnl_pct = round(((current_price / entry_price) - 1) * 100, 2) if entry_price > 0 else 0
-        rows.append([
-            "SELL", s, rank_lookup.get(s, "N/A"), "",
-            entry_price, current_holdings[s]["entry_date"], current_price, "", "",
-            f"{pnl_pct}%", "", "", "", ""
-        ])
+        r_match = ranked_df[ranked_df["symbol"] == s]
+        rank_val = int(r_match.iloc[0]["rank"]) if not r_match.empty else "N/A"
+
+        rows.append({
+            "Action": "SELL", "Symbol": s, "Rank": rank_val, "Composite Score": "",
+            "Entry Price": entry_price, "Entry Date": current_holdings[s]["entry_date"],
+            "Current Price": current_price, "Qty": "", "Position Value (Rs)": "",
+            "P&L %": f"{pnl_pct}%", "Stop-Loss": "", "Blue Dot": "", "Green Dot": "",
+            "Trend Template": "",
+        })
 
     try:
         port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
     except gspread.WorksheetNotFound:
-        port_ws = sh.add_worksheet(title=PORTFOLIO_WORKSHEET, rows=50, cols=15)
+        port_ws = sh.add_worksheet(title=PORTFOLIO_WORKSHEET, rows=50, cols=len(PORTFOLIO_HEADER) + 2)
 
     port_ws.clear()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
-    invested = sum(r[8] for r in rows if isinstance(r[8], (int, float)))
+    invested = sum(r.get("Position Value (Rs)", 0) for r in rows
+                    if isinstance(r.get("Position Value (Rs)"), (int, float)))
     summary = (f"Last updated: {timestamp}  |  Breadth: {breadth_pct}%  |  Regime: {regime}  |  "
-               f"Capital: Rs.{capital:,.0f}  |  Deployed (approx): Rs.{invested:,.0f}")
+               f"Capital: Rs.{capital:,.0f}  |  Deployed (approx): Rs.{invested:,.0f}  |  "
+               f"Mark Executed=Y on BUY/SELL rows once you actually trade in Kite")
     if circuit_breaker:
         summary = "*** CIRCUIT BREAKER TRIGGERED: REDUCE TO CASH ***  |  " + summary
     if capital == 0:
         summary += "  |  SET YOUR CAPITAL in the Config tab"
     port_ws.update([[summary]], "A1")
-    header = ["Action", "Symbol", "Rank", "Composite Score", "Entry Price", "Entry Date",
-              "Current Price", "Qty", "Position Value (Rs)", "P&L %", "Stop-Loss",
-              "Blue Dot", "Green Dot", "Trend Template", "RS Line"]
-    # Add a blank placeholder for the RS Line column -- filled in separately below via
-    # a formula-mode update, since sparkline formulas need value_input_option='USER_ENTERED'.
-    rows_with_placeholder = [r + [""] for r in rows]
-    port_ws.update([header] + rows_with_placeholder, "A3")
 
-    # ---- RS Line sparkline: store history data + insert SPARKLINE() formulas ----
+    row_lists = [[r.get(col, "") for col in PORTFOLIO_HEADER] for r in rows]
+    port_ws.update([PORTFOLIO_HEADER] + row_lists, "A3")
+
+    # RS Line sparkline
     write_rs_history_and_sparklines(sh, rows, rs_history_lookup)
 
-    # Persist updated holdings state (with entry price/date) for next run
-    holdings_ws.clear()
-    holdings_rows = [["symbol", "entry_price", "entry_date"]] + [
-        [s, updated_holdings[s]["entry_price"], updated_holdings[s]["entry_date"]]
-        for s in final_holdings
-    ]
-    holdings_ws.update(holdings_rows, "A1")
-
-    print(f"Portfolio updated: {len(kept)} held, {len(new_adds)} bought, {len(sold)} sold. "
-          f"Capital: Rs.{capital:,.0f}")
+    print(f"Portfolio updated: {len(kept)} held, {len(pending_buy)} pending BUY, "
+          f"{len(pending_sell)} pending SELL awaiting your confirmation. Capital: Rs.{capital:,.0f}")
 
 
 def write_rs_history_and_sparklines(sh, rows, rs_history_lookup):
     """
     Writes RS-ratio history (last RS_HISTORY_DAYS values) for every symbol in the
     Portfolio tab into a dedicated RS_History tab, then inserts a SPARKLINE()
-    formula into the Portfolio tab's 'RS Line' column referencing that data --
-    giving you a mini RS-line chart inline in each row.
+    formula into the Portfolio tab's 'RS Line' column referencing that data.
+    `rows` is a list of dicts keyed by PORTFOLIO_HEADER column names.
     """
     if not rows:
         return
@@ -571,16 +660,14 @@ def write_rs_history_and_sparklines(sh, rows, rs_history_lookup):
     hist_header = ["symbol"] + [f"d-{RS_HISTORY_DAYS - 1 - i}" for i in range(RS_HISTORY_DAYS)]
     hist_rows = []
     for r in rows:
-        symbol = r[1]
+        symbol = r["Symbol"]
         history = rs_history_lookup.get(symbol, [])
-        # pad on the left if a symbol has less than RS_HISTORY_DAYS of data
         padded = [""] * (RS_HISTORY_DAYS - len(history)) + history
         hist_rows.append([symbol] + padded)
 
     hist_ws.clear()
     hist_ws.update([hist_header] + hist_rows, "A1")
 
-    # Insert SPARKLINE formulas into the Portfolio tab's RS Line column (column O)
     last_col_letter = col_letter(1 + RS_HISTORY_DAYS)  # data spans B..this column
     port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
     formulas = []
@@ -588,9 +675,11 @@ def write_rs_history_and_sparklines(sh, rows, rs_history_lookup):
         hist_row = i + 2  # RS_History data starts at row 2 (row 1 is header)
         formulas.append([f"=SPARKLINE('RS_History'!B{hist_row}:{last_col_letter}{hist_row})"])
 
+    rs_line_col = col_letter(len(PORTFOLIO_HEADER))  # RS Line is the last Portfolio column
     first_port_row = 4  # Portfolio data starts at row 4 (row 3 is header, row 1 is summary)
     last_port_row = first_port_row + len(rows) - 1
-    port_ws.update(f"O{first_port_row}:O{last_port_row}", formulas, value_input_option="USER_ENTERED")
+    port_ws.update(formulas, f"{rs_line_col}{first_port_row}:{rs_line_col}{last_port_row}",
+                   value_input_option="USER_ENTERED")
 
 
 def write_to_sheet(df, run_mode="EOD"):
@@ -625,7 +714,7 @@ def write_to_sheet(df, run_mode="EOD"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
     label = "PREVIEW (intraday, not final)" if run_mode == "PREVIEW" else "EOD FINAL"
     ws.update([[f"Last updated: {timestamp}  |  {label}"]], "A1")
-    header = ["Symbol", "Composite Score", "RS Score", "RS Rating (1-99)", "Blue Dot",
+    header = ["Rank", "Symbol", "Composite Score", "RS Score", "RS Rating (1-99)", "Blue Dot",
               "Green Dot (Breakout Watch)", "Trend Template", "TT Criteria Met", "Last Close"]
     ws.update([header] + df.values.tolist(), "A3")
     print("Google Sheet updated successfully.")
