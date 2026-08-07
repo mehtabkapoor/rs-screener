@@ -609,10 +609,15 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
             "Trend Template": "",
         })
 
+    n_port_rows_needed = len(rows) + 10
+    n_port_cols_needed = len(PORTFOLIO_HEADER) + 2
     try:
         port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
+        if port_ws.row_count < n_port_rows_needed or port_ws.col_count < n_port_cols_needed:
+            port_ws.resize(rows=max(port_ws.row_count, n_port_rows_needed),
+                            cols=max(port_ws.col_count, n_port_cols_needed))
     except gspread.WorksheetNotFound:
-        port_ws = sh.add_worksheet(title=PORTFOLIO_WORKSHEET, rows=50, cols=len(PORTFOLIO_HEADER) + 2)
+        port_ws = sh.add_worksheet(title=PORTFOLIO_WORKSHEET, rows=n_port_rows_needed, cols=n_port_cols_needed)
 
     port_ws.clear()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
