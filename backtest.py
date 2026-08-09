@@ -19,6 +19,10 @@ IMPORTANT CAVEATS (read before trusting the numbers):
   - Survivorship: uses your CURRENT stocks.csv list projected backward --
     any stock that was delisted/renamed within the window is simply missing,
     which can modestly overstate returns (a known, common backtest bias).
+  - Entry-day accounting: a stock bought today only starts contributing to
+    portfolio return from TOMORROW onward -- its overnight move on the day
+    you actually enter is correctly excluded, since you couldn't have
+    captured a move that already happened before your buy decision.
   - Look-ahead: none introduced -- every day's decision uses only data up to
     and including that day.
 """
@@ -188,7 +192,28 @@ def run_backtest():
         target_syms = {s for s, _, _ in target}
         target_prices = {s: p for s, _, p in target}
 
-        # Exit anything no longer in target
+        # Snapshot what was actually held BEFORE today's decisions -- only these
+        # stocks' overnight move counts toward today's return. A stock bought
+        # today (at today's close) can only start contributing from tomorrow;
+        # crediting it with today's already-happened move would be look-ahead.
+        held_before_today = set(holdings.keys())
+
+        # Daily portfolio return: equal-weight average of yesterday's holdings' return
+        if held_before_today:
+            rets = []
+            for sym in held_before_today:
+                df = all_signals[sym]
+                if date in df.index:
+                    idx = df.index.get_loc(date)
+                    if idx > 0:
+                        prev_price = df["price"].iloc[idx - 1]
+                        curr_price = df["price"].iloc[idx]
+                        if prev_price > 0:
+                            rets.append(curr_price / prev_price - 1)
+            if rets:
+                equity *= (1 + float(np.mean(rets)))
+
+        # Exit anything no longer in target (at today's close)
         for sym in list(holdings.keys()):
             if sym not in target_syms:
                 entry = holdings.pop(sym)
@@ -203,25 +228,10 @@ def run_backtest():
                     "days_held": (date - entry["entry_date"]).days,
                 })
 
-        # Enter new target names
+        # Enter new target names (at today's close -- starts contributing tomorrow)
         for sym in target_syms:
             if sym not in holdings:
                 holdings[sym] = {"entry_price": target_prices[sym], "entry_date": date}
-
-        # Daily portfolio return: equal-weight average of held stocks' day-over-day return
-        if holdings:
-            rets = []
-            for sym in holdings:
-                df = all_signals[sym]
-                if date in df.index:
-                    idx = df.index.get_loc(date)
-                    if idx > 0:
-                        prev_price = df["price"].iloc[idx - 1]
-                        curr_price = df["price"].iloc[idx]
-                        if prev_price > 0:
-                            rets.append(curr_price / prev_price - 1)
-            if rets:
-                equity *= (1 + float(np.mean(rets)))
 
         equity_curve.append({"date": date.strftime("%Y-%m-%d"), "equity": round(equity, 4),
                               "n_holdings": len(holdings)})
