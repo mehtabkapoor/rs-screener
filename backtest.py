@@ -1,1482 +1,1292 @@
 """
-===============================================================
-RS SCREENER BACKTEST — MODIFIABLE / PLUG-AND-PLAY
-===============================================================
+RS Screener Backtest
 
-ENTRY:
-    Blue Dot / RS New High
+EXACT LIVE SELECTION RULE:
+    Blue Dot (new 250-day RS high)
     +
-    Price Trend Template
+    Price Trend Template PASS (7/7)
     +
-    RS-Line Trend Template
+    RS Line Trend Template PASS (7/7)
     +
-    Rank by RS Score
+    Sort by raw RS Score
     +
-    Hold TOP_N stocks
+    Top 10
 
 EXIT:
     RS LINE < RS LINE 3-EMA
 
 IMPORTANT:
-    EXIT IS STATE-BASED, NOT CROSSOVER-BASED.
+    The RS exit is STATE-BASED, NOT CROSSOVER-BASED.
 
-    The rule is simply:
-
-        RS Line < 3 EMA of RS Line
+    Exit whenever:
+        RS Line < RS Line 3-EMA
 
     It does NOT require:
-        yesterday RS Line > EMA
+        Yesterday RS Line > EMA
         AND
-        today RS Line < EMA
+        Today RS Line < EMA
 
 EXECUTION:
-    Signals calculated using today's CLOSE.
-    With NEXT_OPEN execution, orders execute at
-    the following trading day's OPEN.
+    Existing backtest logic is retained:
+    decisions/signals are evaluated at today's close,
+    and exits are booked at today's close.
 
-REQUIRED INPUT COLUMNS:
+OUTPUT:
+    Full trade log + daily equity curve + summary stats
+    to the "Backtest" tab in Google Sheets.
 
-    date
-    symbol
-    open
-    high
-    low
-    close
-    rs_line
-    rs_score
-
-===============================================================
+IMPORTANT CAVEATS:
+    - No brokerage, STT, or slippage costs are modeled.
+    - Equal-weight daily-reset assumption.
+    - Uses current stocks.csv universe, so survivorship bias remains.
+    - Entry-day accounting excludes the move that occurred before entry.
+    - No look-ahead is introduced by the RS 3-EMA exit.
 """
 
-import os
+import time
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import yfinance as yf
+import gspread
+from google.oauth2.service_account import Credentials
+import json
+import os
 
 
-# =============================================================
-# CONFIGURATION — CHANGE PARAMETERS HERE
-# =============================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
-CONFIG = {
+BENCHMARK = "^CRSLDX"
+BENCHMARK_FALLBACK = "^NSEI"
 
-    # ---------------------------------------------------------
-    # DATA
-    # ---------------------------------------------------------
+LOOKBACK_DAYS = 250
 
-    "INPUT_FILE": "nse_daily_data.xlsx",
+DOWNLOAD_PERIOD = "24mo"
 
-    "INPUT_SHEET": 0,
+STOCKS_FILE = "stocks.csv"
 
-    "OUTPUT_FILE": "RS_Backtest_Output.xlsx",
+TOP_N = 10
 
+# ------------------------------------------------------------
+# RS LINE EXIT
+# ------------------------------------------------------------
+#
+# Exit whenever:
+#
+#     RS Line < RS Line 3-EMA
+#
+# NOT a crossover.
+#
+# ------------------------------------------------------------
 
-    # ---------------------------------------------------------
-    # BACKTEST PERIOD
-    # ---------------------------------------------------------
+RS_EXIT_EMA = 3
 
-    "START_DATE": "2025-04-01",
+# ------------------------------------------------------------
 
-    "END_DATE": "2026-08-07",
+BACKTEST_START = "2026-04-01"
 
+MIN_PRICE = 10
 
-    # ---------------------------------------------------------
-    # PORTFOLIO
-    # ---------------------------------------------------------
+MIN_AVG_VOLUME = 10000
 
-    "TOP_N": 10,
+SHEET_ID_ENV = "SHEET_ID"
 
-    "EQUAL_WEIGHT": True,
+CREDS_ENV = "GOOGLE_CREDENTIALS"
 
+BACKTEST_WORKSHEET = "Backtest"
 
-    # ---------------------------------------------------------
-    # ENTRY — RS NEW HIGH
-    # ---------------------------------------------------------
 
-    "RS_NEW_HIGH_LOOKBACK": 250,
+# ============================================================
+# LOAD TICKERS
+# ============================================================
 
-    # None = no minimum RS score
-    #
-    # Example:
-    # 70
-    # 80
-    # 90
+def load_tickers():
 
-    "MIN_RS_SCORE": None,
+    df = pd.read_csv(
+        STOCKS_FILE
+    )
 
+    symbols = (
+        df["symbol"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .tolist()
+    )
 
-    # ---------------------------------------------------------
-    # PRICE TREND TEMPLATE
-    # ---------------------------------------------------------
-
-    "PRICE_SMA_SHORT": 50,
-
-    "PRICE_SMA_MEDIUM": 150,
-
-    "PRICE_SMA_LONG": 200,
-
-    "PRICE_SMA_LONG_RISING_DAYS": 20,
-
-    "PRICE_52W_LOOKBACK": 252,
-
-    # Price must be at least this multiple
-    # of 52-week low.
-    #
-    # 1.30 = 30% above 52-week low
-
-    "MIN_ABOVE_52W_LOW": 1.30,
-
-    # Price must be within this percentage
-    # of 52-week high.
-    #
-    # 25 = within 25% of 52-week high
-
-    "MAX_BELOW_52W_HIGH_PCT": 25,
-
-
-    # ---------------------------------------------------------
-    # RS-LINE TREND TEMPLATE
-    # ---------------------------------------------------------
-
-    "RS_SMA_SHORT": 50,
-
-    "RS_SMA_MEDIUM": 150,
-
-    "RS_SMA_LONG": 200,
-
-    "RS_SMA_LONG_RISING_DAYS": 20,
-
-
-    # ---------------------------------------------------------
-    # EXIT
-    # ---------------------------------------------------------
-
-    # YOUR REQUEST:
-    #
-    # RS LINE < RS LINE 3-EMA
-
-    "RS_EXIT_EMA": 3,
-
-
-    # ---------------------------------------------------------
-    # EXECUTION
-    # ---------------------------------------------------------
-
-    # RECOMMENDED:
-    #
-    # Signal at today's close
-    # Execute at next trading day's open
-
-    "EXECUTION": "NEXT_OPEN",
-
-    # Alternative:
-    #
-    # "SAME_CLOSE"
-    #
-    # Do not use as the main result unless the signal
-    # is genuinely executable before that close.
-
-
-    # ---------------------------------------------------------
-    # TRANSACTION COSTS
-    # ---------------------------------------------------------
-
-    # Total trading cost per side.
-    #
-    # Example:
-    # 0.15 = 0.15%
-
-    "COST_PER_SIDE_PCT": 0.15,
-
-
-    # Additional slippage per side.
-    #
-    # Example:
-    # 0.05 = 0.05%
-
-    "SLIPPAGE_PER_SIDE_PCT": 0.05,
-
-
-    # ---------------------------------------------------------
-    # OUTPUT
-    # ---------------------------------------------------------
-
-    "PLOT_EQUITY_CURVE": True,
-
-    "MARK_HIGHER_HIGHS_LOWER_LOWS": True,
-
-}
-
-
-# =============================================================
-# LOAD DATA
-# =============================================================
-
-def load_data():
-
-    filename = CONFIG["INPUT_FILE"]
-
-    if not os.path.exists(filename):
-
-        raise FileNotFoundError(
-            "\nINPUT FILE NOT FOUND:\n"
-            f"{filename}\n\n"
-            "Put the raw market-data file in the same "
-            "folder as this Python script or change "
-            "INPUT_FILE in CONFIG."
-        )
-
-
-    extension = os.path.splitext(
-        filename
-    )[1].lower()
-
-
-    if extension == ".csv":
-
-        df = pd.read_csv(filename)
-
-
-    elif extension in [".xlsx", ".xls"]:
-
-        df = pd.read_excel(
-            filename,
-            sheet_name=CONFIG["INPUT_SHEET"]
-        )
-
-
-    else:
-
-        raise ValueError(
-            "Only CSV, XLSX and XLS files are supported."
-        )
-
-
-    # Normalize column names
-
-    df.columns = [
-        str(c).strip().lower()
-        for c in df.columns
+    return [
+        s if s.endswith(".NS")
+        else s + ".NS"
+        for s in symbols
     ]
 
 
-    required = [
-        "date",
-        "symbol",
-        "open",
-        "high",
-        "low",
-        "close",
-        "rs_line",
-        "rs_score",
-    ]
+# ============================================================
+# DOWNLOAD BENCHMARK
+# ============================================================
 
+def download_benchmark():
 
-    missing = [
-        c for c in required
-        if c not in df.columns
-    ]
-
-
-    if missing:
-
-        raise ValueError(
-            "\nMISSING REQUIRED COLUMNS:\n"
-            + "\n".join(missing)
-            + "\n\nRequired columns:\n"
-            + ", ".join(required)
-        )
-
-
-    # Dates
-
-    df["date"] = pd.to_datetime(
-        df["date"],
-        errors="coerce"
-    )
-
-
-    # Numbers
-
-    numeric_columns = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "rs_line",
-        "rs_score",
-    ]
-
-
-    for column in numeric_columns:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-
-    df = df.dropna(
-        subset=[
-            "date",
-            "symbol",
-            "close",
-            "rs_line",
-            "rs_score",
-        ]
-    )
-
-
-    # Sort
-
-    df = df.sort_values(
-        ["symbol", "date"]
-    )
-
-
-    # Remove duplicate stock/date rows
-
-    df = df.drop_duplicates(
-        subset=[
-            "symbol",
-            "date"
-        ],
-        keep="last"
-    )
-
-
-    return df.reset_index(drop=True)
-
-
-# =============================================================
-# CALCULATE INDICATORS
-# =============================================================
-
-def calculate_indicators(df):
-
-    output = []
-
-
-    for symbol, g in df.groupby(
-        "symbol",
-        sort=False
+    for tkr in (
+        BENCHMARK,
+        BENCHMARK_FALLBACK
     ):
 
-        g = g.copy()
+        try:
 
-        g = g.sort_values(
-            "date"
-        ).reset_index(drop=True)
-
-
-        # -----------------------------------------------------
-        # PRICE MOVING AVERAGES
-        # -----------------------------------------------------
-
-        g["sma50"] = (
-            g["close"]
-            .rolling(
-                CONFIG["PRICE_SMA_SHORT"]
-            )
-            .mean()
-        )
-
-
-        g["sma150"] = (
-            g["close"]
-            .rolling(
-                CONFIG["PRICE_SMA_MEDIUM"]
-            )
-            .mean()
-        )
-
-
-        g["sma200"] = (
-            g["close"]
-            .rolling(
-                CONFIG["PRICE_SMA_LONG"]
-            )
-            .mean()
-        )
-
-
-        # -----------------------------------------------------
-        # 200 SMA RISING
-        # -----------------------------------------------------
-
-        slope_days = CONFIG[
-            "PRICE_SMA_LONG_RISING_DAYS"
-        ]
-
-
-        g["sma200_previous"] = (
-            g["sma200"]
-            .shift(slope_days)
-        )
-
-
-        g["price_sma200_rising"] = (
-            g["sma200"]
-            >
-            g["sma200_previous"]
-        )
-
-
-        # -----------------------------------------------------
-        # 52-WEEK HIGH / LOW
-        # -----------------------------------------------------
-
-        lookback = CONFIG[
-            "PRICE_52W_LOOKBACK"
-        ]
-
-
-        g["high_52w"] = (
-            g["high"]
-            .rolling(lookback)
-            .max()
-        )
-
-
-        g["low_52w"] = (
-            g["low"]
-            .rolling(lookback)
-            .min()
-        )
-
-
-        # -----------------------------------------------------
-        # RS MOVING AVERAGES
-        # -----------------------------------------------------
-
-        g["rs_sma50"] = (
-            g["rs_line"]
-            .rolling(
-                CONFIG["RS_SMA_SHORT"]
-            )
-            .mean()
-        )
-
-
-        g["rs_sma150"] = (
-            g["rs_line"]
-            .rolling(
-                CONFIG["RS_SMA_MEDIUM"]
-            )
-            .mean()
-        )
-
-
-        g["rs_sma200"] = (
-            g["rs_line"]
-            .rolling(
-                CONFIG["RS_SMA_LONG"]
-            )
-            .mean()
-        )
-
-
-        # -----------------------------------------------------
-        # RS 200 SMA RISING
-        # -----------------------------------------------------
-
-        rs_slope_days = CONFIG[
-            "RS_SMA_LONG_RISING_DAYS"
-        ]
-
-
-        g["rs_sma200_previous"] = (
-            g["rs_sma200"]
-            .shift(rs_slope_days)
-        )
-
-
-        g["rs_sma200_rising"] = (
-            g["rs_sma200"]
-            >
-            g["rs_sma200_previous"]
-        )
-
-
-        # -----------------------------------------------------
-        # RS LINE 3-EMA
-        # -----------------------------------------------------
-
-        g["rs_exit_ema"] = (
-            g["rs_line"]
-            .ewm(
-                span=CONFIG["RS_EXIT_EMA"],
-                adjust=False
-            )
-            .mean()
-        )
-
-
-        # -----------------------------------------------------
-        # RS NEW HIGH / BLUE DOT
-        # -----------------------------------------------------
-        #
-        # Today's RS is compared against the
-        # PREVIOUS 250 trading days.
-        #
-        # shift(1) prevents today's RS value
-        # from being included in its own high.
-        #
-
-        rs_lookback = CONFIG[
-            "RS_NEW_HIGH_LOOKBACK"
-        ]
-
-
-        g["previous_rs_high"] = (
-            g["rs_line"]
-            .shift(1)
-            .rolling(
-                rs_lookback
-            )
-            .max()
-        )
-
-
-        g["blue_dot"] = (
-            g["rs_line"]
-            >
-            g["previous_rs_high"]
-        )
-
-
-        # -----------------------------------------------------
-        # PRICE TREND TEMPLATE
-        # -----------------------------------------------------
-
-        g["price_tt"] = (
-
-            # 1
-            (
-                g["close"]
-                >
-                g["sma50"]
+            data = yf.download(
+                tkr,
+                period=DOWNLOAD_PERIOD,
+                interval="1d",
+                auto_adjust=True,
+                progress=False
             )
 
-            &
+            if not data.empty:
 
-            # 2
-            (
-                g["close"]
-                >
-                g["sma150"]
-            )
-
-            &
-
-            # 3
-            (
-                g["close"]
-                >
-                g["sma200"]
-            )
-
-            &
-
-            # 4
-            (
-                g["sma50"]
-                >
-                g["sma150"]
-            )
-
-            &
-
-            # 5
-            (
-                g["sma150"]
-                >
-                g["sma200"]
-            )
-
-            &
-
-            # 6
-            g["price_sma200_rising"]
-
-            &
-
-            # 7
-            (
-                g["close"]
-                >=
-                (
-                    g["low_52w"]
-                    *
-                    CONFIG[
-                        "MIN_ABOVE_52W_LOW"
-                    ]
+                print(
+                    f"Benchmark loaded: {tkr}"
                 )
+
+                close = data["Close"]
+
+                # Handle yfinance MultiIndex
+                if isinstance(
+                    close,
+                    pd.DataFrame
+                ):
+
+                    close = close.iloc[:, 0]
+
+                return close
+
+        except Exception as e:
+
+            print(
+                f"Benchmark {tkr} failed: {e}"
             )
 
-            &
 
-            # 8
-            (
-                g["close"]
-                >=
-                (
-                    g["high_52w"]
-                    *
-                    (
-                        1
-                        -
-                        CONFIG[
-                            "MAX_BELOW_52W_HIGH_PCT"
-                        ] / 100
+    raise RuntimeError(
+        "Could not download any benchmark index data."
+    )
+
+
+# ============================================================
+# MINERVINI TREND TEMPLATE
+# ============================================================
+
+def trend_template_series(s):
+
+    sma50 = (
+        s
+        .rolling(50)
+        .mean()
+    )
+
+    sma150 = (
+        s
+        .rolling(150)
+        .mean()
+    )
+
+    sma200 = (
+        s
+        .rolling(200)
+        .mean()
+    )
+
+    sma200_1mo = (
+        sma200
+        .shift(21)
+    )
+
+    low52 = (
+        s
+        .rolling(252)
+        .min()
+    )
+
+    high52 = (
+        s
+        .rolling(252)
+        .max()
+    )
+
+
+    # --------------------------------------------------------
+    # 7 CRITERIA
+    # --------------------------------------------------------
+
+    c1 = (
+        s > sma150
+    ) & (
+        s > sma200
+    )
+
+
+    c2 = (
+        sma150 > sma200
+    )
+
+
+    c3 = (
+        sma200 > sma200_1mo
+    )
+
+
+    c4 = (
+        sma50 > sma150
+    ) & (
+        sma50 > sma200
+    )
+
+
+    c5 = (
+        s > sma50
+    )
+
+
+    c6 = (
+        s >= 1.25 * low52
+    )
+
+
+    c7 = (
+        s >= 0.75 * high52
+    )
+
+
+    met = (
+        c1.astype(int)
+        +
+        c2.astype(int)
+        +
+        c3.astype(int)
+        +
+        c4.astype(int)
+        +
+        c5.astype(int)
+        +
+        c6.astype(int)
+        +
+        c7.astype(int)
+    )
+
+
+    passed = (
+        met == 7
+    )
+
+
+    return passed
+
+
+# ============================================================
+# COMPUTE SIGNALS FOR ONE STOCK
+# ============================================================
+
+def compute_signals_for_stock(
+    close,
+    bench_close
+):
+
+    """
+    Returns a per-date DataFrame containing:
+
+        price
+        rs_score
+        blue_dot
+        tt_pass
+        rs_tt_pass
+        rs_line
+        rs_exit_ema
+        rs_exit
+    """
+
+
+    # --------------------------------------------------------
+    # Align stock and benchmark
+    # --------------------------------------------------------
+
+    aligned = pd.concat(
+        [
+            close,
+            bench_close
+        ],
+        axis=1,
+        join="inner"
+    ).dropna()
+
+
+    aligned.columns = [
+        "s",
+        "b"
+    ]
+
+
+    if len(aligned) < 280:
+
+        return None
+
+
+    # --------------------------------------------------------
+    # RS LINE
+    # --------------------------------------------------------
+    #
+    # RS Line = Stock / Benchmark
+    #
+    # This is the RS line used by the backtest.
+    #
+
+    rs_ratio = (
+        aligned["s"]
+        /
+        aligned["b"]
+    )
+
+
+    # --------------------------------------------------------
+    # RS SCORE
+    # --------------------------------------------------------
+
+    def pct_return(
+        series,
+        days
+    ):
+
+        return (
+            series
+            /
+            series.shift(days)
+            -
+            1
+        )
+
+
+    rs_score = (
+
+        0.40
+        *
+        pct_return(
+            aligned["s"],
+            63
+        )
+
+        +
+
+        0.20
+        *
+        pct_return(
+            aligned["s"],
+            126
+        )
+
+        +
+
+        0.20
+        *
+        pct_return(
+            aligned["s"],
+            189
+        )
+
+        +
+
+        0.20
+        *
+        pct_return(
+            aligned["s"],
+            252
+        )
+
+    ) * 100
+
+
+    # --------------------------------------------------------
+    # BLUE DOT
+    # --------------------------------------------------------
+    #
+    # New 250-day RS high.
+    #
+    # The shift logic makes this a NEW high rather than
+    # simply "currently at rolling high".
+    #
+
+    rs_roll_high = (
+        rs_ratio
+        .rolling(
+            LOOKBACK_DAYS
+        )
+        .max()
+    )
+
+
+    blue_dot = (
+
+        (
+            rs_ratio
+            >=
+            rs_roll_high
+        )
+
+        &
+
+        (
+            rs_ratio.shift(1)
+            <
+            rs_roll_high.shift(1)
+        )
+
+    )
+
+
+    # --------------------------------------------------------
+    # PRICE TREND TEMPLATE
+    # --------------------------------------------------------
+
+    tt_pass = (
+        trend_template_series(
+            aligned["s"]
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # RS LINE TREND TEMPLATE
+    # --------------------------------------------------------
+
+    rs_tt_pass = (
+        trend_template_series(
+            rs_ratio
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # RS LINE 3-EMA
+    # --------------------------------------------------------
+    #
+    # IMPORTANT:
+    #
+    # This is EMA of the RS LINE itself.
+    #
+    # NOT EMA of price.
+    #
+    # NOT crossover logic.
+    #
+
+    rs_exit_ema = (
+        rs_ratio
+        .ewm(
+            span=RS_EXIT_EMA,
+            adjust=False
+        )
+        .mean()
+    )
+
+
+    # --------------------------------------------------------
+    # RS EXIT
+    # --------------------------------------------------------
+    #
+    # EXACT RULE:
+    #
+    #     RS LINE < RS LINE 3-EMA
+    #
+    # This is STATE-BASED.
+    #
+    # If RS is below its 3-EMA for 1 day, 5 days,
+    # or 20 days, the condition remains TRUE.
+    #
+    # There is NO crossover requirement.
+    #
+
+    rs_exit = (
+        rs_ratio
+        <
+        rs_exit_ema
+    )
+
+
+    # --------------------------------------------------------
+    # RETURN SIGNAL DATA
+    # --------------------------------------------------------
+
+    return pd.DataFrame({
+
+        "price":
+            aligned["s"],
+
+        "rs_line":
+            rs_ratio,
+
+        "rs_score":
+            rs_score,
+
+        "blue_dot":
+            blue_dot,
+
+        "tt_pass":
+            tt_pass,
+
+        "rs_tt_pass":
+            rs_tt_pass,
+
+        "rs_exit_ema":
+            rs_exit_ema,
+
+        "rs_exit":
+            rs_exit,
+
+    })
+
+
+# ============================================================
+# RUN BACKTEST
+# ============================================================
+
+def run_backtest():
+
+    tickers = load_tickers()
+
+
+    print(
+        f"Loaded {len(tickers)} tickers."
+    )
+
+
+    print(
+        f"Backtesting from "
+        f"{BACKTEST_START} to today."
+    )
+
+
+    # --------------------------------------------------------
+    # BENCHMARK
+    # --------------------------------------------------------
+
+    bench_close = (
+        download_benchmark()
+    )
+
+
+    # --------------------------------------------------------
+    # SIGNAL STORAGE
+    # --------------------------------------------------------
+
+    all_signals = {}
+
+
+    # --------------------------------------------------------
+    # DOWNLOAD STOCKS IN BATCHES
+    # --------------------------------------------------------
+
+    batch_size = 50
+
+
+    for i in range(
+        0,
+        len(tickers),
+        batch_size
+    ):
+
+        batch = tickers[
+            i:
+            i + batch_size
+        ]
+
+
+        print(
+            f"Downloading batch "
+            f"{i}-{i + len(batch)}..."
+        )
+
+
+        try:
+
+            data = yf.download(
+
+                batch,
+
+                period=DOWNLOAD_PERIOD,
+
+                interval="1d",
+
+                auto_adjust=True,
+
+                progress=False,
+
+                group_by="ticker",
+
+                threads=True
+
+            )
+
+
+        except Exception as e:
+
+            print(
+                f"Batch download failed: {e}"
+            )
+
+            continue
+
+
+        # ----------------------------------------------------
+        # PROCESS EACH STOCK
+        # ----------------------------------------------------
+
+        for symbol in batch:
+
+            try:
+
+                # Single ticker
+                if len(batch) == 1:
+
+                    sdata = data
+
+                # Multiple tickers
+                else:
+
+                    sdata = data[
+                        symbol
+                    ]
+
+
+                close = (
+                    sdata["Close"]
+                    .dropna()
+                )
+
+
+                volume = (
+                    sdata["Volume"]
+                    .dropna()
+                )
+
+
+                # ------------------------------------------------
+                # BASIC DATA FILTERS
+                # ------------------------------------------------
+
+                if (
+                    close.empty
+                    or
+                    len(close) < 280
+                ):
+
+                    continue
+
+
+                if (
+                    close.iloc[-1]
+                    <
+                    MIN_PRICE
+                ):
+
+                    continue
+
+
+                if (
+                    volume.tail(20).mean()
+                    <
+                    MIN_AVG_VOLUME
+                ):
+
+                    continue
+
+
+                # ------------------------------------------------
+                # CALCULATE SIGNALS
+                # ------------------------------------------------
+
+                sig = (
+                    compute_signals_for_stock(
+                        close,
+                        bench_close
                     )
                 )
-            )
 
+
+                if sig is not None:
+
+                    all_signals[
+                        symbol.replace(
+                            ".NS",
+                            ""
+                        )
+                    ] = sig
+
+
+            except Exception as e:
+
+                print(
+                    f"Skipping {symbol}: {e}"
+                )
+
+                continue
+
+
+        time.sleep(1)
+
+
+    print(
+        f"Signals computed for "
+        f"{len(all_signals)} stocks "
+        f"with sufficient history."
+    )
+
+
+    # ========================================================
+    # TRADING DAYS
+    # ========================================================
+
+    trading_days = (
+        bench_close.index[
+            bench_close.index
+            >=
+            pd.Timestamp(
+                BACKTEST_START
+            )
+        ]
+    )
+
+
+    if len(trading_days) == 0:
+
+        print(
+            "No trading days found "
+            "in the backtest window."
+        )
+
+        return (
+            pd.DataFrame(),
+            pd.DataFrame()
         )
 
 
-        # -----------------------------------------------------
-        # RS TREND TEMPLATE
-        # -----------------------------------------------------
-
-        g["rs_tt"] = (
-
-            (
-                g["rs_line"]
-                >
-                g["rs_sma50"]
-            )
-
-            &
-
-            (
-                g["rs_line"]
-                >
-                g["rs_sma150"]
-            )
-
-            &
-
-            (
-                g["rs_line"]
-                >
-                g["rs_sma200"]
-            )
-
-            &
-
-            (
-                g["rs_sma50"]
-                >
-                g["rs_sma150"]
-            )
-
-            &
-
-            (
-                g["rs_sma150"]
-                >
-                g["rs_sma200"]
-            )
-
-            &
-
-            g["rs_sma200_rising"]
-
-        )
-
-
-        # -----------------------------------------------------
-        # ENTRY SIGNAL
-        # -----------------------------------------------------
-
-        g["entry_signal"] = (
-
-            g["blue_dot"]
-
-            &
-
-            g["price_tt"]
-
-            &
-
-            g["rs_tt"]
-
-        )
-
-
-        # Optional minimum RS score
-
-        if CONFIG["MIN_RS_SCORE"] is not None:
-
-            g["entry_signal"] &= (
-
-                g["rs_score"]
-                >=
-                CONFIG["MIN_RS_SCORE"]
-
-            )
-
-
-        # -----------------------------------------------------
-        # EXIT SIGNAL
-        # -----------------------------------------------------
-        #
-        # THIS IS THE IMPORTANT PART.
-        #
-        # EXIT whenever:
-        #
-        #       RS LINE < RS LINE 3-EMA
-        #
-        # This is NOT a crossover test.
-        #
-        # If RS was already below its 3-EMA yesterday
-        # and remains below it today, exit_signal remains TRUE.
-        #
-        # -----------------------------------------------------
-
-        g["exit_signal"] = (
-
-            g["rs_line"]
-            <
-            g["rs_exit_ema"]
-
-        )
-
-
-        output.append(g)
-
-
-    return pd.concat(
-        output,
-        ignore_index=True
-    )
-
-
-# =============================================================
-# BACKTEST ENGINE
-# =============================================================
-
-def run_backtest(df):
-
-    start_date = pd.Timestamp(
-        CONFIG["START_DATE"]
-    )
-
-    end_date = pd.Timestamp(
-        CONFIG["END_DATE"]
-    )
-
-
-    df = df[
-        (df["date"] >= start_date)
-        &
-        (df["date"] <= end_date)
-    ].copy()
-
-
-    df = df.sort_values(
-        ["date", "symbol"]
-    )
-
-
-    dates = sorted(
-        df["date"].unique()
-    )
-
-
-    # ---------------------------------------------------------
+    # ========================================================
     # PORTFOLIO STATE
-    # ---------------------------------------------------------
+    # ========================================================
 
-    positions = {}
-
-    pending_entries = {}
-
-    pending_exits = set()
+    holdings = {}
 
     trade_log = []
+
+    equity = 1.0
 
     equity_curve = []
 
 
-    # Starting equity
+    # ========================================================
+    # DAILY BACKTEST
+    # ========================================================
 
-    equity = 1.0
+    for date in trading_days:
 
-
-    # Total cost per side
-
-    cost_per_side = (
-
-        CONFIG["COST_PER_SIDE_PCT"]
-
-        +
-
-        CONFIG["SLIPPAGE_PER_SIDE_PCT"]
-
-    ) / 100
+        pool = []
 
 
-    # =========================================================
-    # DAILY LOOP
-    # =========================================================
+        # ----------------------------------------------------
+        # BUILD TODAY'S ELIGIBLE POOL
+        # ----------------------------------------------------
 
-    for date in dates:
+        for sym, df in all_signals.items():
 
-        date = pd.Timestamp(date)
+            if date not in df.index:
 
-
-        day = df[
-            df["date"] == date
-        ].copy()
+                continue
 
 
-        # =====================================================
-        # 1. EXECUTE PREVIOUS DAY EXIT SIGNALS
-        # =====================================================
+            row = df.loc[date]
 
-        if (
-            CONFIG["EXECUTION"]
-            ==
-            "NEXT_OPEN"
-        ):
 
-            for symbol in list(
-                pending_exits
+            if pd.isna(
+                row["rs_score"]
             ):
 
-                if symbol not in positions:
+                continue
 
-                    pending_exits.discard(
-                        symbol
+
+            # EXACT LIVE SELECTION RULE:
+            #
+            # Blue Dot
+            # +
+            # Price TT
+            # +
+            # RS TT
+
+            if (
+
+                bool(
+                    row["blue_dot"]
+                )
+
+                and
+
+                bool(
+                    row["tt_pass"]
+                )
+
+                and
+
+                bool(
+                    row["rs_tt_pass"]
+                )
+
+            ):
+
+                pool.append(
+
+                    (
+                        sym,
+
+                        float(
+                            row["rs_score"]
+                        ),
+
+                        float(
+                            row["price"]
+                        )
+
                     )
 
-                    continue
+                )
 
 
-                row = day[
-                    day["symbol"] == symbol
+        # ----------------------------------------------------
+        # SORT BY RAW RS SCORE
+        # ----------------------------------------------------
+
+        pool.sort(
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+
+        # ----------------------------------------------------
+        # TOP N
+        # ----------------------------------------------------
+
+        target = pool[
+            :TOP_N
+        ]
+
+
+        target_syms = {
+            s
+            for s, _, _
+            in target
+        }
+
+
+        target_prices = {
+
+            s: p
+
+            for s, _, p
+            in target
+
+        }
+
+
+        # ====================================================
+        # SNAPSHOT PRE-TODAY HOLDINGS
+        # ====================================================
+        #
+        # Only these positions contribute today's price move.
+        #
+        # A stock entered today starts contributing tomorrow.
+        #
+
+        held_before_today = set(
+            holdings.keys()
+        )
+
+
+        # ====================================================
+        # DAILY PORTFOLIO RETURN
+        # ====================================================
+
+        if held_before_today:
+
+            rets = []
+
+
+            for sym in held_before_today:
+
+                df = all_signals[
+                    sym
                 ]
 
 
-                if row.empty:
+                if date not in df.index:
 
                     continue
 
 
-                row = row.iloc[0]
+                idx = (
+                    df.index
+                    .get_loc(date)
+                )
+
+
+                if idx > 0:
+
+                    prev_price = (
+                        df["price"]
+                        .iloc[idx - 1]
+                    )
+
+
+                    curr_price = (
+                        df["price"]
+                        .iloc[idx]
+                    )
+
+
+                    if prev_price > 0:
+
+                        rets.append(
+
+                            curr_price
+                            /
+                            prev_price
+                            -
+                            1
+
+                        )
+
+
+            if rets:
+
+                equity *= (
+
+                    1
+                    +
+                    float(
+                        np.mean(rets)
+                    )
+
+                )
+
+
+        # ====================================================
+        # EXIT LOGIC
+        # ====================================================
+        #
+        # TWO POSSIBLE EXIT CONDITIONS:
+        #
+        # 1. RS LINE < RS LINE 3-EMA
+        #
+        # 2. Stock no longer belongs to target TOP_N
+        #
+        # The RS exit is independent of crossover.
+        #
+        # ====================================================
+
+        for sym in list(
+            holdings.keys()
+        ):
+
+            df = all_signals[
+                sym
+            ]
+
+
+            if date not in df.index:
+
+                continue
+
+
+            row = df.loc[date]
+
+
+            # ------------------------------------------------
+            # RS 3-EMA EXIT
+            # ------------------------------------------------
+
+            rs_exit = bool(
+                row["rs_exit"]
+            )
+
+
+            # ------------------------------------------------
+            # TOP-N EXIT
+            # ------------------------------------------------
+
+            target_exit = (
+                sym
+                not in
+                target_syms
+            )
+
+
+            # ------------------------------------------------
+            # EXIT IF EITHER CONDITION TRUE
+            # ------------------------------------------------
+
+            if (
+                rs_exit
+                or
+                target_exit
+            ):
+
+                entry = holdings.pop(
+                    sym
+                )
 
 
                 exit_price = float(
-                    row["open"]
+                    row["price"]
                 )
 
 
-                position = positions[
-                    symbol
-                ]
+                ret = (
 
-
-                entry_price = (
-                    position[
-                        "entry_price"
-                    ]
-                )
-
-
-                gross_return = (
                     exit_price
                     /
-                    entry_price
-                    - 1
-                )
-
-
-                net_return = (
-                    gross_return
+                    entry[
+                        "entry_price"
+                    ]
                     -
-                    (
-                        cost_per_side
-                        * 2
+                    1
+
+                ) * 100
+
+
+                # ------------------------------------------------
+                # EXIT REASON
+                # ------------------------------------------------
+
+                if rs_exit:
+
+                    exit_reason = (
+                        f"RS Line < "
+                        f"RS Line {RS_EXIT_EMA}-EMA"
                     )
-                )
+
+                else:
+
+                    exit_reason = (
+                        "No longer in Top-N target"
+                    )
 
 
                 trade_log.append({
 
                     "symbol":
-                        symbol,
+                        sym,
 
                     "entry_date":
-                        position[
+                        entry[
                             "entry_date"
-                        ],
+                        ].strftime(
+                            "%Y-%m-%d"
+                        ),
 
                     "exit_date":
-                        date,
+                        date.strftime(
+                            "%Y-%m-%d"
+                        ),
 
                     "entry_price":
-                        entry_price,
+                        round(
+                            entry[
+                                "entry_price"
+                            ],
+                            2
+                        ),
 
                     "exit_price":
-                        exit_price,
+                        round(
+                            exit_price,
+                            2
+                        ),
 
-                    "gross_return_pct":
-                        gross_return * 100,
-
-                    "net_return_pct":
-                        net_return * 100,
+                    "return_pct":
+                        round(
+                            ret,
+                            2
+                        ),
 
                     "days_held":
                         (
                             date
                             -
-                            position[
+                            entry[
                                 "entry_date"
                             ]
                         ).days,
 
                     "exit_reason":
-                        (
-                            "RS Line < "
-                            f"{CONFIG['RS_EXIT_EMA']}-EMA"
-                        ),
+                        exit_reason,
 
                 })
 
 
-                del positions[
-                    symbol
-                ]
+        # ====================================================
+        # ENTER NEW TARGET NAMES
+        # ====================================================
+        #
+        # Entries occur at today's close.
+        #
+        # Therefore today's already-completed price move is
+        # NOT included in today's portfolio return.
+        #
 
+        for sym in target_syms:
 
-                pending_exits.discard(
-                    symbol
-                )
+            if sym not in holdings:
 
-
-        # =====================================================
-        # 2. EXECUTE PREVIOUS DAY ENTRY SIGNALS
-        # =====================================================
-
-        if (
-            CONFIG["EXECUTION"]
-            ==
-            "NEXT_OPEN"
-        ):
-
-            for symbol in list(
-                pending_entries.keys()
-            ):
-
-                if symbol in positions:
-
-                    del pending_entries[
-                        symbol
-                    ]
-
-                    continue
-
-
-                row = day[
-                    day["symbol"] == symbol
-                ]
-
-
-                if row.empty:
-
-                    continue
-
-
-                row = row.iloc[0]
-
-
-                entry_price = float(
-                    row["open"]
-                )
-
-
-                positions[symbol] = {
-
-                    "entry_date":
-                        date,
+                holdings[sym] = {
 
                     "entry_price":
-                        entry_price,
+                        target_prices[
+                            sym
+                        ],
 
-                    "last_close":
-                        entry_price,
+                    "entry_date":
+                        date
 
                 }
 
 
-                del pending_entries[
-                    symbol
-                ]
-
-
-        # =====================================================
-        # 3. DAILY PORTFOLIO RETURN
-        # =====================================================
-        #
-        # Correct daily mark-to-market:
-        #
-        # previous close/open
-        #          ↓
-        # today's close
-        #
-        # We do NOT repeatedly apply the complete
-        # entry-to-date return.
-        #
-
-        if positions:
-
-            position_returns = []
-
-
-            for symbol in list(
-                positions.keys()
-            ):
-
-                row = day[
-                    day["symbol"] == symbol
-                ]
-
-
-                if row.empty:
-
-                    continue
-
-
-                row = row.iloc[0]
-
-
-                current_close = float(
-                    row["close"]
-                )
-
-
-                previous_price = (
-                    positions[symbol][
-                        "last_close"
-                    ]
-                )
-
-
-                daily_return = (
-
-                    current_close
-                    /
-                    previous_price
-                    - 1
-
-                )
-
-
-                position_returns.append(
-                    daily_return
-                )
-
-
-                positions[symbol][
-                    "last_close"
-                ] = current_close
-
-
-            if position_returns:
-
-                portfolio_return = (
-                    np.mean(
-                        position_returns
-                    )
-                )
-
-            else:
-
-                portfolio_return = 0.0
-
-
-        else:
-
-            portfolio_return = 0.0
-
-
-        # Update equity
-
-        equity *= (
-            1
-            +
-            portfolio_return
-        )
-
+        # ====================================================
+        # EQUITY CURVE
+        # ====================================================
 
         equity_curve.append({
 
             "date":
-                date,
+                date.strftime(
+                    "%Y-%m-%d"
+                ),
 
             "equity":
-                equity,
+                round(
+                    equity,
+                    4
+                ),
 
             "n_holdings":
-                len(positions),
+                len(
+                    holdings
+                )
 
         })
 
 
-        # =====================================================
-        # 4. GENERATE EXIT SIGNALS
-        # =====================================================
-        #
-        # Signal uses TODAY'S CLOSE.
-        #
-        # Rule:
-        #
-        #     RS Line < RS Line 3-EMA
-        #
-        # NOT:
-        #
-        #     crossover
-        #
-        # =====================================================
+    # ========================================================
+    # CLOSE OPEN POSITIONS AT FINAL DATE
+    # ========================================================
 
-        for symbol in list(
-            positions.keys()
-        ):
+    last_date = (
+        trading_days[-1]
+    )
 
-            row = day[
-                day["symbol"] == symbol
-            ]
 
+    for sym, entry in holdings.items():
 
-            if row.empty:
-
-                continue
-
-
-            row = row.iloc[0]
-
-
-            if bool(
-                row["exit_signal"]
-            ):
-
-                if (
-                    CONFIG["EXECUTION"]
-                    ==
-                    "NEXT_OPEN"
-                ):
-
-                    pending_exits.add(
-                        symbol
-                    )
-
-
-                else:
-
-                    # SAME_CLOSE EXIT
-
-                    exit_price = float(
-                        row["close"]
-                    )
-
-
-                    position = positions[
-                        symbol
-                    ]
-
-
-                    entry_price = (
-                        position[
-                            "entry_price"
-                        ]
-                    )
-
-
-                    gross_return = (
-                        exit_price
-                        /
-                        entry_price
-                        - 1
-                    )
-
-
-                    net_return = (
-                        gross_return
-                        -
-                        (
-                            cost_per_side
-                            * 2
-                        )
-                    )
-
-
-                    trade_log.append({
-
-                        "symbol":
-                            symbol,
-
-                        "entry_date":
-                            position[
-                                "entry_date"
-                            ],
-
-                        "exit_date":
-                            date,
-
-                        "entry_price":
-                            entry_price,
-
-                        "exit_price":
-                            exit_price,
-
-                        "gross_return_pct":
-                            gross_return * 100,
-
-                        "net_return_pct":
-                            net_return * 100,
-
-                        "days_held":
-                            (
-                                date
-                                -
-                                position[
-                                    "entry_date"
-                                ]
-                            ).days,
-
-                        "exit_reason":
-                            (
-                                "RS Line < "
-                                f"{CONFIG['RS_EXIT_EMA']}-EMA"
-                            ),
-
-                    })
-
-
-                    del positions[
-                        symbol
-                    ]
-
-
-        # =====================================================
-        # 5. GENERATE ENTRY SIGNALS
-        # =====================================================
-
-        candidates = day[
-            day["entry_signal"]
-        ].copy()
-
-
-        # Strongest RS first
-
-        candidates = candidates.sort_values(
-            "rs_score",
-            ascending=False
-        )
-
-
-        # Current positions
-
-        current_symbols = set(
-            positions.keys()
-        )
-
-
-        # Pending entries
-
-        current_symbols.update(
-            pending_entries.keys()
-        )
-
-
-        # Available slots
-
-        available_slots = (
-
-            CONFIG["TOP_N"]
-            -
-            len(current_symbols)
-
-        )
-
-
-        if available_slots > 0:
-
-            selected = candidates[
-                ~candidates[
-                    "symbol"
-                ].isin(
-                    current_symbols
-                )
-            ].head(
-                available_slots
-            )
-
-
-            for _, row in selected.iterrows():
-
-                symbol = row[
-                    "symbol"
-                ]
-
-
-                # -------------------------------------------------
-                # SAME CLOSE
-                # -------------------------------------------------
-
-                if (
-                    CONFIG["EXECUTION"]
-                    ==
-                    "SAME_CLOSE"
-                ):
-
-                    entry_price = float(
-                        row["close"]
-                    )
-
-
-                    positions[symbol] = {
-
-                        "entry_date":
-                            date,
-
-                        "entry_price":
-                            entry_price,
-
-                        "last_close":
-                            entry_price,
-
-                    }
-
-
-                # -------------------------------------------------
-                # NEXT OPEN
-                # -------------------------------------------------
-
-                else:
-
-                    pending_entries[
-                        symbol
-                    ] = {
-
-                        "signal_date":
-                            date,
-
-                    }
-
-
-    # =========================================================
-    # CLOSE OPEN POSITIONS AT BACKTEST END
-    # =========================================================
-
-    if dates:
-
-        last_date = pd.Timestamp(
-            dates[-1]
-        )
-
-
-        last_day = df[
-            df["date"] == last_date
+        df = all_signals[
+            sym
         ]
 
 
-        for symbol in list(
-            positions.keys()
-        ):
-
-            row = last_day[
-                last_day["symbol"] == symbol
-            ]
-
-
-            if row.empty:
-
-                continue
-
-
-            row = row.iloc[0]
-
+        if last_date in df.index:
 
             exit_price = float(
-                row["close"]
+                df.loc[
+                    last_date,
+                    "price"
+                ]
             )
 
+        else:
 
-            position = positions[
-                symbol
-            ]
-
-
-            entry_price = (
-                position[
+            exit_price = (
+                entry[
                     "entry_price"
                 ]
             )
 
 
-            gross_return = (
-                exit_price
-                /
-                entry_price
-                - 1
-            )
+        ret = (
+
+            exit_price
+            /
+            entry[
+                "entry_price"
+            ]
+            -
+            1
+
+        ) * 100
 
 
-            net_return = (
-                gross_return
-                -
+        trade_log.append({
+
+            "symbol":
+                sym,
+
+            "entry_date":
+                entry[
+                    "entry_date"
+                ].strftime(
+                    "%Y-%m-%d"
+                ),
+
+            "exit_date":
                 (
-                    cost_per_side
-                    * 2
-                )
-            )
+                    last_date.strftime(
+                        "%Y-%m-%d"
+                    )
+                    +
+                    " (OPEN)"
+                ),
 
-
-            trade_log.append({
-
-                "symbol":
-                    symbol,
-
-                "entry_date":
-                    position[
-                        "entry_date"
+            "entry_price":
+                round(
+                    entry[
+                        "entry_price"
                     ],
+                    2
+                ),
 
-                "exit_date":
-                    last_date,
-
-                "entry_price":
-                    entry_price,
-
-                "exit_price":
+            "exit_price":
+                round(
                     exit_price,
+                    2
+                ),
 
-                "gross_return_pct":
-                    gross_return * 100,
+            "return_pct":
+                round(
+                    ret,
+                    2
+                ),
 
-                "net_return_pct":
-                    net_return * 100,
+            "days_held":
+                (
+                    last_date
+                    -
+                    entry[
+                        "entry_date"
+                    ]
+                ).days,
 
-                "days_held":
-                    (
-                        last_date
-                        -
-                        position[
-                            "entry_date"
-                        ]
-                    ).days,
+            "exit_reason":
+                "BACKTEST END",
 
-                "exit_reason":
-                    "BACKTEST END",
-
-            })
+        })
 
 
-    trades = pd.DataFrame(
+    # ========================================================
+    # DATAFRAMES
+    # ========================================================
+
+    trade_df = pd.DataFrame(
         trade_log
     )
 
@@ -1486,1098 +1296,580 @@ def run_backtest(df):
     )
 
 
-    return trades, equity_df
+    return (
+        trade_df,
+        equity_df
+    )
 
 
-# =============================================================
-# PERFORMANCE STATISTICS
-# =============================================================
+# ============================================================
+# SUMMARY
+# ============================================================
 
-def calculate_statistics(
-    trades,
-    equity_curve
+def compute_summary(
+    trade_df,
+    equity_df
 ):
 
-    if equity_curve.empty:
+    if equity_df.empty:
 
         return {}
 
 
-    equity = (
-        equity_curve[
+    # --------------------------------------------------------
+    # TOTAL RETURN
+    # --------------------------------------------------------
+
+    total_return_pct = round(
+
+        (
+            equity_df[
+                "equity"
+            ].iloc[-1]
+            -
+            1
+        )
+
+        * 100,
+
+        2
+
+    )
+
+
+    # --------------------------------------------------------
+    # MAX DRAWDOWN
+    # --------------------------------------------------------
+
+    running_max = (
+        equity_df[
             "equity"
         ]
-        .astype(float)
-    )
-
-
-    # ---------------------------------------------------------
-    # TOTAL RETURN
-    # ---------------------------------------------------------
-
-    total_return = (
-        equity.iloc[-1]
-        /
-        equity.iloc[0]
-        - 1
-    )
-
-
-    # ---------------------------------------------------------
-    # DRAWDOWN
-    # ---------------------------------------------------------
-
-    running_high = (
-        equity
         .cummax()
     )
 
 
     drawdown = (
-        equity
+
+        equity_df[
+            "equity"
+        ]
         /
-        running_high
-        - 1
+        running_max
+        -
+        1
+
+    ) * 100
+
+
+    max_dd = round(
+        drawdown.min(),
+        2
     )
 
 
-    max_drawdown = (
-        drawdown.min()
-    )
+    # --------------------------------------------------------
+    # CLOSED TRADES ONLY
+    # --------------------------------------------------------
 
+    if not trade_df.empty:
 
-    # ---------------------------------------------------------
-    # CAGR
-    # ---------------------------------------------------------
+        closed_trades = (
 
-    start = pd.Timestamp(
-        equity_curve[
-            "date"
-        ].iloc[0]
-    )
+            trade_df[
+                ~trade_df[
+                    "exit_date"
+                ]
+                .astype(str)
+                .str.contains(
+                    "OPEN",
+                    na=False
+                )
+            ]
 
-
-    end = pd.Timestamp(
-        equity_curve[
-            "date"
-        ].iloc[-1]
-    )
-
-
-    years = (
-        end - start
-    ).days / 365.25
-
-
-    if years > 0:
-
-        cagr = (
-
-            equity.iloc[-1]
-            /
-            equity.iloc[0]
-
-        ) ** (
-
-            1 / years
-
-        ) - 1
+        )
 
     else:
 
-        cagr = np.nan
+        closed_trades = (
+            trade_df
+        )
 
 
-    # ---------------------------------------------------------
+    n_trades = len(
+        closed_trades
+    )
+
+
+    # --------------------------------------------------------
     # TRADE STATISTICS
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
 
-    if not trades.empty:
+    if n_trades:
 
-        winners = trades[
-            trades[
-                "net_return_pct"
-            ] > 0
-        ]
+        win_rate = round(
 
-
-        losers = trades[
-            trades[
-                "net_return_pct"
-            ] <= 0
-        ]
-
-
-        win_rate = (
-            len(winners)
-            /
-            len(trades)
-        )
-
-
-        average_trade = (
-            trades[
-                "net_return_pct"
-            ].mean()
-        )
-
-
-        median_trade = (
-            trades[
-                "net_return_pct"
-            ].median()
-        )
-
-
-        average_winner = (
-
-            winners[
-                "net_return_pct"
-            ].mean()
-
-            if not winners.empty
-
-            else np.nan
-
-        )
-
-
-        average_loser = (
-
-            losers[
-                "net_return_pct"
-            ].mean()
-
-            if not losers.empty
-
-            else np.nan
-
-        )
-
-
-        gross_profit = (
-            winners[
-                "net_return_pct"
-            ].sum()
-        )
-
-
-        gross_loss = abs(
-            losers[
-                "net_return_pct"
-            ].sum()
-        )
-
-
-        if gross_loss > 0:
-
-            profit_factor = (
-                gross_profit
-                /
-                gross_loss
+            (
+                closed_trades[
+                    "return_pct"
+                ]
+                >
+                0
             )
+            .mean()
+            *
+            100,
 
-        else:
+            1
 
-            profit_factor = np.inf
+        )
+
+
+        avg_return = round(
+
+            closed_trades[
+                "return_pct"
+            ]
+            .mean(),
+
+            2
+
+        )
+
+
+        avg_days_held = round(
+
+            closed_trades[
+                "days_held"
+            ]
+            .mean(),
+
+            1
+
+        )
 
 
         best_trade = (
-            trades[
-                "net_return_pct"
+            closed_trades[
+                "return_pct"
             ].max()
         )
 
 
         worst_trade = (
-            trades[
-                "net_return_pct"
+            closed_trades[
+                "return_pct"
             ].min()
         )
 
 
-        average_days = (
-            trades[
-                "days_held"
-            ].mean()
-        )
-
-
-        median_days = (
-            trades[
-                "days_held"
-            ].median()
-        )
-
-
-        # -----------------------------------------------------
-        # MAX CONSECUTIVE LOSSES
-        # -----------------------------------------------------
-
-        max_loss_streak = 0
-
-        current_streak = 0
-
-
-        for result in trades[
-            "net_return_pct"
-        ]:
-
-            if result <= 0:
-
-                current_streak += 1
-
-                max_loss_streak = max(
-                    max_loss_streak,
-                    current_streak
-                )
-
-            else:
-
-                current_streak = 0
-
-
     else:
 
-        winners = pd.DataFrame()
+        win_rate = 0
 
-        losers = pd.DataFrame()
+        avg_return = 0
 
-        win_rate = np.nan
+        avg_days_held = 0
 
-        average_trade = np.nan
+        best_trade = 0
 
-        median_trade = np.nan
-
-        average_winner = np.nan
-
-        average_loser = np.nan
-
-        profit_factor = np.nan
-
-        best_trade = np.nan
-
-        worst_trade = np.nan
-
-        average_days = np.nan
-
-        median_days = np.nan
-
-        max_loss_streak = 0
+        worst_trade = 0
 
 
-    # ---------------------------------------------------------
-    # DAILY SHARPE
-    # ---------------------------------------------------------
-
-    daily_returns = (
-        equity
-        .pct_change()
-        .dropna()
-    )
-
-
-    if (
-
-        len(daily_returns) > 1
-
-        and
-
-        daily_returns.std() > 0
-
-    ):
-
-        sharpe = (
-
-            daily_returns.mean()
-            /
-            daily_returns.std()
-
-            *
-            np.sqrt(252)
-
-        )
-
-    else:
-
-        sharpe = np.nan
-
-
-    # ---------------------------------------------------------
-    # CALMAR
-    # ---------------------------------------------------------
-
-    if max_drawdown < 0:
-
-        calmar = (
-            cagr
-            /
-            abs(max_drawdown)
-        )
-
-    else:
-
-        calmar = np.nan
-
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
 
     return {
 
-        "Starting Equity":
-            equity.iloc[0],
+        "Total Return (gross, no costs)":
+            f"{total_return_pct}%",
 
-        "Ending Equity":
-            equity.iloc[-1],
+        "Max Drawdown":
+            f"{max_dd}%",
 
-        "Total Return %":
-            total_return * 100,
+        "Number of Closed Trades":
+            n_trades,
 
-        "CAGR %":
-            cagr * 100,
+        "Win Rate":
+            f"{win_rate}%",
 
-        "Max Drawdown %":
-            max_drawdown * 100,
+        "Avg Return per Trade":
+            f"{avg_return}%",
 
-        "Calmar Ratio":
-            calmar,
+        "Avg Days Held":
+            avg_days_held,
 
-        "Daily Sharpe":
-            sharpe,
+        "Best Trade":
+            f"{best_trade}%",
 
-        "Closed Trades":
-            len(trades),
+        "Worst Trade":
+            f"{worst_trade}%",
 
-        "Winning Trades":
-            len(winners),
-
-        "Losing Trades":
-            len(losers),
-
-        "Win Rate %":
-            win_rate * 100,
-
-        "Average Trade %":
-            average_trade,
-
-        "Median Trade %":
-            median_trade,
-
-        "Average Winner %":
-            average_winner,
-
-        "Average Loser %":
-            average_loser,
-
-        "Winner / Loser Ratio":
+        "RS Exit Rule":
             (
-                abs(
-                    average_winner
-                    /
-                    average_loser
-                )
-                if (
-                    pd.notna(
-                        average_winner
-                    )
-                    and
-                    pd.notna(
-                        average_loser
-                    )
-                    and
-                    average_loser != 0
-                )
-                else np.nan
+                f"RS Line < "
+                f"RS Line {RS_EXIT_EMA}-EMA"
             ),
 
-        "Profit Factor":
-            profit_factor,
+        "Exit Type":
+            "STATE-BASED, NOT CROSSOVER",
 
-        "Best Trade %":
-            best_trade,
-
-        "Worst Trade %":
-            worst_trade,
-
-        "Average Days Held":
-            average_days,
-
-        "Median Days Held":
-            median_days,
-
-        "Max Consecutive Losses":
-            max_loss_streak,
+        "Backtest Window":
+            (
+                f"{BACKTEST_START} "
+                f"to "
+                f"{equity_df['date'].iloc[-1]}"
+            ),
 
     }
 
 
-# =============================================================
-# EQUITY STRUCTURE
-# =============================================================
+# ============================================================
+# WRITE TO GOOGLE SHEET
+# ============================================================
 
-def identify_equity_structure(
-    equity_curve
+def write_to_sheet(
+    trade_df,
+    equity_df,
+    summary
 ):
 
-    x = equity_curve.copy()
-
-
-    x["running_high"] = (
-        x["equity"]
-        .cummax()
+    sheet_id = os.environ.get(
+        SHEET_ID_ENV
     )
 
 
-    x["running_low"] = (
-        x["equity"]
-        .cummin()
+    creds_json = os.environ.get(
+        CREDS_ENV
     )
 
 
-    x["higher_high"] = (
+    # --------------------------------------------------------
+    # FALLBACK TO CSV
+    # --------------------------------------------------------
 
-        x["equity"]
-        >
-        x["running_high"]
-        .shift(1)
+    if not sheet_id or not creds_json:
 
-    )
-
-
-    x["lower_low"] = (
-
-        x["equity"]
-        <
-        x["running_low"]
-        .shift(1)
-
-    )
-
-
-    if len(x) > 0:
-
-        x.loc[
-            x.index[0],
-            "higher_high"
-        ] = False
-
-
-        x.loc[
-            x.index[0],
-            "lower_low"
-        ] = False
-
-
-    x["drawdown"] = (
-
-        x["equity"]
-        /
-        x["running_high"]
-        - 1
-
-    )
-
-
-    return x
-
-
-# =============================================================
-# PLOT EQUITY CURVE
-# =============================================================
-
-def plot_equity_curve(
-    equity_curve
-):
-
-    x = identify_equity_structure(
-        equity_curve
-    )
-
-
-    plt.figure(
-        figsize=(14, 7)
-    )
-
-
-    plt.plot(
-        x["date"],
-        x["equity"],
-        linewidth=1.8
-    )
-
-
-    if CONFIG[
-        "MARK_HIGHER_HIGHS_LOWER_LOWS"
-    ]:
-
-        hh = x[
-            x["higher_high"]
-        ]
-
-
-        ll = x[
-            x["lower_low"]
-        ]
-
-
-        plt.scatter(
-            hh["date"],
-            hh["equity"],
-            marker="^",
-            s=55
+        print(
+            "Missing "
+            "SHEET_ID/GOOGLE_CREDENTIALS "
+            "-- saving to CSV instead."
         )
 
 
-        plt.scatter(
-            ll["date"],
-            ll["equity"],
-            marker="v",
-            s=55
+        trade_df.to_csv(
+            "backtest_trades.csv",
+            index=False
         )
 
 
-        # -----------------------------------------------------
-        # HH LABELS
-        # -----------------------------------------------------
-
-        for _, row in hh.iterrows():
-
-            plt.annotate(
-
-                (
-                    f"HH\n"
-                    f"{row['date']:%d %b %y}\n"
-                    f"{row['equity']:.3f}"
-                ),
-
-                (
-                    row["date"],
-                    row["equity"]
-                ),
-
-                xytext=(
-                    0,
-                    9
-                ),
-
-                textcoords=(
-                    "offset points"
-                ),
-
-                ha="center",
-
-                va="bottom",
-
-                fontsize=7
-
-            )
-
-
-        # -----------------------------------------------------
-        # LL LABELS
-        # -----------------------------------------------------
-
-        for _, row in ll.iterrows():
-
-            plt.annotate(
-
-                (
-                    f"LL\n"
-                    f"{row['date']:%d %b %y}\n"
-                    f"{row['equity']:.3f}"
-                ),
-
-                (
-                    row["date"],
-                    row["equity"]
-                ),
-
-                xytext=(
-                    0,
-                    -11
-                ),
-
-                textcoords=(
-                    "offset points"
-                ),
-
-                ha="center",
-
-                va="top",
-
-                fontsize=7
-
-            )
-
-
-    # Starting equity
-
-    plt.axhline(
-        1.0,
-        linestyle="--",
-        linewidth=0.9
-    )
-
-
-    plt.title(
-        (
-            "RS Screener — "
-            "RS Line < "
-            f"{CONFIG['RS_EXIT_EMA']}-EMA Exit"
+        equity_df.to_csv(
+            "backtest_equity.csv",
+            index=False
         )
+
+
+        return
+
+
+    # --------------------------------------------------------
+    # GOOGLE AUTH
+    # --------------------------------------------------------
+
+    creds_dict = json.loads(
+        creds_json
     )
 
 
-    plt.xlabel(
-        "Date"
-    )
-
-
-    plt.ylabel(
-        "Equity "
-        "(starting equity = 1.00)"
-    )
-
-
-    plt.grid(
-        True,
-        alpha=0.25
-    )
-
-
-    plt.tight_layout()
-
-
-    filename = (
-        "EquityCurve_"
-        f"{CONFIG['RS_EXIT_EMA']}"
-        "EMA.png"
-    )
-
-
-    plt.savefig(
-        filename,
-        dpi=180,
-        bbox_inches="tight"
-    )
-
-
-    plt.show()
-
-
-    print(
-        "\nEquity curve saved:"
-    )
-
-    print(
-        filename
-    )
-
-
-# =============================================================
-# EXPORT RESULTS
-# =============================================================
-
-def export_results(
-
-    trades,
-    equity_curve,
-    statistics,
-    data
-
-):
-
-    filename = CONFIG[
-        "OUTPUT_FILE"
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets"
     ]
 
 
-    structure = (
-        identify_equity_structure(
-            equity_curve
+    creds = (
+        Credentials
+        .from_service_account_info(
+            creds_dict,
+            scopes=scopes
         )
     )
 
 
-    summary = pd.DataFrame(
+    gc = gspread.authorize(
+        creds
+    )
 
-        list(
-            statistics.items()
-        ),
 
-        columns=[
-            "Metric",
-            "Value"
+    sh = gc.open_by_key(
+        sheet_id
+    )
+
+
+    # --------------------------------------------------------
+    # WORKSHEET
+    # --------------------------------------------------------
+
+    n_rows_needed = (
+        len(trade_df)
+        +
+        len(equity_df)
+        +
+        30
+    )
+
+
+    try:
+
+        ws = sh.worksheet(
+            BACKTEST_WORKSHEET
+        )
+
+
+        if (
+            ws.row_count
+            <
+            n_rows_needed
+        ):
+
+            ws.resize(
+                rows=n_rows_needed,
+                cols=10
+            )
+
+
+    except gspread.WorksheetNotFound:
+
+        ws = sh.add_worksheet(
+
+            title=BACKTEST_WORKSHEET,
+
+            rows=n_rows_needed,
+
+            cols=10
+
+        )
+
+
+    # --------------------------------------------------------
+    # CLEAR
+    # --------------------------------------------------------
+
+    ws.clear()
+
+
+    from datetime import datetime
+
+
+    timestamp = (
+        datetime.now()
+        .strftime(
+            "%Y-%m-%d %H:%M IST"
+        )
+    )
+
+
+    ws.update(
+
+        [
+            [
+                (
+                    f"Backtest run: "
+                    f"{timestamp} | "
+                    f"GROSS returns, "
+                    f"no brokerage/STT/slippage modeled"
+                )
+            ]
+        ],
+
+        "A1"
+
+    )
+
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
+
+    summary_rows = (
+
+        [
+            [
+                "Summary",
+                ""
+            ]
+        ]
+
+        +
+
+        [
+            [k, v]
+            for k, v
+            in summary.items()
         ]
 
     )
 
 
-    # ---------------------------------------------------------
-    # CONFIG EXPORT
-    # ---------------------------------------------------------
-
-    config_rows = []
-
-
-    for key, value in CONFIG.items():
-
-        config_rows.append({
-
-            "Parameter":
-                key,
-
-            "Value":
-                value,
-
-        })
-
-
-    config_df = pd.DataFrame(
-        config_rows
+    ws.update(
+        summary_rows,
+        "A3"
     )
 
 
-    # ---------------------------------------------------------
-    # EXCEL
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # TRADE LOG
+    # --------------------------------------------------------
 
-    with pd.ExcelWriter(
-        filename,
-        engine="openpyxl"
-    ) as writer:
+    trade_start_row = (
 
-        summary.to_excel(
-            writer,
-            sheet_name="Summary",
-            index=False
-        )
+        3
+        +
+        len(summary_rows)
+        +
+        2
 
-
-        config_df.to_excel(
-            writer,
-            sheet_name="Config",
-            index=False
-        )
-
-
-        trades.to_excel(
-            writer,
-            sheet_name="Trade Log",
-            index=False
-        )
-
-
-        structure.to_excel(
-            writer,
-            sheet_name="Equity Curve",
-            index=False
-        )
-
-
-        data.to_excel(
-            writer,
-            sheet_name="Signal Data",
-            index=False
-        )
-
-
-    print(
-        "\nExcel output saved:"
-    )
-
-    print(
-        filename
     )
 
 
-# =============================================================
-# PRINT RESULTS
-# =============================================================
+    ws.update(
 
-def print_results(
-    statistics
-):
+        [
+            [
+                "Trade Log"
+            ]
+        ],
 
-    print("\n")
+        f"A{trade_start_row}"
 
-    print("=" * 70)
-
-    print(
-        "BACKTEST RESULTS"
     )
 
-    print("=" * 70)
+
+    trade_header_row = (
+        trade_start_row
+        +
+        1
+    )
 
 
-    for key, value in statistics.items():
+    if not trade_df.empty:
 
-        if isinstance(
-            value,
-            float
-        ):
+        ws.update(
 
-            if np.isfinite(value):
-
-                print(
-                    f"{key:30s}: "
-                    f"{value:.4f}"
+            [
+                list(
+                    trade_df.columns
                 )
+            ]
+            +
+            trade_df.values.tolist(),
 
-            else:
+            f"A{trade_header_row}"
 
-                print(
-                    f"{key:30s}: "
-                    f"{value}"
+        )
+
+
+    # --------------------------------------------------------
+    # EQUITY CURVE
+    # --------------------------------------------------------
+
+    equity_start_row = (
+
+        trade_header_row
+        +
+        len(trade_df)
+        +
+        3
+
+    )
+
+
+    ws.update(
+
+        [
+            [
+                "Daily Equity Curve"
+            ]
+        ],
+
+        f"A{equity_start_row}"
+
+    )
+
+
+    equity_header_row = (
+        equity_start_row
+        +
+        1
+    )
+
+
+    if not equity_df.empty:
+
+        ws.update(
+
+            [
+                list(
+                    equity_df.columns
                 )
+            ]
+            +
+            equity_df.values.tolist(),
 
-        else:
+            f"A{equity_header_row}"
 
-            print(
-                f"{key:30s}: "
-                f"{value}"
-            )
-
-
-    print("=" * 70)
+        )
 
 
-# =============================================================
+    print(
+
+        f"Backtest results written "
+        f"to '{BACKTEST_WORKSHEET}' tab: "
+
+        f"{len(trade_df)} trades, "
+
+        f"{len(equity_df)} trading days."
+
+    )
+
+
+# ============================================================
 # MAIN
-# =============================================================
-
-def main():
-
-    print("\n")
-
-    print("=" * 70)
-
-    print(
-        "RS SCREENER BACKTEST"
-    )
-
-    print("=" * 70)
-
-
-    # ---------------------------------------------------------
-    # CONFIG DISPLAY
-    # ---------------------------------------------------------
-
-    print(
-        "\nINPUT FILE:"
-    )
-
-    print(
-        CONFIG["INPUT_FILE"]
-    )
-
-
-    print(
-        "\nBACKTEST:"
-    )
-
-    print(
-        CONFIG["START_DATE"],
-        "→",
-        CONFIG["END_DATE"]
-    )
-
-
-    print(
-        "\nPORTFOLIO:"
-    )
-
-    print(
-        f"Top N = {CONFIG['TOP_N']}"
-    )
-
-
-    print(
-        "\nENTRY:"
-    )
-
-    print(
-        "RS New High = "
-        f"{CONFIG['RS_NEW_HIGH_LOOKBACK']} days"
-    )
-
-
-    print(
-        "Minimum RS Score = "
-        f"{CONFIG['MIN_RS_SCORE']}"
-    )
-
-
-    print(
-        "\nEXIT:"
-    )
-
-    print(
-        "RS Line < "
-        f"RS Line {CONFIG['RS_EXIT_EMA']}-EMA"
-    )
-
-
-    print(
-        "This is STATE-BASED, not crossover-based."
-    )
-
-
-    print(
-        "\nEXECUTION:"
-    )
-
-    print(
-        CONFIG["EXECUTION"]
-    )
-
-
-    print(
-        "\nCOSTS:"
-    )
-
-    print(
-        f"Cost per side = "
-        f"{CONFIG['COST_PER_SIDE_PCT']}%"
-    )
-
-
-    print(
-        f"Slippage per side = "
-        f"{CONFIG['SLIPPAGE_PER_SIDE_PCT']}%"
-    )
-
-
-    # ---------------------------------------------------------
-    # LOAD
-    # ---------------------------------------------------------
-
-    print(
-        "\nLoading data..."
-    )
-
-
-    raw_data = load_data()
-
-
-    print(
-        f"Loaded {len(raw_data):,} rows."
-    )
-
-
-    print(
-        f"Stocks: "
-        f"{raw_data['symbol'].nunique():,}"
-    )
-
-
-    print(
-        f"Raw dates: "
-        f"{raw_data['date'].min():%d %b %Y}"
-        f" → "
-        f"{raw_data['date'].max():%d %b %Y}"
-    )
-
-
-    # ---------------------------------------------------------
-    # INDICATORS
-    # ---------------------------------------------------------
-
-    print(
-        "\nCalculating indicators..."
-    )
-
-
-    data = calculate_indicators(
-        raw_data
-    )
-
-
-    # ---------------------------------------------------------
-    # BACKTEST
-    # ---------------------------------------------------------
-
-    print(
-        "\nRunning backtest..."
-    )
-
-
-    trades, equity_curve = (
-        run_backtest(
-            data
-        )
-    )
-
-
-    # ---------------------------------------------------------
-    # STATISTICS
-    # ---------------------------------------------------------
-
-    statistics = (
-        calculate_statistics(
-            trades,
-            equity_curve
-        )
-    )
-
-
-    # ---------------------------------------------------------
-    # PRINT
-    # ---------------------------------------------------------
-
-    print_results(
-        statistics
-    )
-
-
-    # ---------------------------------------------------------
-    # EXPORT
-    # ---------------------------------------------------------
-
-    export_results(
-
-        trades,
-
-        equity_curve,
-
-        statistics,
-
-        data
-
-    )
-
-
-    # ---------------------------------------------------------
-    # PLOT
-    # ---------------------------------------------------------
-
-    if CONFIG[
-        "PLOT_EQUITY_CURVE"
-    ]:
-
-        print(
-            "\nGenerating equity curve..."
-        )
-
-
-        plot_equity_curve(
-            equity_curve
-        )
-
-
-    print("\n")
-
-    print("=" * 70)
-
-    print(
-        "BACKTEST COMPLETE"
-    )
-
-    print("=" * 70)
-
-
-# =============================================================
-# RUN
-# =============================================================
+# ============================================================
 
 if __name__ == "__main__":
 
-    main()
+    trades, equity = (
+        run_backtest()
+    )
+
+
+    summary = (
+        compute_summary(
+            trades,
+            equity
+        )
+    )
+
+
+    print(
+        "\n--- SUMMARY ---"
+    )
+
+
+    for k, v in summary.items():
+
+        print(
+            f"{k}: {v}"
+        )
+
+
+    write_to_sheet(
+
+        trades,
+
+        equity,
+
+        summary
+
+    )
