@@ -26,10 +26,22 @@ IMPORTANT:
         AND
         Today RS Line < EMA
 
+DOWNLOAD:
+    Automatically downloads data beginning exactly
+    3 years before BACKTEST_START.
+
+    Example:
+        BACKTEST_START = "2016-04-01"
+
+        Download starts:
+        2013-04-01
+
+    This provides historical data before the backtest
+    for the 250-day RS high, 252-day Trend Template,
+    moving averages, and RS calculations.
+
 EXECUTION:
-    Existing backtest logic is retained:
-    decisions/signals are evaluated at today's close,
-    and exits are booked at today's close.
+    Signals and exits are evaluated at today's close.
 
 OUTPUT:
     Full trade log + daily equity curve + summary stats
@@ -60,19 +72,49 @@ import os
 BENCHMARK = "^CRSLDX"
 BENCHMARK_FALLBACK = "^NSEI"
 
+# ------------------------------------------------------------
+# RS NEW-HIGH LOOKBACK
+# ------------------------------------------------------------
+
 LOOKBACK_DAYS = 250
 
-DOWNLOAD_PERIOD = "24mo"
+
+# ------------------------------------------------------------
+# DOWNLOAD HISTORY
+# ------------------------------------------------------------
+#
+# Data will automatically be downloaded from exactly this
+# many years BEFORE BACKTEST_START.
+#
+# Example:
+#
+# BACKTEST_START = 2016-04-01
+# DOWNLOAD START = 2013-04-01
+#
+# ------------------------------------------------------------
+
+DOWNLOAD_YEARS_BEFORE_START = 3
+
+
+# ------------------------------------------------------------
+# STOCK UNIVERSE
+# ------------------------------------------------------------
 
 STOCKS_FILE = "stocks.csv"
 
+
+# ------------------------------------------------------------
+# PORTFOLIO
+# ------------------------------------------------------------
+
 TOP_N = 10
+
 
 # ------------------------------------------------------------
 # RS LINE EXIT
 # ------------------------------------------------------------
 #
-# Exit whenever:
+# EXIT whenever:
 #
 #     RS Line < RS Line 3-EMA
 #
@@ -82,19 +124,90 @@ TOP_N = 10
 
 RS_EXIT_EMA = 3
 
+
+# ------------------------------------------------------------
+# BACKTEST PERIOD
 # ------------------------------------------------------------
 
-BACKTEST_START = "2026-04-01"
+BACKTEST_START = "2016-04-01"
 
-MIN_PRICE = 10
 
-MIN_AVG_VOLUME = 10000
+# ------------------------------------------------------------
+# STOCK FILTERS
+# ------------------------------------------------------------
+
+MIN_PRICE = 20
+
+MIN_AVG_VOLUME = 100000
+
+
+# ------------------------------------------------------------
+# GOOGLE SHEETS
+# ------------------------------------------------------------
 
 SHEET_ID_ENV = "SHEET_ID"
 
 CREDS_ENV = "GOOGLE_CREDENTIALS"
 
 BACKTEST_WORKSHEET = "Backtest"
+
+
+# ============================================================
+# DOWNLOAD DATE CALCULATOR
+# ============================================================
+
+def get_download_dates():
+
+    """
+    Automatically calculates the Yahoo Finance download
+    window.
+
+    Download starts exactly 3 years before BACKTEST_START.
+
+    Example:
+
+        BACKTEST_START = 2016-04-01
+
+        DOWNLOAD_START = 2013-04-01
+
+        DOWNLOAD_END = tomorrow
+
+    One extra day is used on the end because yfinance's
+    'end' parameter is exclusive.
+    """
+
+    backtest_start = pd.Timestamp(
+        BACKTEST_START
+    )
+
+
+    download_start = (
+        backtest_start
+        -
+        pd.DateOffset(
+            years=DOWNLOAD_YEARS_BEFORE_START
+        )
+    )
+
+
+    download_end = (
+        pd.Timestamp.today()
+        +
+        pd.Timedelta(
+            days=1
+        )
+    )
+
+
+    return (
+        download_start.strftime(
+            "%Y-%m-%d"
+        ),
+
+        download_end.strftime(
+            "%Y-%m-%d"
+        )
+    )
 
 
 # ============================================================
@@ -107,6 +220,7 @@ def load_tickers():
         STOCKS_FILE
     )
 
+
     symbols = (
         df["symbol"]
         .dropna()
@@ -115,10 +229,15 @@ def load_tickers():
         .tolist()
     )
 
+
     return [
-        s if s.endswith(".NS")
+
+        s
+        if s.endswith(".NS")
         else s + ".NS"
+
         for s in symbols
+
     ]
 
 
@@ -128,20 +247,52 @@ def load_tickers():
 
 def download_benchmark():
 
+    download_start, download_end = (
+        get_download_dates()
+    )
+
+
+    print(
+        "\nBenchmark download:"
+    )
+
+
+    print(
+        f"Start: {download_start}"
+    )
+
+
+    print(
+        f"End:   {download_end}"
+    )
+
+
     for tkr in (
+
         BENCHMARK,
+
         BENCHMARK_FALLBACK
+
     ):
 
         try:
 
             data = yf.download(
+
                 tkr,
-                period=DOWNLOAD_PERIOD,
+
+                start=download_start,
+
+                end=download_end,
+
                 interval="1d",
+
                 auto_adjust=True,
+
                 progress=False
+
             )
+
 
             if not data.empty:
 
@@ -149,17 +300,30 @@ def download_benchmark():
                     f"Benchmark loaded: {tkr}"
                 )
 
+
                 close = data["Close"]
 
+
                 # Handle yfinance MultiIndex
+
                 if isinstance(
                     close,
                     pd.DataFrame
                 ):
 
-                    close = close.iloc[:, 0]
+                    close = (
+                        close.iloc[:, 0]
+                    )
+
+
+                close = (
+                    close
+                    .dropna()
+                )
+
 
                 return close
+
 
         except Exception as e:
 
@@ -185,11 +349,13 @@ def trend_template_series(s):
         .mean()
     )
 
+
     sma150 = (
         s
         .rolling(150)
         .mean()
     )
+
 
     sma200 = (
         s
@@ -197,16 +363,19 @@ def trend_template_series(s):
         .mean()
     )
 
+
     sma200_1mo = (
         sma200
         .shift(21)
     )
+
 
     low52 = (
         s
         .rolling(252)
         .min()
     )
+
 
     high52 = (
         s
@@ -259,19 +428,33 @@ def trend_template_series(s):
 
 
     met = (
+
         c1.astype(int)
+
         +
+
         c2.astype(int)
+
         +
+
         c3.astype(int)
+
         +
+
         c4.astype(int)
+
         +
+
         c5.astype(int)
+
         +
+
         c6.astype(int)
+
         +
+
         c7.astype(int)
+
     )
 
 
@@ -296,27 +479,31 @@ def compute_signals_for_stock(
     Returns a per-date DataFrame containing:
 
         price
+        rs_line
         rs_score
         blue_dot
         tt_pass
         rs_tt_pass
-        rs_line
         rs_exit_ema
         rs_exit
     """
 
 
     # --------------------------------------------------------
-    # Align stock and benchmark
+    # ALIGN STOCK AND BENCHMARK
     # --------------------------------------------------------
 
     aligned = pd.concat(
+
         [
             close,
             bench_close
         ],
+
         axis=1,
+
         join="inner"
+
     ).dropna()
 
 
@@ -325,6 +512,8 @@ def compute_signals_for_stock(
         "b"
     ]
 
+
+    # Need enough data for the longest indicator.
 
     if len(aligned) < 280:
 
@@ -337,13 +526,16 @@ def compute_signals_for_stock(
     #
     # RS Line = Stock / Benchmark
     #
-    # This is the RS line used by the backtest.
-    #
+    # --------------------------------------------------------
 
     rs_ratio = (
+
         aligned["s"]
+
         /
+
         aligned["b"]
+
     )
 
 
@@ -357,11 +549,17 @@ def compute_signals_for_stock(
     ):
 
         return (
+
             series
+
             /
+
             series.shift(days)
+
             -
+
             1
+
         )
 
 
@@ -410,33 +608,46 @@ def compute_signals_for_stock(
     #
     # New 250-day RS high.
     #
-    # The shift logic makes this a NEW high rather than
-    # simply "currently at rolling high".
+    # Today's value is compared against the previous
+    # rolling history using the shift logic.
     #
+    # --------------------------------------------------------
 
     rs_roll_high = (
+
         rs_ratio
+
         .rolling(
             LOOKBACK_DAYS
         )
+
         .max()
+
     )
 
 
     blue_dot = (
 
         (
+
             rs_ratio
+
             >=
+
             rs_roll_high
+
         )
 
         &
 
         (
+
             rs_ratio.shift(1)
+
             <
+
             rs_roll_high.shift(1)
+
         )
 
     )
@@ -468,22 +679,24 @@ def compute_signals_for_stock(
     # RS LINE 3-EMA
     # --------------------------------------------------------
     #
-    # IMPORTANT:
+    # EMA is calculated directly on the RS LINE.
     #
-    # This is EMA of the RS LINE itself.
-    #
-    # NOT EMA of price.
-    #
-    # NOT crossover logic.
-    #
+    # --------------------------------------------------------
 
     rs_exit_ema = (
+
         rs_ratio
+
         .ewm(
+
             span=RS_EXIT_EMA,
+
             adjust=False
+
         )
+
         .mean()
+
     )
 
 
@@ -495,18 +708,20 @@ def compute_signals_for_stock(
     #
     #     RS LINE < RS LINE 3-EMA
     #
-    # This is STATE-BASED.
+    # STATE-BASED.
     #
-    # If RS is below its 3-EMA for 1 day, 5 days,
-    # or 20 days, the condition remains TRUE.
+    # NO CROSSOVER TEST.
     #
-    # There is NO crossover requirement.
-    #
+    # --------------------------------------------------------
 
     rs_exit = (
+
         rs_ratio
+
         <
+
         rs_exit_ema
+
     )
 
 
@@ -553,18 +768,43 @@ def run_backtest():
 
 
     print(
-        f"Loaded {len(tickers)} tickers."
+        f"\nLoaded {len(tickers)} tickers."
+    )
+
+
+    download_start, download_end = (
+        get_download_dates()
     )
 
 
     print(
-        f"Backtesting from "
-        f"{BACKTEST_START} to today."
+        "\nBACKTEST DATA WINDOW"
+    )
+
+
+    print(
+        f"Download start : {download_start}"
+    )
+
+
+    print(
+        f"Backtest start : {BACKTEST_START}"
+    )
+
+
+    print(
+        "Backtest end   : TODAY"
+    )
+
+
+    print(
+        f"History before backtest: "
+        f"{DOWNLOAD_YEARS_BEFORE_START} years"
     )
 
 
     # --------------------------------------------------------
-    # BENCHMARK
+    # DOWNLOAD BENCHMARK
     # --------------------------------------------------------
 
     bench_close = (
@@ -587,9 +827,13 @@ def run_backtest():
 
 
     for i in range(
+
         0,
+
         len(tickers),
+
         batch_size
+
     ):
 
         batch = tickers[
@@ -599,8 +843,11 @@ def run_backtest():
 
 
         print(
-            f"Downloading batch "
-            f"{i}-{i + len(batch)}..."
+
+            f"\nDownloading batch "
+            f"{i} - "
+            f"{i + len(batch)}..."
+
         )
 
 
@@ -610,7 +857,9 @@ def run_backtest():
 
                 batch,
 
-                period=DOWNLOAD_PERIOD,
+                start=download_start,
+
+                end=download_end,
 
                 interval="1d",
 
@@ -643,11 +892,14 @@ def run_backtest():
             try:
 
                 # Single ticker
+
                 if len(batch) == 1:
 
                     sdata = data
 
+
                 # Multiple tickers
+
                 else:
 
                     sdata = data[
@@ -656,43 +908,84 @@ def run_backtest():
 
 
                 close = (
+
                     sdata["Close"]
+
                     .dropna()
+
                 )
 
 
                 volume = (
+
                     sdata["Volume"]
+
                     .dropna()
+
                 )
 
 
                 # ------------------------------------------------
-                # BASIC DATA FILTERS
+                # BASIC DATA FILTER
                 # ------------------------------------------------
 
                 if (
+
                     close.empty
+
                     or
+
                     len(close) < 280
+
                 ):
 
                     continue
 
 
+                # ------------------------------------------------
+                # CURRENT PRICE FILTER
+                # ------------------------------------------------
+                #
+                # WARNING:
+                #
+                # This is a CURRENT price filter.
+                # It is therefore not historically neutral.
+                #
+                # It is retained exactly from your existing code.
+                #
+                # ------------------------------------------------
+
                 if (
+
                     close.iloc[-1]
+
                     <
+
                     MIN_PRICE
+
                 ):
 
                     continue
 
 
+                # ------------------------------------------------
+                # CURRENT VOLUME FILTER
+                # ------------------------------------------------
+                #
+                # Also a CURRENT liquidity filter.
+                #
+                # Retained exactly from your original code.
+                #
+                # ------------------------------------------------
+
                 if (
+
                     volume.tail(20).mean()
+
                     <
+
                     MIN_AVG_VOLUME
+
                 ):
 
                     continue
@@ -703,27 +996,38 @@ def run_backtest():
                 # ------------------------------------------------
 
                 sig = (
+
                     compute_signals_for_stock(
+
                         close,
+
                         bench_close
+
                     )
+
                 )
 
 
                 if sig is not None:
 
                     all_signals[
+
                         symbol.replace(
                             ".NS",
                             ""
                         )
+
                     ] = sig
 
 
             except Exception as e:
 
                 print(
-                    f"Skipping {symbol}: {e}"
+
+                    f"Skipping "
+                    f"{symbol}: "
+                    f"{e}"
+
                 )
 
                 continue
@@ -733,9 +1037,11 @@ def run_backtest():
 
 
     print(
-        f"Signals computed for "
+
+        f"\nSignals computed for "
         f"{len(all_signals)} stocks "
         f"with sufficient history."
+
     )
 
 
@@ -744,13 +1050,19 @@ def run_backtest():
     # ========================================================
 
     trading_days = (
+
         bench_close.index[
+
             bench_close.index
+
             >=
+
             pd.Timestamp(
                 BACKTEST_START
             )
+
         ]
+
     )
 
 
@@ -761,9 +1073,13 @@ def run_backtest():
             "in the backtest window."
         )
 
+
         return (
+
             pd.DataFrame(),
+
             pd.DataFrame()
+
         )
 
 
@@ -810,13 +1126,13 @@ def run_backtest():
                 continue
 
 
-            # EXACT LIVE SELECTION RULE:
+            # EXACT SELECTION RULE:
             #
             # Blue Dot
             # +
-            # Price TT
+            # Price Trend Template
             # +
-            # RS TT
+            # RS Trend Template
 
             if (
 
@@ -841,6 +1157,7 @@ def run_backtest():
                 pool.append(
 
                     (
+
                         sym,
 
                         float(
@@ -861,8 +1178,11 @@ def run_backtest():
         # ----------------------------------------------------
 
         pool.sort(
+
             key=lambda x: x[1],
+
             reverse=True
+
         )
 
 
@@ -876,9 +1196,13 @@ def run_backtest():
 
 
         target_syms = {
+
             s
+
             for s, _, _
+
             in target
+
         }
 
 
@@ -887,6 +1211,7 @@ def run_backtest():
             s: p
 
             for s, _, p
+
             in target
 
         }
@@ -896,13 +1221,17 @@ def run_backtest():
         # SNAPSHOT PRE-TODAY HOLDINGS
         # ====================================================
         #
-        # Only these positions contribute today's price move.
+        # Only positions held before today's decisions
+        # contribute today's price return.
         #
-        # A stock entered today starts contributing tomorrow.
+        # New positions begin contributing tomorrow.
         #
+        # ====================================================
 
         held_before_today = set(
+
             holdings.keys()
+
         )
 
 
@@ -928,22 +1257,37 @@ def run_backtest():
 
 
                 idx = (
+
                     df.index
-                    .get_loc(date)
+
+                    .get_loc(
+                        date
+                    )
+
                 )
 
 
                 if idx > 0:
 
                     prev_price = (
+
                         df["price"]
-                        .iloc[idx - 1]
+
+                        .iloc[
+                            idx - 1
+                        ]
+
                     )
 
 
                     curr_price = (
+
                         df["price"]
-                        .iloc[idx]
+
+                        .iloc[
+                            idx
+                        ]
+
                     )
 
 
@@ -965,7 +1309,9 @@ def run_backtest():
                 equity *= (
 
                     1
+
                     +
+
                     float(
                         np.mean(rets)
                     )
@@ -977,18 +1323,20 @@ def run_backtest():
         # EXIT LOGIC
         # ====================================================
         #
-        # TWO POSSIBLE EXIT CONDITIONS:
+        # EXIT if:
         #
-        # 1. RS LINE < RS LINE 3-EMA
+        # 1. RS Line < RS Line 3-EMA
         #
-        # 2. Stock no longer belongs to target TOP_N
+        # OR
         #
-        # The RS exit is independent of crossover.
+        # 2. Stock is no longer in today's Top-N target.
         #
         # ====================================================
 
         for sym in list(
+
             holdings.keys()
+
         ):
 
             df = all_signals[
@@ -1009,7 +1357,9 @@ def run_backtest():
             # ------------------------------------------------
 
             rs_exit = bool(
+
                 row["rs_exit"]
+
             )
 
 
@@ -1018,9 +1368,13 @@ def run_backtest():
             # ------------------------------------------------
 
             target_exit = (
+
                 sym
+
                 not in
+
                 target_syms
+
             )
 
 
@@ -1029,9 +1383,13 @@ def run_backtest():
             # ------------------------------------------------
 
             if (
+
                 rs_exit
+
                 or
+
                 target_exit
+
             ):
 
                 entry = holdings.pop(
@@ -1040,18 +1398,24 @@ def run_backtest():
 
 
                 exit_price = float(
+
                     row["price"]
+
                 )
 
 
                 ret = (
 
                     exit_price
+
                     /
+
                     entry[
                         "entry_price"
                     ]
+
                     -
+
                     1
 
                 ) * 100
@@ -1064,14 +1428,19 @@ def run_backtest():
                 if rs_exit:
 
                     exit_reason = (
+
                         f"RS Line < "
                         f"RS Line {RS_EXIT_EMA}-EMA"
+
                     )
 
                 else:
 
                     exit_reason = (
-                        "No longer in Top-N target"
+
+                        "No longer in "
+                        "Top-N target"
+
                     )
 
 
@@ -1094,31 +1463,45 @@ def run_backtest():
 
                     "entry_price":
                         round(
+
                             entry[
                                 "entry_price"
                             ],
+
                             2
+
                         ),
 
                     "exit_price":
                         round(
+
                             exit_price,
+
                             2
+
                         ),
 
                     "return_pct":
                         round(
+
                             ret,
+
                             2
+
                         ),
 
                     "days_held":
+
                         (
+
                             date
+
                             -
+
                             entry[
                                 "entry_date"
                             ]
+
                         ).days,
 
                     "exit_reason":
@@ -1133,9 +1516,10 @@ def run_backtest():
         #
         # Entries occur at today's close.
         #
-        # Therefore today's already-completed price move is
-        # NOT included in today's portfolio return.
+        # Today's already-completed price move is NOT included
+        # in today's portfolio return.
         #
+        # ====================================================
 
         for sym in target_syms:
 
@@ -1161,17 +1545,20 @@ def run_backtest():
         equity_curve.append({
 
             "date":
+
                 date.strftime(
                     "%Y-%m-%d"
                 ),
 
             "equity":
+
                 round(
                     equity,
                     4
                 ),
 
             "n_holdings":
+
                 len(
                     holdings
                 )
@@ -1198,29 +1585,37 @@ def run_backtest():
         if last_date in df.index:
 
             exit_price = float(
+
                 df.loc[
                     last_date,
                     "price"
                 ]
+
             )
 
         else:
 
             exit_price = (
+
                 entry[
                     "entry_price"
                 ]
+
             )
 
 
         ret = (
 
             exit_price
+
             /
+
             entry[
                 "entry_price"
             ]
+
             -
+
             1
 
         ) * 100
@@ -1249,31 +1644,45 @@ def run_backtest():
 
             "entry_price":
                 round(
+
                     entry[
                         "entry_price"
                     ],
+
                     2
+
                 ),
 
             "exit_price":
                 round(
+
                     exit_price,
+
                     2
+
                 ),
 
             "return_pct":
                 round(
+
                     ret,
+
                     2
+
                 ),
 
             "days_held":
+
                 (
+
                     last_date
+
                     -
+
                     entry[
                         "entry_date"
                     ]
+
                 ).days,
 
             "exit_reason":
@@ -1297,8 +1706,11 @@ def run_backtest():
 
 
     return (
+
         trade_df,
+
         equity_df
+
     )
 
 
@@ -1323,11 +1735,15 @@ def compute_summary(
     total_return_pct = round(
 
         (
+
             equity_df[
                 "equity"
             ].iloc[-1]
+
             -
+
             1
+
         )
 
         * 100,
@@ -1342,10 +1758,13 @@ def compute_summary(
     # --------------------------------------------------------
 
     running_max = (
+
         equity_df[
             "equity"
         ]
+
         .cummax()
+
     )
 
 
@@ -1354,17 +1773,24 @@ def compute_summary(
         equity_df[
             "equity"
         ]
+
         /
+
         running_max
+
         -
+
         1
 
     ) * 100
 
 
     max_dd = round(
+
         drawdown.min(),
+
         2
+
     )
 
 
@@ -1377,7 +1803,10 @@ def compute_summary(
         closed_trades = (
 
             trade_df[
-                ~trade_df[
+
+                ~
+
+                trade_df[
                     "exit_date"
                 ]
                 .astype(str)
@@ -1385,6 +1814,7 @@ def compute_summary(
                     "OPEN",
                     na=False
                 )
+
             ]
 
         )
@@ -1410,14 +1840,21 @@ def compute_summary(
         win_rate = round(
 
             (
+
                 closed_trades[
                     "return_pct"
                 ]
+
                 >
+
                 0
+
             )
+
             .mean()
+
             *
+
             100,
 
             1
@@ -1430,6 +1867,7 @@ def compute_summary(
             closed_trades[
                 "return_pct"
             ]
+
             .mean(),
 
             2
@@ -1442,6 +1880,7 @@ def compute_summary(
             closed_trades[
                 "days_held"
             ]
+
             .mean(),
 
             1
@@ -1450,16 +1889,24 @@ def compute_summary(
 
 
         best_trade = (
+
             closed_trades[
                 "return_pct"
-            ].max()
+            ]
+
+            .max()
+
         )
 
 
         worst_trade = (
+
             closed_trades[
                 "return_pct"
-            ].min()
+            ]
+
+            .min()
+
         )
 
 
@@ -1515,11 +1962,17 @@ def compute_summary(
         "Exit Type":
             "STATE-BASED, NOT CROSSOVER",
 
-        "Backtest Window":
+        "Download Start":
+            download_start,
+
+        "Backtest Start":
+            BACKTEST_START,
+
+        "Backtest End":
             (
-                f"{BACKTEST_START} "
-                f"to "
-                f"{equity_df['date'].iloc[-1]}"
+                equity_df[
+                    "date"
+                ].iloc[-1]
             ),
 
     }
@@ -1552,21 +2005,29 @@ def write_to_sheet(
     if not sheet_id or not creds_json:
 
         print(
+
             "Missing "
             "SHEET_ID/GOOGLE_CREDENTIALS "
             "-- saving to CSV instead."
+
         )
 
 
         trade_df.to_csv(
+
             "backtest_trades.csv",
+
             index=False
+
         )
 
 
         equity_df.to_csv(
+
             "backtest_equity.csv",
+
             index=False
+
         )
 
 
@@ -1583,16 +2044,24 @@ def write_to_sheet(
 
 
     scopes = [
+
         "https://www.googleapis.com/auth/spreadsheets"
+
     ]
 
 
     creds = (
+
         Credentials
+
         .from_service_account_info(
+
             creds_dict,
+
             scopes=scopes
+
         )
+
     )
 
 
@@ -1611,30 +2080,45 @@ def write_to_sheet(
     # --------------------------------------------------------
 
     n_rows_needed = (
+
         len(trade_df)
+
         +
+
         len(equity_df)
+
         +
+
         30
+
     )
 
 
     try:
 
         ws = sh.worksheet(
+
             BACKTEST_WORKSHEET
+
         )
 
 
         if (
+
             ws.row_count
+
             <
+
             n_rows_needed
+
         ):
 
             ws.resize(
+
                 rows=n_rows_needed,
+
                 cols=10
+
             )
 
 
@@ -1662,24 +2146,36 @@ def write_to_sheet(
 
 
     timestamp = (
+
         datetime.now()
+
         .strftime(
             "%Y-%m-%d %H:%M IST"
         )
+
     )
 
 
     ws.update(
 
         [
+
             [
+
                 (
+
                     f"Backtest run: "
                     f"{timestamp} | "
                     f"GROSS returns, "
-                    f"no brokerage/STT/slippage modeled"
+                    f"no brokerage/STT/slippage modeled | "
+                    f"RS exit = "
+                    f"RS Line < "
+                    f"RS Line {RS_EXIT_EMA}-EMA"
+
                 )
+
             ]
+
         ],
 
         "A1"
@@ -1694,26 +2190,35 @@ def write_to_sheet(
     summary_rows = (
 
         [
+
             [
                 "Summary",
                 ""
             ]
+
         ]
 
         +
 
         [
+
             [k, v]
+
             for k, v
+
             in summary.items()
+
         ]
 
     )
 
 
     ws.update(
+
         summary_rows,
+
         "A3"
+
     )
 
 
@@ -1724,9 +2229,13 @@ def write_to_sheet(
     trade_start_row = (
 
         3
+
         +
+
         len(summary_rows)
+
         +
+
         2
 
     )
@@ -1735,9 +2244,11 @@ def write_to_sheet(
     ws.update(
 
         [
+
             [
                 "Trade Log"
             ]
+
         ],
 
         f"A{trade_start_row}"
@@ -1746,9 +2257,13 @@ def write_to_sheet(
 
 
     trade_header_row = (
+
         trade_start_row
+
         +
+
         1
+
     )
 
 
@@ -1757,11 +2272,15 @@ def write_to_sheet(
         ws.update(
 
             [
+
                 list(
                     trade_df.columns
                 )
+
             ]
+
             +
+
             trade_df.values.tolist(),
 
             f"A{trade_header_row}"
@@ -1776,9 +2295,13 @@ def write_to_sheet(
     equity_start_row = (
 
         trade_header_row
+
         +
+
         len(trade_df)
+
         +
+
         3
 
     )
@@ -1787,9 +2310,11 @@ def write_to_sheet(
     ws.update(
 
         [
+
             [
                 "Daily Equity Curve"
             ]
+
         ],
 
         f"A{equity_start_row}"
@@ -1798,9 +2323,13 @@ def write_to_sheet(
 
 
     equity_header_row = (
+
         equity_start_row
+
         +
+
         1
+
     )
 
 
@@ -1809,11 +2338,15 @@ def write_to_sheet(
         ws.update(
 
             [
+
                 list(
                     equity_df.columns
                 )
+
             ]
+
             +
+
             equity_df.values.tolist(),
 
             f"A{equity_header_row}"
@@ -1823,7 +2356,7 @@ def write_to_sheet(
 
     print(
 
-        f"Backtest results written "
+        f"\nBacktest results written "
         f"to '{BACKTEST_WORKSHEET}' tab: "
 
         f"{len(trade_df)} trades, "
