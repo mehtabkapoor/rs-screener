@@ -94,22 +94,34 @@ CREDS_ENV = "GOOGLE_CREDENTIALS"
 BACKTEST_WORKSHEET = "Backtest"
 COMPARISON_WORKSHEET = "Backtest_Exit_Comparison"
 
-# ---- Exit variants to compare (all run against the same precomputed data) ----
+# ---- Rank hysteresis (merged in from v4) ----
+# Entry threshold = Top 10. Exit threshold = rank > RANK_EXIT.
+# This means a holding can drift #5 -> #11 -> #15 -> #19 WITHOUT being sold
+# purely on rank -- it's only forced out once it falls past RANK_EXIT, or
+# the variant's own secondary exit fires, or the circuit breaker forces a
+# full defensive exit. This applies to EVERY variant below (not a separate
+# mutually-exclusive option), because rank hysteresis is the structural
+# baseline risk control, and the secondary rule is a tactical layer on top.
+RANK_EXIT = 20
+
+# ---- Secondary exit variants (compared side by side, ALL combined with
+# the RANK_EXIT hysteresis above) ----
 # type options:
-#   "rs_ema_state"     -- exit whenever RS line < RS EMA(span)      [current/original rule]
-#   "rs_ema_cross"      -- exit only on the CROSSOVER day (was above, now below)
-#   "rank_buffer"        -- no RS-based exit; hold until rank falls past `buffer`
-#   "tt_fail_cross"      -- exit only when price Trend Template flips PASS->FAIL
+#   "rs_ema_state"   -- exit whenever RS line < RS EMA(span)
+#   "rs_ema_cross"   -- exit only on the CROSSOVER day (was above, now below)
+#   "none"           -- no secondary exit; rank hysteresis alone governs exits
+#   "tt_fail_cross"  -- exit only when price Trend Template flips PASS->FAIL
 EXIT_VARIANTS = [
-    {"name": "RS<3EMA (state, original)",  "type": "rs_ema_state", "span": 3},
-    {"name": "RS<3EMA (crossover)",         "type": "rs_ema_cross", "span": 3},
-    {"name": "RS<10EMA (crossover)",        "type": "rs_ema_cross", "span": 10},
-    {"name": "RS<20EMA (crossover)",        "type": "rs_ema_cross", "span": 20},
-    {"name": "RS<20EMA (state)",            "type": "rs_ema_state", "span": 20},
-    {"name": "Rank buffer only (buf=20)",   "type": "rank_buffer",  "buffer": 20},
-    {"name": "Trend Template fail (cross)", "type": "tt_fail_cross"},
+    {"name": "RS<3EMA (state) + Rank20",         "type": "rs_ema_state", "span": 3},
+    {"name": "RS<3EMA (crossover) + Rank20",      "type": "rs_ema_cross", "span": 3},
+    {"name": "RS<5EMA (crossover) + Rank20",      "type": "rs_ema_cross", "span": 5},
+    {"name": "RS<10EMA (crossover) + Rank20",     "type": "rs_ema_cross", "span": 10},
+    {"name": "RS<20EMA (crossover) + Rank20",     "type": "rs_ema_cross", "span": 20},
+    {"name": "RS<20EMA (state) + Rank20",         "type": "rs_ema_state", "span": 20},
+    {"name": "Rank20 only (no secondary exit)",   "type": "none"},
+    {"name": "Trend Template fail (cross) + Rank20", "type": "tt_fail_cross"},
 ]
-PRIMARY_VARIANT_INDEX = 3   # which variant's FULL trade log gets written (0-indexed)
+PRIMARY_VARIANT_INDEX = 2   # RS<5EMA (crossover) + Rank20 -- the recommended default
 # -----------------------------------------
 
 
@@ -348,7 +360,6 @@ def run_backtest_for_variant(all_signals, trading_days, variant, breadth_df):
 
     v_type = variant["type"]
     span = variant.get("span")
-    buffer = variant.get("buffer")
 
     for date in trading_days:
         regime_row = breadth_df.loc[date] if date in breadth_df.index else None
@@ -369,7 +380,6 @@ def run_backtest_for_variant(all_signals, trading_days, variant, breadth_df):
                 pool.append((sym, float(row["rs_score"])))
         pool.sort(key=lambda x: x[1], reverse=True)
         rank_lookup = {sym: i + 1 for i, (sym, _) in enumerate(pool)}
-        target_syms_topn = {sym for sym, _ in pool[:TOP_N]}
 
         # ---- Mark-to-market current portfolio value (for sizing new entries) ----
         portfolio_value = cash
@@ -378,37 +388,41 @@ def run_backtest_for_variant(all_signals, trading_days, variant, breadth_df):
             price = float(df.loc[date, "price"]) if date in df.index else pos["entry_price"]
             portfolio_value += pos["qty"] * price
 
-        # ---- Exit logic (variant-specific), or forced by circuit breaker ----
+        # ---- Exit logic: rank-20 hysteresis + variant's secondary exit, both
+        # combined for every variant (a stock exits if EITHER fires), plus a
+        # circuit breaker override that forces every position out regardless. ----
         for sym in list(holdings.keys()):
             df = all_signals[sym]
             if date not in df.index:
                 continue
             row = df.loc[date]
+            current_rank = rank_lookup.get(sym, 9999)
+            rank_exit_trigger = current_rank > RANK_EXIT
+
+            if v_type == "rs_ema_state":
+                secondary_trigger = bool(row.get(f"rs_below_ema{span}", False))
+                secondary_reason = f"RS Line < RS Line {span}-EMA"
+            elif v_type == "rs_ema_cross":
+                secondary_trigger = bool(row.get(f"rs_cross_below_ema{span}", False))
+                secondary_reason = f"RS Line crossed below {span}-EMA"
+            elif v_type == "tt_fail_cross":
+                secondary_trigger = bool(row.get("tt_fail_cross", False))
+                secondary_reason = "Trend Template PASS->FAIL"
+            else:  # "none" -- rank hysteresis is the only exit mechanism
+                secondary_trigger, secondary_reason = False, "N/A"
 
             if circuit_breaker:
-                exit_trigger, reason = True, "CIRCUIT BREAKER: forced exit"
-            elif v_type == "rank_buffer":
-                rank = rank_lookup.get(sym, 9999)
-                exit_trigger = rank > buffer
-                reason = f"Rank > {buffer}"
-            elif v_type == "rs_ema_state":
-                exit_trigger = bool(row.get(f"rs_below_ema{span}", False))
-                reason = f"RS Line < RS Line {span}-EMA"
-            elif v_type == "rs_ema_cross":
-                exit_trigger = bool(row.get(f"rs_cross_below_ema{span}", False))
-                reason = f"RS Line crossed below {span}-EMA"
-            elif v_type == "tt_fail_cross":
-                exit_trigger = bool(row.get("tt_fail_cross", False))
-                reason = "Trend Template PASS->FAIL"
+                exit_now, reason = True, "CIRCUIT BREAKER: forced exit"
+            elif secondary_trigger:
+                exit_now, reason = True, secondary_reason
+            elif rank_exit_trigger:
+                exit_now = True
+                reason = ("No longer in eligible pool" if current_rank == 9999
+                           else f"Rank {current_rank} > {RANK_EXIT}")
             else:
-                exit_trigger, reason = False, "N/A"
+                exit_now, reason = False, None
 
-            if v_type == "rank_buffer" and not circuit_breaker:
-                target_exit = False
-            else:
-                target_exit = (not circuit_breaker) and (sym not in target_syms_topn)
-
-            if exit_trigger or target_exit:
+            if exit_now:
                 pos = holdings.pop(sym)
                 exit_price = float(row["price"])
                 gross_proceeds = pos["qty"] * exit_price
@@ -435,19 +449,15 @@ def run_backtest_for_variant(all_signals, trading_days, variant, breadth_df):
                     "net_pnl_rs": round(net_gain - tax, 2),
                     "net_return_pct": net_return_pct,
                     "days_held": (date - pos["entry_date"]).days,
-                    "exit_reason": reason if (exit_trigger or circuit_breaker) else "No longer in Top-N pool",
+                    "exit_reason": reason,
+                    "exit_rank": current_rank if current_rank != 9999 else "",
                 })
 
         # ---- Entries (skipped entirely if circuit breaker just fired) ----
         if not circuit_breaker and allow_new_entries:
             slot_capital = (portfolio_value / TOP_N) * size_multiplier
-
-            if v_type == "rank_buffer":
-                slots_open = TOP_N - len(holdings)
-                candidates = [s for s, _ in sorted(pool, key=lambda x: x[1], reverse=True)]
-            else:
-                slots_open = TOP_N - len(holdings)
-                candidates = [s for s in target_syms_topn if s not in holdings]
+            slots_open = TOP_N - len(holdings)
+            candidates = [s for s, _ in pool]  # already sorted by RS Score desc
 
             for sym in candidates:
                 if slots_open <= 0:
@@ -512,6 +522,7 @@ def run_backtest_for_variant(all_signals, trading_days, variant, breadth_df):
                 "net_return_pct": net_return_pct,
                 "days_held": (last_date - pos["entry_date"]).days,
                 "exit_reason": "BACKTEST END (mark-to-market, not actually sold)",
+                "exit_rank": "",
             })
 
     return pd.DataFrame(trade_log), pd.DataFrame(equity_curve)
@@ -537,23 +548,57 @@ def summarize(trade_df, equity_df):
         win_rate_net = round((closed["net_return_pct"] > 0).mean() * 100, 1)
         avg_gross = round(closed["gross_return_pct"].mean(), 2)
         avg_net = round(closed["net_return_pct"].mean(), 2)
+        median_net = round(closed["net_return_pct"].median(), 2)
         avg_days = round(closed["days_held"].mean(), 1)
+        median_days = round(closed["days_held"].median(), 1)
         best_gross = closed["gross_return_pct"].max()
         worst_gross = closed["gross_return_pct"].min()
         total_costs_rs = round((closed["buy_cost_rs"] + closed["sell_cost_rs"]).sum(), 0)
         total_tax_rs = round(closed["stcg_tax_rs"].sum(), 0)
+
+        # Winner/loser split and profit factor -- computed NET (after cost+tax)
+        winners = closed[closed["net_return_pct"] > 0]
+        losers = closed[closed["net_return_pct"] < 0]
+        avg_winner_net = round(winners["net_return_pct"].mean(), 2) if len(winners) else 0
+        avg_loser_net = round(losers["net_return_pct"].mean(), 2) if len(losers) else 0
+        gross_profit_net = winners["net_pnl_rs"].sum() if len(winners) else 0
+        gross_loss_net = abs(losers["net_pnl_rs"].sum()) if len(losers) else 0
+        profit_factor_net = round(gross_profit_net / gross_loss_net, 3) if gross_loss_net > 0 else 0
     else:
-        win_rate_gross = win_rate_net = avg_gross = avg_net = avg_days = 0
-        best_gross = worst_gross = total_costs_rs = total_tax_rs = 0
+        win_rate_gross = win_rate_net = avg_gross = avg_net = median_net = 0
+        avg_days = median_days = best_gross = worst_gross = 0
+        total_costs_rs = total_tax_rs = avg_winner_net = avg_loser_net = profit_factor_net = 0
+
+    # ---- Risk-adjusted metrics, computed on the REAL (net) daily equity curve ----
+    daily_returns = equity_df["equity"].pct_change().dropna()
+    if len(daily_returns):
+        daily_mean, daily_std = daily_returns.mean(), daily_returns.std()
+        n_days = len(equity_df)
+        annualized_return = equity_df["equity"].iloc[-1] ** (252 / max(n_days, 1)) - 1
+        annualized_vol = daily_std * np.sqrt(252)
+        sharpe = (daily_mean / daily_std * np.sqrt(252)) if daily_std > 0 else 0
+        downside = daily_returns[daily_returns < 0]
+        downside_std = downside.std() if len(downside) else 0
+        sortino = (daily_mean / downside_std * np.sqrt(252)) if downside_std > 0 else 0
+    else:
+        annualized_return = annualized_vol = sharpe = sortino = 0
+
+    calmar = round(annualized_return / abs(max_dd / 100), 3) if abs(max_dd) > 0 else 0
 
     return {
         "final_portfolio_value_rs": round(final_value, 0),
         "net_total_return_pct": net_total_return_pct,
+        "annualized_return_pct": round(annualized_return * 100, 2),
+        "annualized_volatility_pct": round(annualized_vol * 100, 2),
+        "sharpe": round(sharpe, 3), "sortino": round(sortino, 3), "calmar": calmar,
         "max_dd_pct": max_dd,
         "n_trades": n,
         "win_rate_gross": win_rate_gross, "win_rate_net": win_rate_net,
         "avg_gross_return_per_trade": avg_gross, "avg_net_return_per_trade": avg_net,
-        "avg_days_held": avg_days,
+        "median_net_return_per_trade": median_net,
+        "avg_days_held": avg_days, "median_days_held": median_days,
+        "avg_winner_net": avg_winner_net, "avg_loser_net": avg_loser_net,
+        "profit_factor_net": profit_factor_net,
         "best_gross_trade": best_gross, "worst_gross_trade": worst_gross,
         "total_costs_rs": total_costs_rs, "total_stcg_tax_rs": total_tax_rs,
     }
@@ -570,6 +615,8 @@ def run_backtest():
     print(f"Backtest end   : {BACKTEST_END}")
     print(f"Data cleaning threshold: +/-{MAX_PLAUSIBLE_DAILY_MOVE*100:.0f}% single-day move")
     print(f"Liquidity filter: price >= {MIN_PRICE}, {VOLUME_LOOKBACK}d avg volume >= {MIN_AVG_VOLUME}")
+    print(f"Maximum holdings: {TOP_N}  |  Rank exit: > {RANK_EXIT} (hysteresis: entry top {TOP_N}, exit past {RANK_EXIT})")
+    print(f"Starting capital: Rs.{STARTING_CAPITAL:,.0f}  |  Regime filter: {'ON' if ENABLE_REGIME_FILTER else 'OFF'}")
     print("=" * 50)
 
     bench_close = download_benchmark()
@@ -640,6 +687,9 @@ def run_backtest():
         summary["variant"] = variant["name"]
         comparison_rows.append(summary)
         print(f"  Net Return: {summary.get('net_total_return_pct')}% | "
+              f"CAGR: {summary.get('annualized_return_pct')}% | "
+              f"Sharpe: {summary.get('sharpe')} | Sortino: {summary.get('sortino')} | "
+              f"Calmar: {summary.get('calmar')} | "
               f"Final Value: Rs.{summary.get('final_portfolio_value_rs'):,.0f} | "
               f"Max DD: {summary.get('max_dd_pct')}% | "
               f"Trades: {summary.get('n_trades')} | Net Win Rate: {summary.get('win_rate_net')}% | "
@@ -649,9 +699,12 @@ def run_backtest():
             primary_trades, primary_equity = trades, equity
 
     comparison_df = pd.DataFrame(comparison_rows)[
-        ["variant", "final_portfolio_value_rs", "net_total_return_pct", "max_dd_pct",
-         "n_trades", "win_rate_gross", "win_rate_net", "avg_gross_return_per_trade",
-         "avg_net_return_per_trade", "avg_days_held", "best_gross_trade", "worst_gross_trade",
+        ["variant", "final_portfolio_value_rs", "net_total_return_pct",
+         "annualized_return_pct", "annualized_volatility_pct", "sharpe", "sortino", "calmar",
+         "max_dd_pct", "n_trades", "win_rate_gross", "win_rate_net",
+         "avg_gross_return_per_trade", "avg_net_return_per_trade", "median_net_return_per_trade",
+         "avg_days_held", "median_days_held", "avg_winner_net", "avg_loser_net",
+         "profit_factor_net", "best_gross_trade", "worst_gross_trade",
          "total_costs_rs", "total_stcg_tax_rs"]
     ]
 
@@ -763,10 +816,17 @@ if __name__ == "__main__":
 #    law allows loss carry-forward/set-off) -- this makes the tax estimate
 #    conservative (i.e. real net returns could be somewhat better than shown).
 #
-# 4. The "Top-N membership" exit ALWAYS applies on top of whichever exit
-#    variant is selected (except rank_buffer, which relaxes it on purpose)
-#    -- so even the "loosest" variants still see turnover from stocks simply
-#    falling out of the top 10 by RS Score. If turnover is still too high
-#    after comparing variants, the next experiment worth running is
-#    combining "rank_buffer" (hold to rank 20) WITH a slow RS-EMA crossover
-#    exit, instead of either alone.
+# 4. RANK-20 HYSTERESIS IS NOW UNIVERSAL (v4 merge). Every variant combines
+#    two exit conditions: rank falls past RANK_EXIT (20), OR the variant's
+#    own secondary rule fires (RS-EMA cross/state, Trend Template fail).
+#    A holding can drift #5 -> #11 -> #19 without being force-sold purely
+#    on rank; it only exits at rank 21+, on the secondary trigger, or on a
+#    circuit breaker. "Rank20 only" (secondary exit disabled) isolates how
+#    much the hysteresis alone contributes vs. each tactical exit layered
+#    on top -- that comparison is the most direct answer to "is a faster
+#    RS-based exit actually adding value over the buffer alone."
+#
+# 5. Entries fill open slots from the full ranked pool (not strictly
+#    literal top 10) whenever slots are open -- so if hysteresis keeps 6
+#    positions in the 11-20 buffer zone, only 4 new slots open up, filled
+#    by the 4 highest-RS-Score eligible names not already held.
