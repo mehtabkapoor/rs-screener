@@ -1,11 +1,12 @@
 """
-RS Screener - Clone of iArpanK's AmiBroker RS-Screener logic
-Computes IBD-style Relative Strength Score, flags:
-  - Blue Dot  : RS line made a new N-day high
-  - Green Dot : RS made a new high AND price has NOT yet made a new high
-                (this is the "about to breakout" precursor signal)
+RS Screener - Simplified Trend Template & RS Rank Portfolio System
+Computes IBD-style Relative Strength Score and applies structural filters:
+  - Stock Trend Template PASS (Minervini 7-point criteria)
+  - RS Line Trend Template PASS (Relative strength structural durability)
+  - Portfolio Selection: Top 10 stocks sorted by RS Score from high to low
+  - Exit Condition: Position is liquidated when it falls outside the Top 10
 
-Runs fully free via GitHub Actions. No local machine needed after setup.
+Runs fully free via GitHub Actions.
 """
 
 import time
@@ -20,9 +21,9 @@ import sys
 # ---------------- CONFIG ----------------
 BENCHMARK = "^CRSLDX"        # Yahoo Finance ticker for NIFTY 500
 BENCHMARK_FALLBACK = "^NSEI"  # NIFTY 50, used if the above fails
-LOOKBACK_DAYS = 250            # ~52 weeks, for RS new-high detection
-HISTORY_PERIOD = "15mo"        # enough daily bars to cover 12mo return + buffer
-STOCKS_FILE = "stocks.csv"     # your ticker list, one column named 'symbol'
+LOOKBACK_DAYS = 250            # ~52 weeks, for trend/RS evaluation
+HISTORY_PERIOD = "15mo"        # daily bars to cover 12mo return + buffer
+STOCKS_FILE = "stocks.csv"     # ticker list, one column named 'symbol'
 SHEET_ID_ENV = "SHEET_ID"      # GitHub secret name holding target Sheet ID
 CREDS_ENV = "GOOGLE_CREDENTIALS"  # GitHub secret name holding service account JSON
 WORKSHEET_NAME = "RS_Screener"
@@ -31,61 +32,38 @@ MIN_AVG_VOLUME = 10000         # filter: ignore illiquid stocks
 
 # ---- Portfolio construction (quant layer) ----
 TOP_N = 10                     # target portfolio size
-RANK_BUFFER = 20               # (unused when STRICT_DAILY_REBALANCE=True, see below)
 
-# Selection rule: Blue Dot (new RS high) + Trend Template PASS (strict, all 7
-# Minervini criteria), sorted by raw RS Score, top 10, rebalanced daily to
-# exact membership. NOTE: your own audit found daily rebalance costs ~24% of
-# gross returns to charges vs a rank-buffer approach -- this trades that off
-# deliberately for simplicity/discipline. Set False to restore the buffered
-# (lower-turnover) approach using Composite Score instead.
+# Selection rule: Trend Template PASS + RS Line Trend Template PASS,
+# sorted high-to-low by RS Score, top 10 membership with daily rebalance exit.
 STRICT_DAILY_REBALANCE = True
 REQUIRE_TREND_TEMPLATE_PASS = True
-REQUIRE_RS_TREND_TEMPLATE_PASS = True   # also require the RS LINE itself to pass
-                                          # its own Trend Template -- confirms the
-                                          # relative-strength trend is structurally
-                                          # durable, not just a one-day spike
-SELECTION_SORT_METRIC = "rs_score"   # or "composite_score"
+REQUIRE_RS_TREND_TEMPLATE_PASS = True   
+SELECTION_SORT_METRIC = "rs_score"   
+
 BREADTH_RISK_ON = 60           # % of universe above 50DMA -> full-size new entries allowed
 BREADTH_RISK_CAUTION = 40      # % above 50DMA -> half-size / caution zone
                                 # below this -> no new entries, existing holdings still managed
-BREADTH_CIRCUIT_BREAKER = 25   # % above 50DMA -> full defensive exit, sell everything regardless of rank
-RS_HISTORY_DAYS = 90            # days of RS-line history to store for the sparkline chart
+BREADTH_CIRCUIT_BREAKER = 25   # % above 50DMA -> full defensive exit, sell everything
+RS_HISTORY_DAYS = 90            # days of RS-line history to store for sparkline chart
 INTRADAY_INTERVAL = "5m"        # granularity for live preview price
 
-# Must exactly match the ONE cron expression in daily_rs_screener.yml that you
-# want treated as the real end-of-day run (the only one that updates
-# Portfolio/Holdings). Any other scheduled time you add there automatically
-# runs as a PREVIEW scan instead -- no code change needed, just edit the YAML.
 EOD_CRON = "15 11 * * 1-5"      # 4:45 PM IST
 HOLDINGS_WORKSHEET = "Holdings"
 PORTFOLIO_WORKSHEET = "Portfolio"
 CONFIG_WORKSHEET = "Config"
 RS_HISTORY_WORKSHEET = "RS_History"
-STOP_LOSS_PCT = 0.08           # 8% below entry as a hard floor (classic O'Neil stop)
+STOP_LOSS_PCT = 0.08           # 8% hard floor stop-loss
 
-# Canonical Portfolio tab column layout. Used for both writing and reading back
-# (so confirmed-execution parsing always matches what was written).
+# Portfolio tab column layout
 PORTFOLIO_HEADER = [
     "Action", "Executed", "Execution Price", "Symbol", "Rank", "Composite Score",
     "Entry Price", "Entry Date", "Current Price", "Qty", "Position Value (Rs)",
-    "P&L %", "Stop-Loss", "Blue Dot", "Green Dot", "Trend Template",
-    "RS Line Trend Template", "RS Line",
+    "P&L %", "Stop-Loss", "Trend Template", "RS Line Trend Template", "RS Line",
 ]
 # -----------------------------------------
 
 
 def get_run_mode():
-    """
-    Three ways this can run:
-      1) Scheduled, matching EOD_CRON       -> real EOD (updates Portfolio/Holdings)
-      2) Scheduled, any OTHER cron time     -> automatic PREVIEW (live prices,
-                                                ranking tab only, e.g. a midday check)
-      3) Manual 'workflow_dispatch' click   -> PREVIEW by default, or EOD if the
-                                                'force_eod' checkbox was ticked
-    This lets you add as many scan times as you like in the YAML -- only the
-    one matching EOD_CRON ever touches your real holdings.
-    """
     event = os.environ.get("GITHUB_EVENT_NAME", "manual")
     force_eod = os.environ.get("FORCE_EOD", "false").strip().lower() == "true"
 
@@ -96,7 +74,6 @@ def get_run_mode():
 
 
 def col_letter(n):
-    """Converts a 1-indexed column number to a spreadsheet column letter (1=A, 27=AA, etc.)."""
     letters = ""
     while n > 0:
         n, remainder = divmod(n - 1, 26)
@@ -105,7 +82,6 @@ def col_letter(n):
 
 
 def load_tickers():
-    """Reads your stock universe from stocks.csv (one 'symbol' column, NSE symbols without .NS)."""
     df = pd.read_csv(STOCKS_FILE)
     symbols = df["symbol"].dropna().astype(str).str.strip().tolist()
     return [s if s.endswith(".NS") else s + ".NS" for s in symbols]
@@ -129,8 +105,6 @@ def download_benchmark(run_mode):
 
 
 def fetch_intraday_last_price(tickers):
-    """Batch-fetches today's latest available intraday price for a list of tickers.
-    Returns {ticker: last_price}. Used only in PREVIEW mode (manual runs before close)."""
     prices = {}
     try:
         data = yf.download(tickers, period="1d", interval=INTRADAY_INTERVAL,
@@ -149,9 +123,6 @@ def fetch_intraday_last_price(tickers):
 
 
 def append_preview_price(close_series, live_price):
-    """Appends today's live intraday price as the latest point in a daily close
-    series, ONLY if today's date isn't already the last bar (avoids duplicating
-    a bar that yfinance may have already started forming)."""
     if live_price is None:
         return close_series
     today = pd.Timestamp.now(tz=close_series.index.tz).normalize() if close_series.index.tz \
@@ -166,13 +137,13 @@ def append_preview_price(close_series, live_price):
 
 
 def compute_rs_score(close_series):
-    """IBD-style RS Score = 40%*P3 + 20%*P6 + 20%*P9 + 20%*P12 (trading-day approximations)."""
+    """IBD-style RS Score = 40%*P3 + 20%*P6 + 20%*P9 + 20%*P12."""
     n = len(close_series)
     periods = {"P3": 63, "P6": 126, "P9": 189, "P12": 252}
     returns = {}
     for label, days in periods.items():
         if n <= days:
-            return None  # not enough history yet
+            return None  
         past = close_series.iloc[-days - 1]
         latest = close_series.iloc[-1]
         if past == 0 or pd.isna(past):
@@ -182,39 +153,10 @@ def compute_rs_score(close_series):
     return round(score * 100, 2)
 
 
-def compute_flags(stock_close, bench_close):
-    """Aligns stock and benchmark data, computes RS ratio, Blue Dot / Green Dot flags."""
-    df = pd.concat([stock_close, bench_close], axis=1, join="inner")
-    df.columns = ["stock", "bench"]
-    df = df.dropna()
-    if len(df) < LOOKBACK_DAYS + 2:
-        return None
-
-    df["rs_ratio"] = df["stock"] / df["bench"]
-    df["rs_rolling_high"] = df["rs_ratio"].rolling(LOOKBACK_DAYS).max()
-    df["price_rolling_high"] = df["stock"].rolling(LOOKBACK_DAYS).max()
-
-    today = df.iloc[-1]
-    yesterday = df.iloc[-2]
-
-    rs_new_high_today = today["rs_ratio"] >= today["rs_rolling_high"]
-    rs_was_not_high_yesterday = yesterday["rs_ratio"] < yesterday["rs_rolling_high"]
-    blue_dot = bool(rs_new_high_today and rs_was_not_high_yesterday)
-
-    price_at_new_high = today["stock"] >= today["price_rolling_high"]
-    green_dot = bool(blue_dot and not price_at_new_high)
-
-    return blue_dot, green_dot
-
-
 def compute_trend_template(series):
     """
-    Mark Minervini's 7-point Trend Template (structural criteria) against ANY
-    price-like series -- works for a stock's close price, or equally for the
-    RS ratio line (stock/benchmark) to check if relative strength itself is in
-    a durable structural uptrend, not just a one-day spike.
-    Returns (pass_bool, criteria_met_count_out_of_7) or None if insufficient history.
-    Needs at least 273 data points (52-week high/low + 200-period slope check).
+    Mark Minervini's 7-point Trend Template applied to Price or RS Line.
+    Returns (pass_bool, criteria_met_count_out_of_7).
     """
     if len(series) < 273:
         return None
@@ -224,7 +166,7 @@ def compute_trend_template(series):
     sma150 = series.rolling(150).mean().iloc[-1]
     sma200_series = series.rolling(200).mean()
     sma200 = sma200_series.iloc[-1]
-    sma200_1mo_ago = sma200_series.iloc[-21]  # ~1 month back
+    sma200_1mo_ago = sma200_series.iloc[-21]
 
     if any(pd.isna(x) for x in [sma50, sma150, sma200, sma200_1mo_ago]):
         return None
@@ -235,14 +177,12 @@ def compute_trend_template(series):
     criteria = [
         price > sma150 and price > sma200,                      # 1
         sma150 > sma200,                                          # 2
-        sma200 > sma200_1mo_ago,                                  # 3: 200-period MA trending up
+        sma200 > sma200_1mo_ago,                                  # 3: 200-MA trending up
         sma50 > sma150 and sma50 > sma200,                        # 4
         price > sma50,                                            # 5
-        price >= 1.25 * low_52w,                                  # 6: at least 25% above 52wk low
+        price >= 1.25 * low_52w,                                  # 6: >= 25% above 52wk low
         price >= 0.75 * high_52w,                                 # 7: within 25% of 52wk high
     ]
-    # 8th IBD criterion (RS Rating >= 70) applied separately using the
-    # full-universe percentile rank -- only meaningful for the price version.
     met = sum(criteria)
     passed = met == len(criteria)
     return passed, met
@@ -258,10 +198,6 @@ def main():
 
     bench_close = download_benchmark(run_mode)
 
-    # First pass: collect RS Score + Trend Template data for the WHOLE universe.
-    # We need the full universe's RS scores to compute IBD-style RS Rating percentiles
-    # (RS Rating >=70 = Minervini's 8th criterion), which only makes sense relative
-    # to everyone else scanned, not any single stock in isolation.
     all_stocks = []
     batch_size = 50
     for i in range(0, len(tickers), batch_size):
@@ -292,29 +228,24 @@ def main():
                     continue
 
                 rs_score = compute_rs_score(close)
-                flags = compute_flags(close, bench_close)
-                if rs_score is None or flags is None:
+                if rs_score is None:
                     continue
-                blue_dot, green_dot = flags
+
                 tt_result = compute_trend_template(close)
 
                 sma50_latest = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
                 above_50dma = bool(close.iloc[-1] > sma50_latest) if pd.notna(sma50_latest) else None
                 sma50_value = round(float(sma50_latest), 2) if pd.notna(sma50_latest) else None
 
-                # RS ratio (stock/benchmark) -- full series for Trend Template,
-                # truncated for the sparkline chart
                 aligned = pd.concat([close, bench_close], axis=1, join="inner").dropna()
                 aligned.columns = ["s", "b"]
                 rs_ratio_full = aligned["s"] / aligned["b"]
-                rs_tt_result = compute_trend_template(rs_ratio_full)  # Trend Template applied to the RS line itself
+                rs_tt_result = compute_trend_template(rs_ratio_full)
                 rs_history = [round(float(v), 4) for v in rs_ratio_full.tail(RS_HISTORY_DAYS).tolist()]
 
                 all_stocks.append({
                     "symbol": symbol.replace(".NS", ""),
                     "rs_score": rs_score,
-                    "blue_dot": blue_dot,
-                    "green_dot": green_dot,
                     "last_close": round(float(close.iloc[-1]), 2),
                     "tt_pass": tt_result[0] if tt_result else None,
                     "tt_criteria_met": tt_result[1] if tt_result else None,
@@ -328,75 +259,59 @@ def main():
                 print(f"Skipping {symbol}: {e}")
                 continue
 
-        time.sleep(1)  # be polite to Yahoo's servers
+        time.sleep(1)
 
     if not all_stocks:
         print("No stocks with sufficient data found.")
         results_df = pd.DataFrame(columns=[
-            "rank", "symbol", "composite_score", "rs_score", "rs_rating", "blue_dot", "green_dot",
+            "rank", "symbol", "composite_score", "rs_score", "rs_rating",
             "trend_template", "tt_criteria", "rs_trend_template", "rs_tt_criteria", "last_close"])
         write_to_sheet(results_df, run_mode)
         return
 
     universe_df = pd.DataFrame(all_stocks)
 
-    # RS Rating: percentile rank (1-99) of each stock's RS Score across the whole
-    # scanned universe today -- this mirrors IBD's RS Rating scale.
     universe_df["rs_rating"] = (universe_df["rs_score"].rank(pct=True) * 98 + 1).round(0).astype(int)
 
-    # Composite Score (0-100) for the FULL universe: blends RS strength, trend
-    # structure, and breakout timing into one sortable number -- same weighted-
-    # composite spirit as your Nifty 750 system.
-    #   50% RS Rating          -- raw relative strength, the core signal
-    #   30% Trend Template     -- structural health (Minervini's MA/52wk criteria, /7)
-    #   20% Green Dot bonus    -- rewards RS leading price (only applies if Blue Dot fired)
     universe_df["trend_template"] = universe_df["tt_pass"].map(
         {True: "PASS", False: "FAIL", None: "N/A"})
-    universe_df["blue_dot_label"] = universe_df["blue_dot"].map({True: "YES", False: ""})
-    universe_df["green_dot_label"] = universe_df["green_dot"].map({True: "YES", False: ""})
     universe_df["tt_criteria"] = universe_df["tt_criteria_met"].apply(
         lambda x: f"{x}/7" if pd.notna(x) else "N/A")
 
-    # Trend Template applied to the RS LINE itself (not price) -- confirms the
-    # relative-strength trend is structurally durable, not just a one-day spike.
     universe_df["rs_trend_template"] = universe_df["rs_tt_pass"].map(
         {True: "PASS", False: "FAIL", None: "N/A"})
     universe_df["rs_tt_criteria"] = universe_df["rs_tt_criteria_met"].apply(
         lambda x: f"{x}/7" if pd.notna(x) else "N/A")
 
+    # Composite Score calculation (60% RS Rating, 40% Trend Template criteria weight)
     tt_component = (universe_df["tt_criteria_met"].fillna(0) / 7 * 100)
-    green_component = universe_df["green_dot_label"].map({"YES": 100, "": 0})
     universe_df["composite_score"] = (
-        0.50 * universe_df["rs_rating"] +
-        0.30 * tt_component +
-        0.20 * green_component
+        0.60 * universe_df["rs_rating"] +
+        0.40 * tt_component
     ).round(1)
 
     results_df = universe_df[[
         "symbol", "composite_score", "rs_score", "rs_rating",
-        "blue_dot_label", "green_dot_label",
         "trend_template", "tt_criteria", "rs_trend_template", "rs_tt_criteria", "last_close"
-    ]].rename(columns={"blue_dot_label": "blue_dot", "green_dot_label": "green_dot"})
-    results_df = results_df.sort_values("composite_score", ascending=False)
+    ]]
+    
+    # Primary sort by RS Score from high to low
+    results_df = results_df.sort_values(SELECTION_SORT_METRIC, ascending=False)
     results_df["rank"] = range(1, len(results_df) + 1)
     results_df = results_df[["rank"] + [c for c in results_df.columns if c != "rank"]]
 
-    n_blue = (results_df["blue_dot"] == "YES").sum()
-    n_green = (results_df["green_dot"] == "YES").sum()
     n_tt_pass = (results_df["trend_template"] == "PASS").sum()
     n_rs_tt_pass = (results_df["rs_trend_template"] == "PASS").sum()
-    print(f"Universe scanned: {len(universe_df)} stocks (all shown in output).")
-    print(f"Blue Dot: {n_blue} | Green Dot: {n_green} | Trend Template PASS: {n_tt_pass} | "
-          f"RS Line Trend Template PASS: {n_rs_tt_pass}")
+    print(f"Universe scanned: {len(universe_df)} stocks.")
+    print(f"Stock Trend Template PASS: {n_tt_pass} | RS Line Trend Template PASS: {n_rs_tt_pass}")
 
     write_to_sheet(results_df, run_mode)
 
     if run_mode == "PREVIEW":
-        print("Preview mode: RS_Screener tab updated with live intraday prices. "
-              "Holdings/Portfolio left untouched -- nothing locked in on an unsettled price.")
+        print("Preview mode executed. Holdings/Portfolio unmodified.")
         return
 
-    # ---- Regime / breadth filter (EOD run only) ----
+    # ---- Market Breadth Filter ----
     valid_breadth = universe_df["above_50dma"].dropna()
     breadth_pct = round(100 * valid_breadth.mean(), 1) if len(valid_breadth) else 0
 
@@ -416,7 +331,7 @@ def main():
     circuit_breaker = breadth_pct < BREADTH_CIRCUIT_BREAKER
     print(f"Breadth (% above 50DMA): {breadth_pct}% -> Regime: {regime}")
 
-    # ---- Portfolio construction: rank buffer + persistent holdings ----
+    # ---- Portfolio Construction ----
     sma50_lookup = dict(zip(universe_df["symbol"], universe_df["sma50"]))
     rs_history_lookup = dict(zip(universe_df["symbol"], universe_df["rs_history"]))
     build_portfolio(results_df, breadth_pct, regime, allow_new_entries, sma50_lookup,
@@ -424,9 +339,6 @@ def main():
 
 
 def read_config(sh):
-    """Reads user-editable settings (available capital, etc.) from the Config tab.
-    Creates the tab with a default row if it doesn't exist yet -- edit the value
-    cell directly in Google Sheets to update your available investment fund."""
     try:
         cfg_ws = sh.worksheet(CONFIG_WORKSHEET)
         records = cfg_ws.get_all_records()
@@ -435,7 +347,7 @@ def read_config(sh):
         cfg_ws = sh.add_worksheet(title=CONFIG_WORKSHEET, rows=10, cols=3)
         cfg_ws.update([
             ["Setting", "Value", "Notes"],
-            ["Total Capital (INR)", 0, "EDIT ME: your available investment fund for this strategy"],
+            ["Total Capital (INR)", 0, "EDIT ME: total investment capital"],
         ], "A1")
         settings = {"Total Capital (INR)": 0}
 
@@ -447,21 +359,13 @@ def read_config(sh):
 
 
 def apply_confirmed_executions(sh):
-    """
-    Reads the Portfolio tab as it stood BEFORE this run. Any BUY or SELL row
-    you marked Executed = Y (or YES) gets applied to Holdings now -- using the
-    Execution Price you typed in if provided, otherwise falling back to the
-    suggested price shown that day. This is the ONLY place Holdings ever
-    changes. A signal firing does NOT change Holdings by itself -- only your
-    explicit confirmation does.
-    """
     try:
         port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
     except gspread.WorksheetNotFound:
-        return  # nothing to confirm on the very first run ever
+        return
 
     try:
-        prior_rows = port_ws.get_all_records(head=3)  # header is on row 3
+        prior_rows = port_ws.get_all_records(head=3)
     except Exception as e:
         print(f"Could not read prior Portfolio tab for confirmations: {e}")
         return
@@ -497,17 +401,17 @@ def apply_confirmed_executions(sh):
             try:
                 exec_price = float(exec_price_raw)
             except (ValueError, TypeError):
-                print(f"Skipping confirmed BUY for {symbol}: no valid price found.")
+                print(f"Skipping confirmed BUY for {symbol}: invalid price.")
                 continue
             holdings[symbol] = {"entry_price": exec_price, "entry_date": today_str}
             changed = True
-            print(f"Confirmed BUY applied: {symbol} @ {exec_price}")
+            print(f"Confirmed BUY: {symbol} @ {exec_price}")
 
         elif action == "SELL":
             if symbol in holdings:
                 del holdings[symbol]
                 changed = True
-                print(f"Confirmed SELL applied: {symbol}")
+                print(f"Confirmed SELL: {symbol}")
 
     if changed:
         holdings_ws.clear()
@@ -515,13 +419,10 @@ def apply_confirmed_executions(sh):
             [s, v["entry_price"], v["entry_date"]] for s, v in holdings.items()
         ]
         holdings_ws.update(rows_out, "A1")
-        print("Holdings updated based on your confirmed executions.")
-    else:
-        print("No confirmed executions found since last run (nothing marked Executed=Y).")
+        print("Holdings updated.")
 
 
 def compute_stop_loss(sma50_val, entry_price):
-    """Stop-loss = the tighter of 50DMA or 8% below entry (classic O'Neil stop)."""
     if sma50_val:
         return round(max(sma50_val, entry_price * (1 - STOP_LOSS_PCT)), 2)
     elif entry_price:
@@ -531,19 +432,10 @@ def compute_stop_loss(sma50_val, entry_price):
 
 def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_lookup,
                      rs_history_lookup, circuit_breaker):
-    """
-    Two-step model, so nothing gets locked in on an assumed price:
-      1) Apply any executions YOU confirmed since the last run (Executed=Y)
-         to Holdings -- see apply_confirmed_executions().
-      2) Compute today's suggestions (HOLD / pending BUY / pending SELL) off
-         the now-current Holdings, using rank buffer + regime + circuit breaker.
-    A pending BUY/SELL stays pending, reappearing each run, until you mark it
-    Executed=Y after actually trading in Kite.
-    """
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
     if not sheet_id or not creds_json:
-        print("Missing SHEET_ID/GOOGLE_CREDENTIALS -- skipping portfolio construction.")
+        print("Missing credentials — skipping portfolio construction.")
         return
 
     creds_dict = json.loads(creds_json)
@@ -553,11 +445,8 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
     sh = gc.open_by_key(sheet_id)
 
     capital = read_config(sh)
-
-    # Step 1: apply anything you confirmed executed since the last run
     apply_confirmed_executions(sh)
 
-    # Step 2: read Holdings fresh (now reflecting any confirmations just applied)
     try:
         holdings_ws = sh.worksheet(HOLDINGS_WORKSHEET)
         existing = holdings_ws.get_all_records()
@@ -573,40 +462,24 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
 
     price_lookup = dict(zip(ranked_df["symbol"], ranked_df["last_close"]))
 
-    if STRICT_DAILY_REBALANCE:
-        # Build today's target top-10: Blue Dot required, price Trend Template
-        # PASS required, RS-line Trend Template PASS required (each toggleable),
-        # sorted by the chosen metric, take top N.
-        pool = ranked_df[ranked_df["blue_dot"] == "YES"]
-        if REQUIRE_TREND_TEMPLATE_PASS:
-            pool = pool[pool["trend_template"] == "PASS"]
-        if REQUIRE_RS_TREND_TEMPLATE_PASS:
-            pool = pool[pool["rs_trend_template"] == "PASS"]
-        pool = pool.sort_values(SELECTION_SORT_METRIC, ascending=False)
-        target_symbols = pool.head(TOP_N)["symbol"].tolist()
+    # Target Selection: Stock TT = PASS and RS TT = PASS, ordered high-to-low by RS Score
+    pool = ranked_df
+    if REQUIRE_TREND_TEMPLATE_PASS:
+        pool = pool[pool["trend_template"] == "PASS"]
+    if REQUIRE_RS_TREND_TEMPLATE_PASS:
+        pool = pool[pool["rs_trend_template"] == "PASS"]
+    
+    pool = pool.sort_values(SELECTION_SORT_METRIC, ascending=False)
+    target_symbols = pool.head(TOP_N)["symbol"].tolist()
 
-        if circuit_breaker:
-            target_symbols = []  # full defensive exit overrides everything
+    if circuit_breaker:
+        target_symbols = []
 
-        kept = [s for s in current_holdings if s in target_symbols]
-        pending_sell = [s for s in current_holdings if s not in target_symbols]
-        pending_buy = [] if not allow_new_entries else \
-            [s for s in target_symbols if s not in current_holdings]
-    else:
-        rank_lookup = dict(zip(ranked_df["symbol"], ranked_df["rank"]))
-        if circuit_breaker:
-            kept = []
-            pending_sell = list(current_holdings.keys())
-        else:
-            kept = [s for s in current_holdings if rank_lookup.get(s, 9999) <= RANK_BUFFER]
-            pending_sell = [s for s in current_holdings if s not in kept]
-
-        slots_open = TOP_N - len(kept)
-        pending_buy = []
-        if allow_new_entries and slots_open > 0:
-            already_spoken_for = set(kept) | set(pending_sell)
-            candidates = ranked_df[~ranked_df["symbol"].isin(already_spoken_for)].sort_values("rank")
-            pending_buy = candidates.head(slots_open)["symbol"].tolist()
+    # Position Management Rules
+    kept = [s for s in current_holdings if s in target_symbols]
+    pending_sell = [s for s in current_holdings if s not in target_symbols]  # Exit when leaving Top 10
+    pending_buy = [] if not allow_new_entries else \
+        [s for s in target_symbols if s not in current_holdings]
 
     if regime.startswith("RISK-ON"):
         size_multiplier = 1.0
@@ -616,10 +489,9 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
         size_multiplier = 0.0
     slot_capital = (capital / TOP_N) * size_multiplier if capital > 0 else 0
 
-    from datetime import datetime
-    rows = []  # list of dicts, keyed by PORTFOLIO_HEADER column names
+    rows = []
 
-    # HOLD rows -- already-confirmed positions, no action needed from you
+    # HOLD Positions
     for s in kept:
         r = ranked_df[ranked_df["symbol"] == s].iloc[0]
         entry_price = current_holdings[s]["entry_price"]
@@ -635,12 +507,11 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
             "Entry Price": entry_price, "Entry Date": entry_date, "Current Price": current_price,
             "Qty": qty, "Position Value (Rs)": position_value, "P&L %": f"{pnl_pct}%",
             "Stop-Loss": compute_stop_loss(sma50_lookup.get(s), entry_price),
-            "Blue Dot": r["blue_dot"], "Green Dot": r["green_dot"],
             "Trend Template": r["trend_template"],
             "RS Line Trend Template": r["rs_trend_template"],
         })
 
-    # PENDING BUY -- suggestion only. Mark Executed=Y once you actually buy in Kite.
+    # BUY Suggestions
     for s in pending_buy:
         r = ranked_df[ranked_df["symbol"] == s].iloc[0]
         current_price = price_lookup.get(s, 0)
@@ -653,12 +524,11 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
             "Entry Price": current_price, "Entry Date": "PENDING", "Current Price": current_price,
             "Qty": qty, "Position Value (Rs)": position_value, "P&L %": "",
             "Stop-Loss": compute_stop_loss(sma50_lookup.get(s), current_price),
-            "Blue Dot": r["blue_dot"], "Green Dot": r["green_dot"],
             "Trend Template": r["trend_template"],
             "RS Line Trend Template": r["rs_trend_template"],
         })
 
-    # PENDING SELL -- still technically held until you confirm the exit
+    # SELL Suggestions (Dropped from Top 10 or triggered circuit breaker)
     for s in pending_sell:
         entry_price = current_holdings[s]["entry_price"]
         current_price = price_lookup.get(s, 0)
@@ -670,8 +540,8 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
             "Action": "SELL", "Symbol": s, "Rank": rank_val, "Composite Score": "",
             "Entry Price": entry_price, "Entry Date": current_holdings[s]["entry_date"],
             "Current Price": current_price, "Qty": "", "Position Value (Rs)": "",
-            "P&L %": f"{pnl_pct}%", "Stop-Loss": "", "Blue Dot": "", "Green Dot": "",
-            "Trend Template": "",
+            "P&L %": f"{pnl_pct}%", "Stop-Loss": "", "Trend Template": "",
+            "RS Line Trend Template": "",
         })
 
     n_port_rows_needed = len(rows) + 10
@@ -685,12 +555,13 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
         port_ws = sh.add_worksheet(title=PORTFOLIO_WORKSHEET, rows=n_port_rows_needed, cols=n_port_cols_needed)
 
     port_ws.clear()
+    from datetime import datetime
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
     invested = sum(r.get("Position Value (Rs)", 0) for r in rows
                     if isinstance(r.get("Position Value (Rs)"), (int, float)))
     summary = (f"Last updated: {timestamp}  |  Breadth: {breadth_pct}%  |  Regime: {regime}  |  "
                f"Capital: Rs.{capital:,.0f}  |  Deployed (approx): Rs.{invested:,.0f}  |  "
-               f"Mark Executed=Y on BUY/SELL rows once you actually trade in Kite")
+               f"Mark Executed=Y on BUY/SELL rows once confirmed")
     if circuit_breaker:
         summary = "*** CIRCUIT BREAKER TRIGGERED: REDUCE TO CASH ***  |  " + summary
     if capital == 0:
@@ -700,20 +571,13 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
     row_lists = [[r.get(col, "") for col in PORTFOLIO_HEADER] for r in rows]
     port_ws.update([PORTFOLIO_HEADER] + row_lists, "A3")
 
-    # RS Line sparkline
     write_rs_history_and_sparklines(sh, rows, rs_history_lookup)
 
     print(f"Portfolio updated: {len(kept)} held, {len(pending_buy)} pending BUY, "
-          f"{len(pending_sell)} pending SELL awaiting your confirmation. Capital: Rs.{capital:,.0f}")
+          f"{len(pending_sell)} pending SELL.")
 
 
 def write_rs_history_and_sparklines(sh, rows, rs_history_lookup):
-    """
-    Writes RS-ratio history (last RS_HISTORY_DAYS values) for every symbol in the
-    Portfolio tab into a dedicated RS_History tab, then inserts a SPARKLINE()
-    formula into the Portfolio tab's 'RS Line' column referencing that data.
-    `rows` is a list of dicts keyed by PORTFOLIO_HEADER column names.
-    """
     if not rows:
         return
 
@@ -738,15 +602,15 @@ def write_rs_history_and_sparklines(sh, rows, rs_history_lookup):
     hist_ws.clear()
     hist_ws.update([hist_header] + hist_rows, "A1")
 
-    last_col_letter = col_letter(1 + RS_HISTORY_DAYS)  # data spans B..this column
+    last_col_letter = col_letter(1 + RS_HISTORY_DAYS)
     port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
     formulas = []
     for i in range(len(rows)):
-        hist_row = i + 2  # RS_History data starts at row 2 (row 1 is header)
+        hist_row = i + 2
         formulas.append([f"=SPARKLINE('RS_History'!B{hist_row}:{last_col_letter}{hist_row})"])
 
-    rs_line_col = col_letter(len(PORTFOLIO_HEADER))  # RS Line is the last Portfolio column
-    first_port_row = 4  # Portfolio data starts at row 4 (row 3 is header, row 1 is summary)
+    rs_line_col = col_letter(len(PORTFOLIO_HEADER))
+    first_port_row = 4
     last_port_row = first_port_row + len(rows) - 1
     port_ws.update(formulas, f"{rs_line_col}{first_port_row}:{rs_line_col}{last_port_row}",
                    value_input_option="USER_ENTERED")
@@ -756,8 +620,7 @@ def write_to_sheet(df, run_mode="EOD"):
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
     if not sheet_id or not creds_json:
-        print("Missing SHEET_ID or GOOGLE_CREDENTIALS env vars — skipping Sheets write. "
-              "Saving to CSV instead.")
+        print("Missing env vars — saving to CSV instead.")
         df.to_csv("rs_screener_output.csv", index=False)
         return
 
@@ -766,13 +629,12 @@ def write_to_sheet(df, run_mode="EOD"):
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
 
-    n_rows_needed = len(df) + 10   # + buffer for header/timestamp rows
+    n_rows_needed = len(df) + 10
     n_cols_needed = len(df.columns) + 2
 
     sh = gc.open_by_key(sheet_id)
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
-        # Resize up if your stock list has grown since the sheet was first created
         if ws.row_count < n_rows_needed or ws.col_count < n_cols_needed:
             ws.resize(rows=max(ws.row_count, n_rows_needed),
                       cols=max(ws.col_count, n_cols_needed))
@@ -782,11 +644,11 @@ def write_to_sheet(df, run_mode="EOD"):
     ws.clear()
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
-    label = "PREVIEW (intraday, not final)" if run_mode == "PREVIEW" else "EOD FINAL"
+    label = "PREVIEW (intraday)" if run_mode == "PREVIEW" else "EOD FINAL"
     ws.update([[f"Last updated: {timestamp}  |  {label}"]], "A1")
-    header = ["Rank", "Symbol", "Composite Score", "RS Score", "RS Rating (1-99)", "Blue Dot",
-              "Green Dot (Breakout Watch)", "Trend Template", "TT Criteria Met",
-              "RS Line Trend Template", "RS Line TT Criteria", "Last Close"]
+    header = ["Rank", "Symbol", "Composite Score", "RS Score", "RS Rating (1-99)",
+              "Trend Template", "TT Criteria Met", "RS Line Trend Template",
+              "RS Line TT Criteria", "Last Close"]
     ws.update([header] + df.values.tolist(), "A3")
     print("Google Sheet updated successfully.")
 
