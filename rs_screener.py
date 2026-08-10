@@ -6,6 +6,10 @@ Computes IBD-style Relative Strength Score and applies structural filters:
   - Portfolio Selection: Top 10 stocks sorted by RS Score from high to low
   - Exit Condition: Position is liquidated when it falls outside the Top 10
 
+Flags calculated & displayed (for reference only, NOT used for selection):
+  - Blue Dot  : RS line made a new N-day high
+  - Green Dot : RS made a new high AND price has NOT yet made a new high
+
 Runs fully free via GitHub Actions.
 """
 
@@ -58,7 +62,8 @@ STOP_LOSS_PCT = 0.08           # 8% hard floor stop-loss
 PORTFOLIO_HEADER = [
     "Action", "Executed", "Execution Price", "Symbol", "Rank", "Composite Score",
     "Entry Price", "Entry Date", "Current Price", "Qty", "Position Value (Rs)",
-    "P&L %", "Stop-Loss", "Trend Template", "RS Line Trend Template", "RS Line",
+    "P&L %", "Stop-Loss", "Blue Dot", "Green Dot", "Trend Template",
+    "RS Line Trend Template", "RS Line",
 ]
 # -----------------------------------------
 
@@ -153,6 +158,31 @@ def compute_rs_score(close_series):
     return round(score * 100, 2)
 
 
+def compute_flags(stock_close, bench_close):
+    """Aligns stock and benchmark data, computes RS ratio, Blue Dot / Green Dot flags."""
+    df = pd.concat([stock_close, bench_close], axis=1, join="inner")
+    df.columns = ["stock", "bench"]
+    df = df.dropna()
+    if len(df) < LOOKBACK_DAYS + 2:
+        return None
+
+    df["rs_ratio"] = df["stock"] / df["bench"]
+    df["rs_rolling_high"] = df["rs_ratio"].rolling(LOOKBACK_DAYS).max()
+    df["price_rolling_high"] = df["stock"].rolling(LOOKBACK_DAYS).max()
+
+    today = df.iloc[-1]
+    yesterday = df.iloc[-2]
+
+    rs_new_high_today = today["rs_ratio"] >= today["rs_rolling_high"]
+    rs_was_not_high_yesterday = yesterday["rs_ratio"] < yesterday["rs_rolling_high"]
+    blue_dot = bool(rs_new_high_today and rs_was_not_high_yesterday)
+
+    price_at_new_high = today["stock"] >= today["price_rolling_high"]
+    green_dot = bool(blue_dot and not price_at_new_high)
+
+    return blue_dot, green_dot
+
+
 def compute_trend_template(series):
     """
     Mark Minervini's 7-point Trend Template applied to Price or RS Line.
@@ -228,9 +258,11 @@ def main():
                     continue
 
                 rs_score = compute_rs_score(close)
-                if rs_score is None:
+                flags = compute_flags(close, bench_close)
+                if rs_score is None or flags is None:
                     continue
-
+                
+                blue_dot, green_dot = flags
                 tt_result = compute_trend_template(close)
 
                 sma50_latest = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
@@ -246,6 +278,8 @@ def main():
                 all_stocks.append({
                     "symbol": symbol.replace(".NS", ""),
                     "rs_score": rs_score,
+                    "blue_dot": blue_dot,
+                    "green_dot": green_dot,
                     "last_close": round(float(close.iloc[-1]), 2),
                     "tt_pass": tt_result[0] if tt_result else None,
                     "tt_criteria_met": tt_result[1] if tt_result else None,
@@ -264,7 +298,7 @@ def main():
     if not all_stocks:
         print("No stocks with sufficient data found.")
         results_df = pd.DataFrame(columns=[
-            "rank", "symbol", "composite_score", "rs_score", "rs_rating",
+            "rank", "symbol", "composite_score", "rs_score", "rs_rating", "blue_dot", "green_dot",
             "trend_template", "tt_criteria", "rs_trend_template", "rs_tt_criteria", "last_close"])
         write_to_sheet(results_df, run_mode)
         return
@@ -275,6 +309,8 @@ def main():
 
     universe_df["trend_template"] = universe_df["tt_pass"].map(
         {True: "PASS", False: "FAIL", None: "N/A"})
+    universe_df["blue_dot_label"] = universe_df["blue_dot"].map({True: "YES", False: ""})
+    universe_df["green_dot_label"] = universe_df["green_dot"].map({True: "YES", False: ""})
     universe_df["tt_criteria"] = universe_df["tt_criteria_met"].apply(
         lambda x: f"{x}/7" if pd.notna(x) else "N/A")
 
@@ -283,27 +319,32 @@ def main():
     universe_df["rs_tt_criteria"] = universe_df["rs_tt_criteria_met"].apply(
         lambda x: f"{x}/7" if pd.notna(x) else "N/A")
 
-    # Composite Score calculation (60% RS Rating, 40% Trend Template criteria weight)
+    # Composite Score calculation
     tt_component = (universe_df["tt_criteria_met"].fillna(0) / 7 * 100)
+    green_component = universe_df["green_dot_label"].map({"YES": 100, "": 0})
     universe_df["composite_score"] = (
-        0.60 * universe_df["rs_rating"] +
-        0.40 * tt_component
+        0.50 * universe_df["rs_rating"] +
+        0.30 * tt_component +
+        0.20 * green_component
     ).round(1)
 
     results_df = universe_df[[
         "symbol", "composite_score", "rs_score", "rs_rating",
+        "blue_dot_label", "green_dot_label",
         "trend_template", "tt_criteria", "rs_trend_template", "rs_tt_criteria", "last_close"
-    ]]
+    ]].rename(columns={"blue_dot_label": "blue_dot", "green_dot_label": "green_dot"})
     
     # Primary sort by RS Score from high to low
     results_df = results_df.sort_values(SELECTION_SORT_METRIC, ascending=False)
     results_df["rank"] = range(1, len(results_df) + 1)
     results_df = results_df[["rank"] + [c for c in results_df.columns if c != "rank"]]
 
+    n_blue = (results_df["blue_dot"] == "YES").sum()
+    n_green = (results_df["green_dot"] == "YES").sum()
     n_tt_pass = (results_df["trend_template"] == "PASS").sum()
     n_rs_tt_pass = (results_df["rs_trend_template"] == "PASS").sum()
     print(f"Universe scanned: {len(universe_df)} stocks.")
-    print(f"Stock Trend Template PASS: {n_tt_pass} | RS Line Trend Template PASS: {n_rs_tt_pass}")
+    print(f"Blue Dot: {n_blue} | Green Dot: {n_green} | Stock Trend Template PASS: {n_tt_pass} | RS Line Trend Template PASS: {n_rs_tt_pass}")
 
     write_to_sheet(results_df, run_mode)
 
@@ -462,7 +503,7 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
 
     price_lookup = dict(zip(ranked_df["symbol"], ranked_df["last_close"]))
 
-    # Target Selection: Stock TT = PASS and RS TT = PASS, ordered high-to-low by RS Score
+    # Target Selection: Stock TT = PASS and RS TT = PASS (NO blue_dot required), ordered high-to-low by RS Score
     pool = ranked_df
     if REQUIRE_TREND_TEMPLATE_PASS:
         pool = pool[pool["trend_template"] == "PASS"]
@@ -507,6 +548,7 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
             "Entry Price": entry_price, "Entry Date": entry_date, "Current Price": current_price,
             "Qty": qty, "Position Value (Rs)": position_value, "P&L %": f"{pnl_pct}%",
             "Stop-Loss": compute_stop_loss(sma50_lookup.get(s), entry_price),
+            "Blue Dot": r["blue_dot"], "Green Dot": r["green_dot"],
             "Trend Template": r["trend_template"],
             "RS Line Trend Template": r["rs_trend_template"],
         })
@@ -524,6 +566,7 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
             "Entry Price": current_price, "Entry Date": "PENDING", "Current Price": current_price,
             "Qty": qty, "Position Value (Rs)": position_value, "P&L %": "",
             "Stop-Loss": compute_stop_loss(sma50_lookup.get(s), current_price),
+            "Blue Dot": r["blue_dot"], "Green Dot": r["green_dot"],
             "Trend Template": r["trend_template"],
             "RS Line Trend Template": r["rs_trend_template"],
         })
@@ -540,8 +583,8 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
             "Action": "SELL", "Symbol": s, "Rank": rank_val, "Composite Score": "",
             "Entry Price": entry_price, "Entry Date": current_holdings[s]["entry_date"],
             "Current Price": current_price, "Qty": "", "Position Value (Rs)": "",
-            "P&L %": f"{pnl_pct}%", "Stop-Loss": "", "Trend Template": "",
-            "RS Line Trend Template": "",
+            "P&L %": f"{pnl_pct}%", "Stop-Loss": "", "Blue Dot": "", "Green Dot": "",
+            "Trend Template": "", "RS Line Trend Template": "",
         })
 
     n_port_rows_needed = len(rows) + 10
@@ -646,9 +689,9 @@ def write_to_sheet(df, run_mode="EOD"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
     label = "PREVIEW (intraday)" if run_mode == "PREVIEW" else "EOD FINAL"
     ws.update([[f"Last updated: {timestamp}  |  {label}"]], "A1")
-    header = ["Rank", "Symbol", "Composite Score", "RS Score", "RS Rating (1-99)",
-              "Trend Template", "TT Criteria Met", "RS Line Trend Template",
-              "RS Line TT Criteria", "Last Close"]
+    header = ["Rank", "Symbol", "Composite Score", "RS Score", "RS Rating (1-99)", "Blue Dot",
+              "Green Dot (Breakout Watch)", "Trend Template", "TT Criteria Met",
+              "RS Line Trend Template", "RS Line TT Criteria", "Last Close"]
     ws.update([header] + df.values.tolist(), "A3")
     print("Google Sheet updated successfully.")
 
