@@ -1,16 +1,20 @@
 """
-RS Screener - Simplified Trend Template & RS Rank Portfolio System
-Computes IBD-style Relative Strength Score and applies structural filters:
-  - Stock Trend Template PASS (Minervini 7-point criteria)
-  - RS Line Trend Template PASS (Relative strength structural durability)
-  - Portfolio Selection: Top 10 stocks sorted by RS Score from high to low
-  - Exit Condition: Position is liquidated when it falls outside the Top 10
+RS Screener - Trend Template & RS Rank Portfolio System
+Calculates IBD-style Cross-Sectional Relative Strength Percentile Ranks (1-99).
 
-Flags calculated & displayed (for reference only, NOT used for selection):
-  - Blue Dot  : RS line made a new N-day high
-  - Green Dot : RS made a new high AND price has NOT yet made a new high
+Portfolio Entry Criteria:
+  - Top 10 Ranked Stocks by RS Score
+  - Stock Trend Template PASS
+  - RS Line Trend Template PASS
 
-Runs fully free via GitHub Actions.
+Portfolio Exit Criteria (Trigger SELL if ANY met):
+  1. Hard Stop-Loss: Loss from Entry Price >= 5%
+  2. Max Drawdown: Drawdown from Peak Price > 10%
+  3. Rank Drop: Rank drops below Top 20
+  4. RS Breakdown: RS Line falls below its 5-day EMA
+  5. Structural Fail: Stock or RS Line Trend Template FAIL
+
+Runs fully automated via GitHub Actions.
 """
 
 import time
@@ -23,47 +27,40 @@ import os
 import sys
 
 # ---------------- CONFIG ----------------
-BENCHMARK = "^CRSLDX"        # Yahoo Finance ticker for NIFTY 500
-BENCHMARK_FALLBACK = "^NSEI"  # NIFTY 50, used if the above fails
-LOOKBACK_DAYS = 250            # ~52 weeks, for trend/RS evaluation
-HISTORY_PERIOD = "15mo"        # daily bars to cover 12mo return + buffer
-STOCKS_FILE = "stocks.csv"     # ticker list, one column named 'symbol'
-SHEET_ID_ENV = "SHEET_ID"      # GitHub secret name holding target Sheet ID
-CREDS_ENV = "GOOGLE_CREDENTIALS"  # GitHub secret name holding service account JSON
+BENCHMARK = "^CRSLDX"          # Primary Benchmark: NIFTY 500
+BENCHMARK_FALLBACK = "^NSEI"    # Secondary Benchmark: NIFTY 50
+LOOKBACK_DAYS = 250              # ~52 weeks lookback
+HISTORY_PERIOD = "15mo"          # Data depth for 1-year returns + calculations
+STOCKS_FILE = "stocks.csv"       # Stock universe file
+SHEET_ID_ENV = "SHEET_ID"        # Secret holding Sheet ID
+CREDS_ENV = "GOOGLE_CREDENTIALS"# Secret holding Service Account JSON
 WORKSHEET_NAME = "RS_Screener"
-MIN_PRICE = 10                 # filter: ignore penny stocks
-MIN_AVG_VOLUME = 10000         # filter: ignore illiquid stocks
+MIN_PRICE = 10                   # Exclude penny stocks
+MIN_AVG_VOLUME = 10000           # Exclude illiquid stocks
 
-# ---- Portfolio construction (quant layer) ----
-TOP_N = 10                     # target portfolio size
+# ---- Portfolio Risk & Exit Limits ----
+ENTRY_RANK_THRESHOLD = 10        # Entry: Top 10 stocks
+EXIT_RANK_THRESHOLD = 20         # Exit: Rank drops below 20
+STOP_LOSS_PCT = 0.05             # Hard Floor Stop-Loss: 5% drop from entry
+MAX_DRAWDOWN_PCT = 0.10          # Trailing Drawdown Exit: 10% drop from peak price
 
-# Selection rule: Trend Template PASS + RS Line Trend Template PASS,
-# sorted high-to-low by RS Score, top 10 membership with daily rebalance exit.
-STRICT_DAILY_REBALANCE = True
-REQUIRE_TREND_TEMPLATE_PASS = True
-REQUIRE_RS_TREND_TEMPLATE_PASS = True   
-SELECTION_SORT_METRIC = "rs_score"   
+BREADTH_RISK_ON = 60             # % above 50DMA -> Risk-On
+BREADTH_RISK_CAUTION = 40        # % above 50DMA -> Caution (Half size)
+BREADTH_CIRCUIT_BREAKER = 25     # % above 50DMA -> Liquidate to Cash
+RS_HISTORY_DAYS = 90             # RS History length for Google Sheets sparklines
+INTRADAY_INTERVAL = "5m"
 
-BREADTH_RISK_ON = 60           # % of universe above 50DMA -> full-size new entries allowed
-BREADTH_RISK_CAUTION = 40      # % above 50DMA -> half-size / caution zone
-                                # below this -> no new entries, existing holdings still managed
-BREADTH_CIRCUIT_BREAKER = 25   # % above 50DMA -> full defensive exit, sell everything
-RS_HISTORY_DAYS = 90            # days of RS-line history to store for sparkline chart
-INTRADAY_INTERVAL = "5m"        # granularity for live preview price
-
-EOD_CRON = "15 11 * * 1-5"      # 4:45 PM IST
+EOD_CRON = "15 11 * * 1-5"        # EOD Trigger schedule
 HOLDINGS_WORKSHEET = "Holdings"
 PORTFOLIO_WORKSHEET = "Portfolio"
 CONFIG_WORKSHEET = "Config"
 RS_HISTORY_WORKSHEET = "RS_History"
-STOP_LOSS_PCT = 0.08           # 8% hard floor stop-loss
 
-# Portfolio tab column layout
 PORTFOLIO_HEADER = [
     "Action", "Executed", "Execution Price", "Symbol", "Rank", "Composite Score",
-    "Entry Price", "Entry Date", "Current Price", "Qty", "Position Value (Rs)",
-    "P&L %", "Stop-Loss", "Blue Dot", "Green Dot", "Trend Template",
-    "RS Line Trend Template", "RS Line",
+    "Entry Price", "Peak Price", "Entry Date", "Current Price", "Qty", "Position Value (Rs)",
+    "P&L %", "Drawdown %", "Stop-Loss", "Exit Reason", "Blue Dot", "Green Dot",
+    "Trend Template", "RS Line Trend Template", "RS Line",
 ]
 # -----------------------------------------
 
@@ -98,15 +95,15 @@ def download_benchmark(run_mode):
             data = yf.download(tkr, period=HISTORY_PERIOD, interval="1d",
                                 auto_adjust=True, progress=False)
             if not data.empty:
-                print(f"Benchmark loaded: {tkr}")
+                print(f"Benchmark loaded successfully: {tkr}")
                 close = data["Close"]
                 if run_mode == "PREVIEW":
                     live = fetch_intraday_last_price([tkr])
                     close = append_preview_price(close, live.get(tkr))
                 return close
         except Exception as e:
-            print(f"Benchmark {tkr} failed: {e}")
-    raise RuntimeError("Could not download any benchmark index data.")
+            print(f"Benchmark fetch failed for {tkr}: {e}")
+    raise RuntimeError("Unable to download benchmark data.")
 
 
 def fetch_intraday_last_price(tickers):
@@ -123,7 +120,7 @@ def fetch_intraday_last_price(tickers):
             except Exception:
                 continue
     except Exception as e:
-        print(f"Intraday batch fetch failed: {e}")
+        print(f"Intraday price collection failed: {e}")
     return prices
 
 
@@ -141,25 +138,29 @@ def append_preview_price(close_series, live_price):
     return pd.concat([close_series, new_point])
 
 
-def compute_rs_score(close_series):
-    """IBD-style RS Score = 40%*P3 + 20%*P6 + 20%*P9 + 20%*P12."""
+def compute_raw_rs_performance(close_series):
+    """Calculates weighted 3, 6, 9, and 12-month return composite."""
     n = len(close_series)
     periods = {"P3": 63, "P6": 126, "P9": 189, "P12": 252}
     returns = {}
     for label, days in periods.items():
         if n <= days:
-            return None  
+            return None
         past = close_series.iloc[-days - 1]
         latest = close_series.iloc[-1]
         if past == 0 or pd.isna(past):
             return None
         returns[label] = (latest / past) - 1
-    score = 0.40 * returns["P3"] + 0.20 * returns["P6"] + 0.20 * returns["P9"] + 0.20 * returns["P12"]
-    return round(score * 100, 2)
+    
+    raw_score = (0.40 * returns["P3"] + 
+                 0.20 * returns["P6"] + 
+                 0.20 * returns["P9"] + 
+                 0.20 * returns["P12"])
+    return raw_score
 
 
-def compute_flags(stock_close, bench_close):
-    """Aligns stock and benchmark data, computes RS ratio, Blue Dot / Green Dot flags."""
+def compute_flags_and_rs_ema(stock_close, bench_close):
+    """Computes RS Ratio, Blue/Green Dots, and RS Line 5 EMA condition."""
     df = pd.concat([stock_close, bench_close], axis=1, join="inner")
     df.columns = ["stock", "bench"]
     df = df.dropna()
@@ -167,6 +168,7 @@ def compute_flags(stock_close, bench_close):
         return None
 
     df["rs_ratio"] = df["stock"] / df["bench"]
+    df["rs_ema5"] = df["rs_ratio"].ewm(span=5, adjust=False).mean()
     df["rs_rolling_high"] = df["rs_ratio"].rolling(LOOKBACK_DAYS).max()
     df["price_rolling_high"] = df["stock"].rolling(LOOKBACK_DAYS).max()
 
@@ -180,14 +182,14 @@ def compute_flags(stock_close, bench_close):
     price_at_new_high = today["stock"] >= today["price_rolling_high"]
     green_dot = bool(blue_dot and not price_at_new_high)
 
-    return blue_dot, green_dot
+    rs_below_ema5 = bool(today["rs_ratio"] < today["rs_ema5"])
+    daily_change_pct = (today["stock"] / yesterday["stock"]) - 1.0
+
+    return blue_dot, green_dot, rs_below_ema5, daily_change_pct, df["rs_ratio"]
 
 
 def compute_trend_template(series):
-    """
-    Mark Minervini's 7-point Trend Template applied to Price or RS Line.
-    Returns (pass_bool, criteria_met_count_out_of_7).
-    """
+    """Mark Minervini 7-Point Trend Template Criteria."""
     if len(series) < 273:
         return None
 
@@ -196,7 +198,8 @@ def compute_trend_template(series):
     sma150 = series.rolling(150).mean().iloc[-1]
     sma200_series = series.rolling(200).mean()
     sma200 = sma200_series.iloc[-1]
-    sma200_1mo_ago = sma200_series.iloc[-21]
+    
+    sma200_1mo_ago = sma200_series.shift(21).iloc[-1]
 
     if any(pd.isna(x) for x in [sma50, sma150, sma200, sma200_1mo_ago]):
         return None
@@ -207,11 +210,11 @@ def compute_trend_template(series):
     criteria = [
         price > sma150 and price > sma200,                      # 1
         sma150 > sma200,                                          # 2
-        sma200 > sma200_1mo_ago,                                  # 3: 200-MA trending up
+        sma200 > sma200_1mo_ago,                                  # 3
         sma50 > sma150 and sma50 > sma200,                        # 4
         price > sma50,                                            # 5
-        price >= 1.25 * low_52w,                                  # 6: >= 25% above 52wk low
-        price >= 0.75 * high_52w,                                 # 7: within 25% of 52wk high
+        price >= 1.25 * low_52w,                                  # 6
+        price >= 0.75 * high_52w,                                 # 7
     ]
     met = sum(criteria)
     passed = met == len(criteria)
@@ -220,11 +223,10 @@ def compute_trend_template(series):
 
 def main():
     tickers = load_tickers()
-    print(f"Loaded {len(tickers)} tickers.")
+    print(f"Scanning universe: {len(tickers)} tickers loaded.")
 
     run_mode = get_run_mode()
-    print(f"Run mode: {run_mode}"
-          + (" (manual preview -- Holdings/Portfolio will NOT be updated)" if run_mode == "PREVIEW" else ""))
+    print(f"Run Mode: {run_mode}")
 
     bench_close = download_benchmark(run_mode)
 
@@ -232,13 +234,12 @@ def main():
     batch_size = 50
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
-        print(f"Downloading batch {i}-{i+len(batch)}...")
         try:
             data = yf.download(batch, period=HISTORY_PERIOD, interval="1d",
                                 auto_adjust=True, progress=False, group_by="ticker",
                                 threads=True)
         except Exception as e:
-            print(f"Batch download failed: {e}")
+            print(f"Batch execution failed: {e}")
             continue
 
         intraday_batch_prices = fetch_intraday_last_price(batch) if run_mode == "PREVIEW" else {}
@@ -257,29 +258,28 @@ def main():
                 if volume.tail(20).mean() < MIN_AVG_VOLUME:
                     continue
 
-                rs_score = compute_rs_score(close)
-                flags = compute_flags(close, bench_close)
-                if rs_score is None or flags is None:
+                raw_rs_perf = compute_raw_rs_performance(close)
+                flag_data = compute_flags_and_rs_ema(close, bench_close)
+                if raw_rs_perf is None or flag_data is None:
                     continue
                 
-                blue_dot, green_dot = flags
+                blue_dot, green_dot, rs_below_ema5, daily_change_pct, rs_ratio_full = flag_data
                 tt_result = compute_trend_template(close)
 
                 sma50_latest = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
                 above_50dma = bool(close.iloc[-1] > sma50_latest) if pd.notna(sma50_latest) else None
                 sma50_value = round(float(sma50_latest), 2) if pd.notna(sma50_latest) else None
 
-                aligned = pd.concat([close, bench_close], axis=1, join="inner").dropna()
-                aligned.columns = ["s", "b"]
-                rs_ratio_full = aligned["s"] / aligned["b"]
                 rs_tt_result = compute_trend_template(rs_ratio_full)
                 rs_history = [round(float(v), 4) for v in rs_ratio_full.tail(RS_HISTORY_DAYS).tolist()]
 
                 all_stocks.append({
                     "symbol": symbol.replace(".NS", ""),
-                    "rs_score": rs_score,
+                    "raw_rs_perf": raw_rs_perf,
                     "blue_dot": blue_dot,
                     "green_dot": green_dot,
+                    "rs_below_ema5": rs_below_ema5,
+                    "daily_change_pct": daily_change_pct,
                     "last_close": round(float(close.iloc[-1]), 2),
                     "tt_pass": tt_result[0] if tt_result else None,
                     "tt_criteria_met": tt_result[1] if tt_result else None,
@@ -290,91 +290,69 @@ def main():
                     "rs_history": rs_history,
                 })
             except Exception as e:
-                print(f"Skipping {symbol}: {e}")
                 continue
 
-        time.sleep(1)
+        time.sleep(0.5)
 
     if not all_stocks:
-        print("No stocks with sufficient data found.")
-        results_df = pd.DataFrame(columns=[
-            "rank", "symbol", "composite_score", "rs_score", "rs_rating", "blue_dot", "green_dot",
-            "trend_template", "tt_criteria", "rs_trend_template", "rs_tt_criteria", "last_close"])
-        write_to_sheet(results_df, run_mode)
+        print("No eligible stock records generated.")
         return
 
     universe_df = pd.DataFrame(all_stocks)
 
-    universe_df["rs_rating"] = (universe_df["rs_score"].rank(pct=True) * 98 + 1).round(0).astype(int)
+    # Standard Cross-Sectional Percentile Ranking (1-99)
+    universe_df["rs_score"] = (universe_df["raw_rs_perf"].rank(pct=True) * 98 + 1).round(0).astype(int)
+    universe_df["rs_rating"] = universe_df["rs_score"]
 
-    universe_df["trend_template"] = universe_df["tt_pass"].map(
-        {True: "PASS", False: "FAIL", None: "N/A"})
+    universe_df["trend_template"] = universe_df["tt_pass"].map({True: "PASS", False: "FAIL", None: "N/A"})
     universe_df["blue_dot_label"] = universe_df["blue_dot"].map({True: "YES", False: ""})
     universe_df["green_dot_label"] = universe_df["green_dot"].map({True: "YES", False: ""})
-    universe_df["tt_criteria"] = universe_df["tt_criteria_met"].apply(
-        lambda x: f"{x}/7" if pd.notna(x) else "N/A")
+    universe_df["tt_criteria"] = universe_df["tt_criteria_met"].apply(lambda x: f"{x}/7" if pd.notna(x) else "N/A")
 
-    universe_df["rs_trend_template"] = universe_df["rs_tt_pass"].map(
-        {True: "PASS", False: "FAIL", None: "N/A"})
-    universe_df["rs_tt_criteria"] = universe_df["rs_tt_criteria_met"].apply(
-        lambda x: f"{x}/7" if pd.notna(x) else "N/A")
+    universe_df["rs_trend_template"] = universe_df["rs_tt_pass"].map({True: "PASS", False: "FAIL", None: "N/A"})
+    universe_df["rs_tt_criteria"] = universe_df["rs_tt_criteria_met"].apply(lambda x: f"{x}/7" if pd.notna(x) else "N/A")
 
-    # Composite Score calculation
-    tt_component = (universe_df["tt_criteria_met"].fillna(0) / 7 * 100)
-    green_component = universe_df["green_dot_label"].map({"YES": 100, "": 0})
-    universe_df["composite_score"] = (
-        0.50 * universe_df["rs_rating"] +
-        0.30 * tt_component +
-        0.20 * green_component
-    ).round(1)
+    tt_comp = (universe_df["tt_criteria_met"].fillna(0) / 7 * 100)
+    green_comp = universe_df["green_dot_label"].map({"YES": 100, "": 0})
+    universe_df["composite_score"] = (0.50 * universe_df["rs_score"] + 0.30 * tt_comp + 0.20 * green_comp).round(1)
 
     results_df = universe_df[[
-        "symbol", "composite_score", "rs_score", "rs_rating",
-        "blue_dot_label", "green_dot_label",
-        "trend_template", "tt_criteria", "rs_trend_template", "rs_tt_criteria", "last_close"
+        "symbol", "composite_score", "rs_score", "rs_rating", "blue_dot_label", "green_dot_label",
+        "rs_below_ema5", "daily_change_pct", "trend_template", "tt_criteria", 
+        "rs_trend_template", "rs_tt_criteria", "last_close"
     ]].rename(columns={"blue_dot_label": "blue_dot", "green_dot_label": "green_dot"})
     
-    # Primary sort by RS Score from high to low
-    results_df = results_df.sort_values(SELECTION_SORT_METRIC, ascending=False)
+    results_df = results_df.sort_values("rs_score", ascending=False)
     results_df["rank"] = range(1, len(results_df) + 1)
     results_df = results_df[["rank"] + [c for c in results_df.columns if c != "rank"]]
-
-    n_blue = (results_df["blue_dot"] == "YES").sum()
-    n_green = (results_df["green_dot"] == "YES").sum()
-    n_tt_pass = (results_df["trend_template"] == "PASS").sum()
-    n_rs_tt_pass = (results_df["rs_trend_template"] == "PASS").sum()
-    print(f"Universe scanned: {len(universe_df)} stocks.")
-    print(f"Blue Dot: {n_blue} | Green Dot: {n_green} | Stock Trend Template PASS: {n_tt_pass} | RS Line Trend Template PASS: {n_rs_tt_pass}")
 
     write_to_sheet(results_df, run_mode)
 
     if run_mode == "PREVIEW":
-        print("Preview mode executed. Holdings/Portfolio unmodified.")
+        print("Preview Run Complete. Portfolio tables unchanged.")
         return
 
-    # ---- Market Breadth Filter ----
     valid_breadth = universe_df["above_50dma"].dropna()
     breadth_pct = round(100 * valid_breadth.mean(), 1) if len(valid_breadth) else 0
 
     if breadth_pct >= BREADTH_RISK_ON:
-        regime = "RISK-ON (full size)"
+        regime = "RISK-ON (Full position size)"
         allow_new_entries = True
     elif breadth_pct >= BREADTH_RISK_CAUTION:
-        regime = "CAUTION (half size)"
+        regime = "CAUTION (Half position size)"
         allow_new_entries = True
     elif breadth_pct >= BREADTH_CIRCUIT_BREAKER:
-        regime = "RISK-OFF (no new entries)"
+        regime = "RISK-OFF (No new positions)"
         allow_new_entries = False
     else:
-        regime = "CIRCUIT BREAKER (reduce to cash)"
+        regime = "CIRCUIT BREAKER (Liquidate to cash)"
         allow_new_entries = False
 
     circuit_breaker = breadth_pct < BREADTH_CIRCUIT_BREAKER
-    print(f"Breadth (% above 50DMA): {breadth_pct}% -> Regime: {regime}")
 
-    # ---- Portfolio Construction ----
     sma50_lookup = dict(zip(universe_df["symbol"], universe_df["sma50"]))
     rs_history_lookup = dict(zip(universe_df["symbol"], universe_df["rs_history"]))
+
     build_portfolio(results_df, breadth_pct, regime, allow_new_entries, sma50_lookup,
                      rs_history_lookup, circuit_breaker)
 
@@ -386,10 +364,7 @@ def read_config(sh):
         settings = {row["Setting"]: row["Value"] for row in records if row.get("Setting")}
     except gspread.WorksheetNotFound:
         cfg_ws = sh.add_worksheet(title=CONFIG_WORKSHEET, rows=10, cols=3)
-        cfg_ws.update([
-            ["Setting", "Value", "Notes"],
-            ["Total Capital (INR)", 0, "EDIT ME: total investment capital"],
-        ], "A1")
+        cfg_ws.update([["Setting", "Value", "Notes"], ["Total Capital (INR)", 0, "Specify total capital"]], "A1")
         settings = {"Total Capital (INR)": 0}
 
     try:
@@ -402,26 +377,25 @@ def read_config(sh):
 def apply_confirmed_executions(sh):
     try:
         port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
-    except gspread.WorksheetNotFound:
-        return
-
-    try:
         prior_rows = port_ws.get_all_records(head=3)
-    except Exception as e:
-        print(f"Could not read prior Portfolio tab for confirmations: {e}")
+    except Exception:
         return
 
     try:
         holdings_ws = sh.worksheet(HOLDINGS_WORKSHEET)
         existing = holdings_ws.get_all_records()
         holdings = {
-            row["symbol"]: {"entry_price": float(row.get("entry_price") or 0),
-                             "entry_date": row.get("entry_date", "")}
+            row["symbol"]: {
+                "entry_price": float(row.get("entry_price") or 0),
+                "peak_price": float(row.get("peak_price") or row.get("entry_price") or 0),
+                "entry_date": row.get("entry_date", ""),
+                "qty": int(row.get("qty") or 0)
+            }
             for row in existing if row.get("symbol")
         }
     except gspread.WorksheetNotFound:
-        holdings_ws = sh.add_worksheet(title=HOLDINGS_WORKSHEET, rows=100, cols=5)
-        holdings_ws.update([["symbol", "entry_price", "entry_date"]], "A1")
+        holdings_ws = sh.add_worksheet(title=HOLDINGS_WORKSHEET, rows=100, cols=6)
+        holdings_ws.update([["symbol", "entry_price", "peak_price", "entry_date", "qty"]], "A1")
         holdings = {}
 
     from datetime import datetime
@@ -438,37 +412,28 @@ def apply_confirmed_executions(sh):
             continue
 
         if action == "BUY":
-            exec_price_raw = row.get("Execution Price") or row.get("Entry Price")
-            try:
-                exec_price = float(exec_price_raw)
-            except (ValueError, TypeError):
-                print(f"Skipping confirmed BUY for {symbol}: invalid price.")
-                continue
-            holdings[symbol] = {"entry_price": exec_price, "entry_date": today_str}
-            changed = True
-            print(f"Confirmed BUY: {symbol} @ {exec_price}")
+            exec_price = float(row.get("Execution Price") or row.get("Entry Price") or 0)
+            exec_qty = int(row.get("Qty") or 0)
+            if exec_price > 0 and exec_qty > 0:
+                holdings[symbol] = {
+                    "entry_price": exec_price, 
+                    "peak_price": exec_price, 
+                    "entry_date": today_str, 
+                    "qty": exec_qty
+                }
+                changed = True
 
         elif action == "SELL":
             if symbol in holdings:
                 del holdings[symbol]
                 changed = True
-                print(f"Confirmed SELL: {symbol}")
 
     if changed:
         holdings_ws.clear()
-        rows_out = [["symbol", "entry_price", "entry_date"]] + [
-            [s, v["entry_price"], v["entry_date"]] for s, v in holdings.items()
+        rows_out = [["symbol", "entry_price", "peak_price", "entry_date", "qty"]] + [
+            [s, v["entry_price"], v["peak_price"], v["entry_date"], v["qty"]] for s, v in holdings.items()
         ]
         holdings_ws.update(rows_out, "A1")
-        print("Holdings updated.")
-
-
-def compute_stop_loss(sma50_val, entry_price):
-    if sma50_val:
-        return round(max(sma50_val, entry_price * (1 - STOP_LOSS_PCT)), 2)
-    elif entry_price:
-        return round(entry_price * (1 - STOP_LOSS_PCT), 2)
-    return None
 
 
 def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_lookup,
@@ -476,7 +441,6 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
     if not sheet_id or not creds_json:
-        print("Missing credentials — skipping portfolio construction.")
         return
 
     creds_dict = json.loads(creds_json)
@@ -492,68 +456,141 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
         holdings_ws = sh.worksheet(HOLDINGS_WORKSHEET)
         existing = holdings_ws.get_all_records()
         current_holdings = {
-            row["symbol"]: {"entry_price": float(row.get("entry_price") or 0),
-                             "entry_date": row.get("entry_date", "")}
+            row["symbol"]: {
+                "entry_price": float(row.get("entry_price") or 0),
+                "peak_price": float(row.get("peak_price") or row.get("entry_price") or 0),
+                "entry_date": str(row.get("entry_date", "")),
+                "qty": int(row.get("qty") or 0)
+            }
             for row in existing if row.get("symbol")
         }
     except gspread.WorksheetNotFound:
-        holdings_ws = sh.add_worksheet(title=HOLDINGS_WORKSHEET, rows=100, cols=5)
-        holdings_ws.update([["symbol", "entry_price", "entry_date"]], "A1")
         current_holdings = {}
 
     price_lookup = dict(zip(ranked_df["symbol"], ranked_df["last_close"]))
 
-    # Target Selection: Stock TT = PASS and RS TT = PASS (NO blue_dot required), ordered high-to-low by RS Score
-    pool = ranked_df
-    if REQUIRE_TREND_TEMPLATE_PASS:
-        pool = pool[pool["trend_template"] == "PASS"]
-    if REQUIRE_RS_TREND_TEMPLATE_PASS:
-        pool = pool[pool["rs_trend_template"] == "PASS"]
-    
-    pool = pool.sort_values(SELECTION_SORT_METRIC, ascending=False)
-    target_symbols = pool.head(TOP_N)["symbol"].tolist()
+    # Update Peak Prices for held assets
+    updated_holdings_file = False
+    for s, hdata in current_holdings.items():
+        curr_p = price_lookup.get(s, 0)
+        if curr_p > hdata["peak_price"]:
+            hdata["peak_price"] = curr_p
+            updated_holdings_file = True
+
+    if updated_holdings_file and holdings_ws:
+        holdings_ws.clear()
+        rows_out = [["symbol", "entry_price", "peak_price", "entry_date", "qty"]] + [
+            [s, v["entry_price"], v["peak_price"], v["entry_date"], v["qty"]] for s, v in current_holdings.items()
+        ]
+        holdings_ws.update(rows_out, "A1")
+
+    eligible_candidates = ranked_df[
+        (ranked_df["trend_template"] == "PASS") & 
+        (ranked_df["rs_trend_template"] == "PASS")
+    ].sort_values("rs_score", ascending=False)
+
+    target_pool_top10 = eligible_candidates.head(ENTRY_RANK_THRESHOLD)["symbol"].tolist()
 
     if circuit_breaker:
-        target_symbols = []
+        target_pool_top10 = []
 
-    # Position Management Rules
-    kept = [s for s in current_holdings if s in target_symbols]
-    pending_sell = [s for s in current_holdings if s not in target_symbols]  # Exit when leaving Top 10
-    pending_buy = [] if not allow_new_entries else \
-        [s for s in target_symbols if s not in current_holdings]
+    kept = []
+    pending_sell = []
+    exit_reasons = {}
 
-    if regime.startswith("RISK-ON"):
-        size_multiplier = 1.0
-    elif regime.startswith("CAUTION"):
-        size_multiplier = 0.5
-    else:
-        size_multiplier = 0.0
-    slot_capital = (capital / TOP_N) * size_multiplier if capital > 0 else 0
+    # ---------------- EXIT EVALUATION ENGINE ----------------
+    for s, hdata in current_holdings.items():
+        if circuit_breaker:
+            pending_sell.append(s)
+            exit_reasons[s] = "CIRCUIT BREAKER"
+            continue
+
+        r_match = ranked_df[ranked_df["symbol"] == s]
+        if r_match.empty:
+            pending_sell.append(s)
+            exit_reasons[s] = "DATA MISSING"
+            continue
+
+        r = r_match.iloc[0]
+        rank_val = int(r["rank"])
+        entry_p = hdata["entry_price"]
+        peak_p = hdata["peak_price"]
+        curr_p = price_lookup.get(s, 0)
+
+        # Drawdown calculation relative to highest reached price
+        drawdown_pct = ((peak_p - curr_p) / peak_p) if peak_p > 0 else 0.0
+        # Hard Stop Loss loss from initial entry price
+        stop_loss_trigger = curr_p <= (entry_p * (1.0 - STOP_LOSS_PCT))
+
+        # 1. Hard Floor Stop-Loss Exit (> 5% loss from entry)
+        if stop_loss_trigger:
+            pending_sell.append(s)
+            loss_from_entry = round(((curr_p / entry_p) - 1.0) * 100, 2)
+            exit_reasons[s] = f"STOP LOSS (>5% loss: {loss_from_entry}%)"
+
+        # 2. Maximum Drawdown Exit (> 10% decline from peak)
+        elif drawdown_pct > MAX_DRAWDOWN_PCT:
+            pending_sell.append(s)
+            exit_reasons[s] = f"DRAWDOWN EXCEEDED ({round(drawdown_pct * 100, 2)}% > 10%)"
+
+        # 3. Rank Drop Exit (Rank > 20)
+        elif rank_val > EXIT_RANK_THRESHOLD:
+            pending_sell.append(s)
+            exit_reasons[s] = f"RANK DROP (Rank {rank_val} > {EXIT_RANK_THRESHOLD})"
+        
+        # 4. Stock Price below RS Line 5 EMA
+        elif r["rs_below_ema5"]:
+            pending_sell.append(s)
+            exit_reasons[s] = "BELOW RS 5 EMA"
+
+        # 5. Structural Trend Template Failure
+        elif r["trend_template"] != "PASS" or r["rs_trend_template"] != "PASS":
+            pending_sell.append(s)
+            exit_reasons[s] = "TREND TEMPLATE FAIL"
+
+        else:
+            kept.append(s)
+
+    # Fill open positions up to top 10 limit
+    open_slots = ENTRY_RANK_THRESHOLD - len(kept)
+    pending_buy = []
+    if allow_new_entries and open_slots > 0:
+        for cand in target_pool_top10:
+            if cand not in current_holdings and cand not in pending_buy:
+                pending_buy.append(cand)
+                if len(pending_buy) == open_slots:
+                    break
+
+    size_multiplier = 1.0 if regime.startswith("RISK-ON") else (0.5 if regime.startswith("CAUTION") else 0.0)
+    slot_capital = (capital / ENTRY_RANK_THRESHOLD) * size_multiplier if capital > 0 else 0
 
     rows = []
 
-    # HOLD Positions
+    # 1. HOLD POSITIONS
     for s in kept:
         r = ranked_df[ranked_df["symbol"] == s].iloc[0]
         entry_price = current_holdings[s]["entry_price"]
+        peak_price = current_holdings[s]["peak_price"]
         entry_date = current_holdings[s]["entry_date"]
+        qty = current_holdings[s]["qty"]
         current_price = price_lookup.get(s, 0)
-        position_value = round((capital / TOP_N), 0) if capital > 0 else 0
-        qty = int(position_value / entry_price) if entry_price > 0 else 0
+        position_value = round(qty * current_price, 0)
         pnl_pct = round(((current_price / entry_price) - 1) * 100, 2) if entry_price > 0 else 0
+        dd_pct = round(((peak_price - current_price) / peak_price) * 100, 2) if peak_price > 0 else 0
 
         rows.append({
             "Action": "HOLD", "Symbol": s, "Rank": int(r["rank"]),
             "Composite Score": r["composite_score"],
-            "Entry Price": entry_price, "Entry Date": entry_date, "Current Price": current_price,
-            "Qty": qty, "Position Value (Rs)": position_value, "P&L %": f"{pnl_pct}%",
-            "Stop-Loss": compute_stop_loss(sma50_lookup.get(s), entry_price),
-            "Blue Dot": r["blue_dot"], "Green Dot": r["green_dot"],
+            "Entry Price": entry_price, "Peak Price": peak_price, "Entry Date": entry_date, 
+            "Current Price": current_price, "Qty": qty, "Position Value (Rs)": position_value, 
+            "P&L %": f"{pnl_pct}%", "Drawdown %": f"{dd_pct}%",
+            "Stop-Loss": round(entry_price * (1 - STOP_LOSS_PCT), 2),
+            "Exit Reason": "", "Blue Dot": r["blue_dot"], "Green Dot": r["green_dot"],
             "Trend Template": r["trend_template"],
             "RS Line Trend Template": r["rs_trend_template"],
         })
 
-    # BUY Suggestions
+    # 2. BUY POSITIONS
     for s in pending_buy:
         r = ranked_df[ranked_df["symbol"] == s].iloc[0]
         current_price = price_lookup.get(s, 0)
@@ -563,28 +600,34 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
         rows.append({
             "Action": "BUY", "Symbol": s, "Rank": int(r["rank"]),
             "Composite Score": r["composite_score"],
-            "Entry Price": current_price, "Entry Date": "PENDING", "Current Price": current_price,
-            "Qty": qty, "Position Value (Rs)": position_value, "P&L %": "",
-            "Stop-Loss": compute_stop_loss(sma50_lookup.get(s), current_price),
-            "Blue Dot": r["blue_dot"], "Green Dot": r["green_dot"],
+            "Entry Price": current_price, "Peak Price": current_price, "Entry Date": "PENDING", 
+            "Current Price": current_price, "Qty": qty, "Position Value (Rs)": position_value, 
+            "P&L %": "", "Drawdown %": "",
+            "Stop-Loss": round(current_price * (1 - STOP_LOSS_PCT), 2),
+            "Exit Reason": "", "Blue Dot": r["blue_dot"], "Green Dot": r["green_dot"],
             "Trend Template": r["trend_template"],
             "RS Line Trend Template": r["rs_trend_template"],
         })
 
-    # SELL Suggestions (Dropped from Top 10 or triggered circuit breaker)
+    # 3. SELL POSITIONS
     for s in pending_sell:
         entry_price = current_holdings[s]["entry_price"]
+        peak_price = current_holdings[s]["peak_price"]
         current_price = price_lookup.get(s, 0)
+        qty = current_holdings[s]["qty"]
         pnl_pct = round(((current_price / entry_price) - 1) * 100, 2) if entry_price > 0 else 0
+        dd_pct = round(((peak_price - current_price) / peak_price) * 100, 2) if peak_price > 0 else 0
         r_match = ranked_df[ranked_df["symbol"] == s]
         rank_val = int(r_match.iloc[0]["rank"]) if not r_match.empty else "N/A"
 
         rows.append({
             "Action": "SELL", "Symbol": s, "Rank": rank_val, "Composite Score": "",
-            "Entry Price": entry_price, "Entry Date": current_holdings[s]["entry_date"],
-            "Current Price": current_price, "Qty": "", "Position Value (Rs)": "",
-            "P&L %": f"{pnl_pct}%", "Stop-Loss": "", "Blue Dot": "", "Green Dot": "",
-            "Trend Template": "", "RS Line Trend Template": "",
+            "Entry Price": entry_price, "Peak Price": peak_price, 
+            "Entry Date": current_holdings[s]["entry_date"], "Current Price": current_price, 
+            "Qty": qty, "Position Value (Rs)": round(qty * current_price, 0),
+            "P&L %": f"{pnl_pct}%", "Drawdown %": f"{dd_pct}%", "Stop-Loss": "", 
+            "Exit Reason": exit_reasons.get(s, "EXIT TRIGGERED"),
+            "Blue Dot": "", "Green Dot": "", "Trend Template": "", "RS Line Trend Template": "",
         })
 
     n_port_rows_needed = len(rows) + 10
@@ -600,24 +643,16 @@ def build_portfolio(ranked_df, breadth_pct, regime, allow_new_entries, sma50_loo
     port_ws.clear()
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
-    invested = sum(r.get("Position Value (Rs)", 0) for r in rows
-                    if isinstance(r.get("Position Value (Rs)"), (int, float)))
+    invested = sum(r.get("Position Value (Rs)", 0) for r in rows if isinstance(r.get("Position Value (Rs)"), (int, float)))
+    
     summary = (f"Last updated: {timestamp}  |  Breadth: {breadth_pct}%  |  Regime: {regime}  |  "
-               f"Capital: Rs.{capital:,.0f}  |  Deployed (approx): Rs.{invested:,.0f}  |  "
-               f"Mark Executed=Y on BUY/SELL rows once confirmed")
-    if circuit_breaker:
-        summary = "*** CIRCUIT BREAKER TRIGGERED: REDUCE TO CASH ***  |  " + summary
-    if capital == 0:
-        summary += "  |  SET YOUR CAPITAL in the Config tab"
+               f"Capital: Rs.{capital:,.0f}  |  Deployed: Rs.{invested:,.0f}")
+    
     port_ws.update([[summary]], "A1")
-
     row_lists = [[r.get(col, "") for col in PORTFOLIO_HEADER] for r in rows]
     port_ws.update([PORTFOLIO_HEADER] + row_lists, "A3")
 
     write_rs_history_and_sparklines(sh, rows, rs_history_lookup)
-
-    print(f"Portfolio updated: {len(kept)} held, {len(pending_buy)} pending BUY, "
-          f"{len(pending_sell)} pending SELL.")
 
 
 def write_rs_history_and_sparklines(sh, rows, rs_history_lookup):
@@ -663,7 +698,6 @@ def write_to_sheet(df, run_mode="EOD"):
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
     if not sheet_id or not creds_json:
-        print("Missing env vars — saving to CSV instead.")
         df.to_csv("rs_screener_output.csv", index=False)
         return
 
@@ -687,13 +721,12 @@ def write_to_sheet(df, run_mode="EOD"):
     ws.clear()
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
-    label = "PREVIEW (intraday)" if run_mode == "PREVIEW" else "EOD FINAL"
+    label = "PREVIEW (Intraday)" if run_mode == "PREVIEW" else "EOD FINAL"
     ws.update([[f"Last updated: {timestamp}  |  {label}"]], "A1")
     header = ["Rank", "Symbol", "Composite Score", "RS Score", "RS Rating (1-99)", "Blue Dot",
-              "Green Dot (Breakout Watch)", "Trend Template", "TT Criteria Met",
-              "RS Line Trend Template", "RS Line TT Criteria", "Last Close"]
+              "Green Dot (Breakout Watch)", "RS Below 5 EMA", "Daily Change %", "Trend Template", 
+              "TT Criteria Met", "RS Line Trend Template", "RS Line TT Criteria", "Last Close"]
     ws.update([header] + df.values.tolist(), "A3")
-    print("Google Sheet updated successfully.")
 
 
 if __name__ == "__main__":
