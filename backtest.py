@@ -1,24 +1,35 @@
-# RS SCREENER BACKTEST — SYNCED WITH LIVE SCREENER
+# RS SCREENER BACKTEST
+# PYTHON CALCULATION -> GOOGLE SHEETS OUTPUT
+# SYNCED WITH LIVE SCREENER
 
-import os, json, time
+import os
+import json
+import time
+import traceback
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import gspread
-from datetime import datetime
-from zoneinfo import ZoneInfo
+
 from google.oauth2.service_account import Credentials
 
-# =========================
+
+# ============================================================
 # PARAMETERS
-# =========================
+# ============================================================
 
 BENCHMARK = "^CRSLDX"
 BENCHMARK_FALLBACK = "^NSEI"
+
 STOCKS_FILE = "stocks.csv"
 
 BACKTEST_START = "2016-04-01"
-BACKTEST_END = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+BACKTEST_END = datetime.now(
+    ZoneInfo("Asia/Kolkata")
+).strftime("%Y-%m-%d")
 
 STARTING_CAPITAL = 1_000_000
 
@@ -31,7 +42,13 @@ VOLUME_LOOKBACK = 50
 
 DOWNLOAD_YEARS_BEFORE_START = 3
 
+
+# ============================================================
+# COSTS
+# ============================================================
+
 ENABLE_COSTS = True
+
 STT_BUY_RATE = 0.001
 STT_SELL_RATE = 0.001
 STAMP_DUTY_RATE = 0.00015
@@ -40,10 +57,21 @@ SEBI_CHARGE_RATE = 0.000001
 GST_RATE = 0.18
 DP_CHARGE_FLAT = 20
 
+
+# ============================================================
+# STCG
+# ============================================================
+
 ENABLE_STCG = True
+
 STCG_RATE = 0.20
 STCG_CESS = 0.04
 STCG_EFFECTIVE_RATE = STCG_RATE * (1 + STCG_CESS)
+
+
+# ============================================================
+# GOOGLE SHEETS
+# ============================================================
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
@@ -51,62 +79,99 @@ CREDS_ENV = "GOOGLE_CREDENTIALS"
 SUMMARY_SHEET = "Backtest_Summary"
 BACKTEST_SHEET = "Backtest"
 
-# =========================
-# COSTS
-# =========================
 
-def buy_cost(v):
-    if not ENABLE_COSTS: return 0
+# ============================================================
+# COST FUNCTIONS
+# ============================================================
+
+def buy_cost(value):
+
+    if not ENABLE_COSTS:
+        return 0.0
+
+    exchange = EXCHANGE_CHARGE_RATE * value
+    sebi = SEBI_CHARGE_RATE * value
+
     return (
-        STT_BUY_RATE*v +
-        STAMP_DUTY_RATE*v +
-        EXCHANGE_CHARGE_RATE*v +
-        SEBI_CHARGE_RATE*v +
-        GST_RATE*(EXCHANGE_CHARGE_RATE*v + SEBI_CHARGE_RATE*v)
+        STT_BUY_RATE * value
+        + STAMP_DUTY_RATE * value
+        + exchange
+        + sebi
+        + GST_RATE * (exchange + sebi)
     )
 
-def sell_cost(v):
-    if not ENABLE_COSTS: return 0
+
+def sell_cost(value):
+
+    if not ENABLE_COSTS:
+        return 0.0
+
+    exchange = EXCHANGE_CHARGE_RATE * value
+    sebi = SEBI_CHARGE_RATE * value
+
     return (
-        STT_SELL_RATE*v +
-        EXCHANGE_CHARGE_RATE*v +
-        SEBI_CHARGE_RATE*v +
-        GST_RATE*(EXCHANGE_CHARGE_RATE*v + SEBI_CHARGE_RATE*v) +
-        DP_CHARGE_FLAT
+        STT_SELL_RATE * value
+        + exchange
+        + sebi
+        + GST_RATE * (exchange + sebi)
+        + DP_CHARGE_FLAT
     )
+
 
 def stcg(gain):
-    return (
-        max(0, gain) * STCG_EFFECTIVE_RATE
-        if ENABLE_STCG else 0
-    )
 
-# =========================
-# LOAD UNIVERSE
-# =========================
+    if not ENABLE_STCG:
+        return 0.0
+
+    return max(0.0, gain) * STCG_EFFECTIVE_RATE
+
+
+# ============================================================
+# LOAD STOCK UNIVERSE
+# ============================================================
 
 def load_tickers():
+
+    if not os.path.exists(STOCKS_FILE):
+        raise FileNotFoundError(
+            f"{STOCKS_FILE} not found"
+        )
+
     df = pd.read_csv(STOCKS_FILE)
+
     if "symbol" not in df.columns:
-        raise ValueError("stocks.csv needs a 'symbol' column")
+        raise ValueError(
+            "stocks.csv needs a 'symbol' column"
+        )
+
+    symbols = (
+        df["symbol"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+
     return [
-        x if x.endswith(".NS") else x+".NS"
-        for x in df["symbol"].dropna().astype(str).str.strip()
+        x if x.endswith(".NS") else x + ".NS"
+        for x in symbols
         if x
     ]
 
-# =========================
-# TREND TEMPLATE
-# =========================
 
-def tt(s):
+# ============================================================
+# TREND TEMPLATE
+# ============================================================
+
+def trend_template(s):
+
     sma50 = s.rolling(50).mean()
     sma150 = s.rolling(150).mean()
     sma200 = s.rolling(200).mean()
+
     low52 = s.rolling(252).min()
     high52 = s.rolling(252).max()
 
-    c = [
+    conditions = [
         (s > sma150) & (s > sma200),
         sma150 > sma200,
         sma200 > sma200.shift(21),
@@ -116,17 +181,22 @@ def tt(s):
         s >= 0.75 * high52
     ]
 
-    met = sum(x.astype(int) for x in c)
+    met = sum(
+        condition.astype(int)
+        for condition in conditions
+    )
+
     return met == 7, met
 
-# =========================
-# STOCK SIGNALS
-# =========================
 
-def stock_signals(close, volume, bench):
+# ============================================================
+# STOCK SIGNALS
+# ============================================================
+
+def stock_signals(close, volume, benchmark):
 
     x = pd.concat(
-        [close, bench],
+        [close, benchmark],
         axis=1,
         join="inner"
     ).dropna()
@@ -136,178 +206,343 @@ def stock_signals(close, volume, bench):
     if len(x) < 280:
         return None
 
-    volume = volume.reindex(x.index).fillna(0)
+    volume = (
+        volume
+        .reindex(x.index)
+        .fillna(0)
+    )
 
-    avg_vol = volume.rolling(VOLUME_LOOKBACK).mean()
+    # --------------------------------------------------------
+    # 50D VOLUME
+    # --------------------------------------------------------
 
-    price_tt, price_met = tt(x.s)
+    avg_volume = (
+        volume
+        .rolling(VOLUME_LOOKBACK)
+        .mean()
+    )
 
-    rs_line = x.s / x.b
+    # --------------------------------------------------------
+    # PRICE TT
+    # --------------------------------------------------------
 
-    rs_tt, rs_met = tt(rs_line)
+    price_tt, price_tt_met = trend_template(
+        x["s"]
+    )
+
+    # --------------------------------------------------------
+    # RS LINE
+    # --------------------------------------------------------
+
+    rs_line = x["s"] / x["b"]
+
+    rs_tt, rs_tt_met = trend_template(
+        rs_line
+    )
+
+    # --------------------------------------------------------
+    # RS SCORE
+    # --------------------------------------------------------
 
     def ret(days):
-        return x.s / x.s.shift(days) - 1
+
+        return (
+            x["s"]
+            / x["s"].shift(days)
+            - 1
+        )
 
     rs_score = (
-        0.40 * ret(63) +
-        0.20 * ret(126) +
-        0.20 * ret(189) +
-        0.20 * ret(252)
+        0.40 * ret(63)
+        + 0.20 * ret(126)
+        + 0.20 * ret(189)
+        + 0.20 * ret(252)
     ) * 100
 
+    # --------------------------------------------------------
+    # LIVE-SCREENER IDENTICAL ENTRY FILTER
+    # --------------------------------------------------------
+
     liquid = (
-        (x.s >= MIN_PRICE) &
-        (avg_vol >= MIN_AVG_VOLUME)
+        (x["s"] >= MIN_PRICE)
+        &
+        (avg_volume >= MIN_AVG_VOLUME)
+    )
+
+    eligible = (
+        price_tt
+        &
+        rs_tt
+        &
+        liquid
     )
 
     return pd.DataFrame({
-        "price": x.s,
+
+        "price": x["s"],
+
         "rs_score": rs_score,
+
         "price_tt": price_tt,
-        "price_tt_met": price_met,
+
+        "price_tt_met": price_tt_met,
+
         "rs_tt": rs_tt,
-        "rs_tt_met": rs_met,
+
+        "rs_tt_met": rs_tt_met,
+
+        "avg_volume": avg_volume,
+
         "liquid": liquid,
-        "avg_volume": avg_vol
+
+        "eligible": eligible
+
     })
 
-# =========================
-# DOWNLOAD BENCHMARK
-# =========================
 
-def get_benchmark(start, end):
+# ============================================================
+# BENCHMARK DOWNLOAD
+# ============================================================
 
-    for ticker in [BENCHMARK, BENCHMARK_FALLBACK]:
+def download_benchmark(start, end):
+
+    # Yahoo end date is exclusive.
+    yahoo_end = (
+        pd.Timestamp(end)
+        + pd.Timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+    for ticker in [
+        BENCHMARK,
+        BENCHMARK_FALLBACK
+    ]:
 
         try:
-            d = yf.download(
+
+            data = yf.download(
                 ticker,
                 start=start,
-                end=end,
+                end=yahoo_end,
                 interval="1d",
                 auto_adjust=True,
                 progress=False
             )
 
-            if not d.empty:
-                c = d["Close"]
-                if isinstance(c, pd.DataFrame):
-                    c = c.iloc[:,0]
-                return c.dropna().sort_index()
+            if data.empty:
+                continue
+
+            close = data["Close"]
+
+            if isinstance(
+                close,
+                pd.DataFrame
+            ):
+                close = close.iloc[:, 0]
+
+            close = (
+                close
+                .dropna()
+                .sort_index()
+            )
+
+            if not close.empty:
+                print(
+                    f"Benchmark: {ticker}"
+                )
+                return close
 
         except Exception as e:
-            print("Benchmark error:", ticker, e)
 
-    raise RuntimeError("Benchmark download failed")
+            print(
+                f"Benchmark {ticker} failed: {e}"
+            )
 
-# =========================
-# DOWNLOAD STOCKS
-# =========================
+    raise RuntimeError(
+        "Benchmark download failed"
+    )
 
-def build_signals(tickers, start, end, benchmark):
+
+# ============================================================
+# STOCK DOWNLOAD + SIGNAL BUILD
+# ============================================================
+
+def build_signals(
+    tickers,
+    start,
+    end,
+    benchmark
+):
 
     signals = {}
+
     batch_size = 50
 
-    for i in range(0, len(tickers), batch_size):
+    yahoo_end = (
+        pd.Timestamp(end)
+        + pd.Timedelta(days=1)
+    ).strftime("%Y-%m-%d")
 
-        batch = tickers[i:i+batch_size]
+    for i in range(
+        0,
+        len(tickers),
+        batch_size
+    ):
+
+        batch = tickers[
+            i:i + batch_size
+        ]
 
         print(
-            f"Downloading {i+1}-"
-            f"{i+len(batch)} / {len(tickers)}"
+            f"Downloading "
+            f"{i + 1}-{i + len(batch)} "
+            f"/ {len(tickers)}"
         )
 
         try:
+
             data = yf.download(
                 batch,
                 start=start,
-                end=end,
+                end=yahoo_end,
                 interval="1d",
                 auto_adjust=True,
                 group_by="ticker",
                 threads=True,
                 progress=False
             )
+
         except Exception as e:
-            print("Batch failed:", e)
+
+            print(
+                f"Batch failed: {e}"
+            )
+
             continue
 
-        for sym in batch:
+        for symbol in batch:
 
             try:
 
-                d = data if len(batch) == 1 else (
-                    data[sym]
-                    if sym in data.columns.get_level_values(0)
-                    else pd.DataFrame()
-                )
+                if len(batch) == 1:
 
-                if d.empty or "Close" not in d.columns:
+                    stock = data
+
+                else:
+
+                    if (
+                        symbol
+                        not in
+                        data.columns.get_level_values(0)
+                    ):
+                        continue
+
+                    stock = data[symbol]
+
+                if (
+                    stock.empty
+                    or
+                    "Close" not in stock.columns
+                ):
                     continue
 
-                close = d["Close"].dropna().sort_index()
-                volume = d["Volume"].reindex(close.index).fillna(0)
+                close = (
+                    stock["Close"]
+                    .dropna()
+                    .sort_index()
+                )
 
-                sig = stock_signals(
+                volume = (
+                    stock["Volume"]
+                    .reindex(close.index)
+                    .fillna(0)
+                )
+
+                if close.empty:
+                    continue
+
+                result = stock_signals(
                     close,
                     volume,
                     benchmark
                 )
 
-                if sig is not None:
-                    signals[sym.replace(".NS","")] = sig
+                if result is not None:
 
-            except Exception:
-                continue
+                    name = symbol.replace(
+                        ".NS",
+                        ""
+                    )
+
+                    signals[name] = result
+
+            except Exception as e:
+
+                print(
+                    f"Skipping {symbol}: {e}"
+                )
 
         time.sleep(0.5)
 
+    print(
+        f"Signals built: "
+        f"{len(signals)} stocks"
+    )
+
     return signals
 
-# =========================
+
+# ============================================================
 # BACKTEST
-# =========================
+# ============================================================
 
-def run_backtest(signals, days):
+def run_backtest(
+    signals,
+    trading_days
+):
 
-    cash = STARTING_CAPITAL
+    cash = float(
+        STARTING_CAPITAL
+    )
+
     holdings = {}
+
     trades = []
     equity = []
     ranking_log = []
 
-    for date in days:
+    last_rank = {}
 
-        # -------------------------
-        # ENTRY-ELIGIBLE UNIVERSE
-        # SAME AS LIVE SCREENER
-        # -------------------------
+    for date in trading_days:
+
+        # ====================================================
+        # ELIGIBLE UNIVERSE
+        # EXACT LIVE SCREENER RULE
+        # ====================================================
 
         candidates = []
 
-        for sym, df in signals.items():
+        for symbol, df in signals.items():
 
             if date not in df.index:
                 continue
 
-            r = df.loc[date]
+            row = df.loc[date]
 
-            if pd.isna(r.rs_score):
+            if pd.isna(
+                row["rs_score"]
+            ):
                 continue
 
-            if not bool(r.price_tt):
-                continue
-
-            if not bool(r.rs_tt):
-                continue
-
-            if not bool(r.liquid):
+            if not bool(
+                row["eligible"]
+            ):
                 continue
 
             candidates.append(
-                (sym, float(r.rs_score))
+                (
+                    symbol,
+                    float(row["rs_score"])
+                )
             )
 
         candidates.sort(
@@ -315,246 +550,666 @@ def run_backtest(signals, days):
             reverse=True
         )
 
-        # IMPORTANT:
-        # Rank is the rank among eligible stocks,
-        # exactly like the live screener.
-
         rank = {
-            sym: i
-            for i, (sym, _) in enumerate(
-                candidates, 1
+            symbol: i
+            for i, (symbol, _) in enumerate(
+                candidates,
+                start=1
             )
         }
 
+        last_rank = rank.copy()
+
         top10 = [
-            sym for sym, _ in candidates[:TOP_N]
+            symbol
+            for symbol, _
+            in candidates[:TOP_N]
         ]
 
-        # -------------------------
-        # DAILY RANKING AUDIT
-        # -------------------------
+        # ====================================================
+        # DAILY RANKING LOG
+        # ====================================================
 
-        for i, (sym, score) in enumerate(
+        for i, (
+            symbol,
+            score
+        ) in enumerate(
             candidates,
-            1
+            start=1
         ):
 
-            r = signals[sym].loc[date]
+            row = signals[
+                symbol
+            ].loc[date]
+
+            if i <= TOP_N:
+                action = "BUY ENTRY"
+            elif i <= EXIT_RANK:
+                action = "HOLD ALLOWED"
+            else:
+                action = "WATCHLIST ONLY"
 
             ranking_log.append({
-                "date": date.strftime("%Y-%m-%d"),
-                "rank": i,
-                "symbol": sym,
-                "rs_score": round(score,4),
-                "price": round(float(r.price),2),
-                "price_tt_met": int(r.price_tt_met),
-                "rs_tt_met": int(r.rs_tt_met),
-                "avg_volume_50d": round(float(r.avg_volume),0),
-                "action": (
-                    "BUY ENTRY" if i <= TOP_N
-                    else "HOLD ALLOWED" if i <= EXIT_RANK
-                    else "WATCHLIST ONLY"
-                )
+
+                "date":
+                    date.strftime(
+                        "%Y-%m-%d"
+                    ),
+
+                "rank":
+                    i,
+
+                "symbol":
+                    symbol,
+
+                "action":
+                    action,
+
+                "rs_score":
+                    round(
+                        score,
+                        4
+                    ),
+
+                "price":
+                    round(
+                        float(
+                            row["price"]
+                        ),
+                        2
+                    ),
+
+                "price_tt_met":
+                    int(
+                        row["price_tt_met"]
+                    ),
+
+                "rs_tt_met":
+                    int(
+                        row["rs_tt_met"]
+                    ),
+
+                "avg_volume_50d":
+                    round(
+                        float(
+                            row["avg_volume"]
+                        ),
+                        0
+                    )
             })
 
-        # -------------------------
-        # EXIT
-        # -------------------------
+        # ====================================================
+        # EXITS
+        #
+        # IMPORTANT:
+        # Exit rank is based on the SAME eligible ranking
+        # used for live screener.
+        # ====================================================
 
-        for sym in list(holdings):
+        for symbol in list(
+            holdings.keys()
+        ):
 
-            if date not in signals[sym].index:
+            if date not in signals[
+                symbol
+            ].index:
                 continue
 
-            r = signals[sym].loc[date]
-            current_rank = rank.get(sym, 999999)
+            row = signals[
+                symbol
+            ].loc[date]
+
+            current_rank = rank.get(
+                symbol,
+                999999
+            )
 
             if current_rank <= EXIT_RANK:
                 continue
 
-            pos = holdings.pop(sym)
-
-            price = float(r.price)
-            gross = pos["qty"] * price
-            scost = sell_cost(gross)
-            proceeds = gross - scost
-
-            basis = (
-                pos["qty"] * pos["entry_price"]
-                + pos["buy_cost"]
+            position = holdings.pop(
+                symbol
             )
 
-            gain = proceeds - basis
-            tax = stcg(gain)
-            pnl = gain - tax
+            price = float(
+                row["price"]
+            )
 
-            cash += proceeds - tax
+            gross = (
+                position["qty"]
+                * price
+            )
+
+            sell_fee = sell_cost(
+                gross
+            )
+
+            proceeds = (
+                gross
+                - sell_fee
+            )
+
+            basis = (
+                position["qty"]
+                * position["entry_price"]
+                + position["buy_cost"]
+            )
+
+            gain = (
+                proceeds
+                - basis
+            )
+
+            tax = stcg(gain)
+
+            pnl = (
+                gain
+                - tax
+            )
+
+            cash += (
+                proceeds
+                - tax
+            )
 
             trades.append({
-                "symbol": sym,
-                "entry_date": pos["entry_date"].strftime("%Y-%m-%d"),
-                "exit_date": date.strftime("%Y-%m-%d"),
-                "qty": pos["qty"],
-                "entry_price": round(pos["entry_price"],2),
-                "exit_price": round(price,2),
-                "entry_rank": pos["entry_rank"],
-                "exit_rank": current_rank,
-                "entry_rs_score": pos["entry_score"],
-                "exit_rs_score": round(float(r.rs_score),4),
-                "gross_return_pct": round(
-                    (price/pos["entry_price"]-1)*100,2
-                ),
-                "buy_cost_rs": round(pos["buy_cost"],2),
-                "sell_cost_rs": round(scost,2),
-                "stcg_tax_rs": round(tax,2),
-                "net_pnl_rs": round(pnl,2),
-                "net_return_pct": round(
-                    pnl/basis*100,2
-                ),
-                "days_held": (date-pos["entry_date"]).days,
-                "exit_reason": "RS RANK > 15"
+
+                "symbol":
+                    symbol,
+
+                "entry_date":
+                    position[
+                        "entry_date"
+                    ].strftime(
+                        "%Y-%m-%d"
+                    ),
+
+                "exit_date":
+                    date.strftime(
+                        "%Y-%m-%d"
+                    ),
+
+                "qty":
+                    position["qty"],
+
+                "entry_price":
+                    round(
+                        position[
+                            "entry_price"
+                        ],
+                        2
+                    ),
+
+                "exit_price":
+                    round(
+                        price,
+                        2
+                    ),
+
+                "entry_rank":
+                    position[
+                        "entry_rank"
+                    ],
+
+                "exit_rank":
+                    current_rank,
+
+                "entry_rs_score":
+                    position[
+                        "entry_score"
+                    ],
+
+                "exit_rs_score":
+                    round(
+                        float(
+                            row["rs_score"]
+                        ),
+                        4
+                    ),
+
+                "gross_return_pct":
+                    round(
+                        (
+                            price
+                            /
+                            position[
+                                "entry_price"
+                            ]
+                            - 1
+                        ) * 100,
+                        2
+                    ),
+
+                "buy_cost_rs":
+                    round(
+                        position[
+                            "buy_cost"
+                        ],
+                        2
+                    ),
+
+                "sell_cost_rs":
+                    round(
+                        sell_fee,
+                        2
+                    ),
+
+                "stcg_tax_rs":
+                    round(
+                        tax,
+                        2
+                    ),
+
+                "net_pnl_rs":
+                    round(
+                        pnl,
+                        2
+                    ),
+
+                "net_return_pct":
+                    round(
+                        pnl / basis * 100,
+                        2
+                    ),
+
+                "days_held":
+                    (
+                        date
+                        -
+                        position[
+                            "entry_date"
+                        ]
+                    ).days,
+
+                "exit_reason":
+                    "RS RANK > 15"
             })
 
-        # -------------------------
-        # PORTFOLIO VALUE
-        # AFTER EXITS
-        # -------------------------
+        # ====================================================
+        # VALUE AFTER EXITS
+        # ====================================================
 
-        value = cash
+        portfolio_value = cash
 
-        for sym, pos in holdings.items():
+        for symbol, position in (
+            holdings.items()
+        ):
 
-            if date in signals[sym].index:
-                price = float(signals[sym].loc[date].price)
+            if date in signals[
+                symbol
+            ].index:
+
+                price = float(
+                    signals[
+                        symbol
+                    ].loc[
+                        date,
+                        "price"
+                    ]
+                )
+
             else:
-                price = pos["entry_price"]
 
-            value += pos["qty"] * price
+                price = position[
+                    "entry_price"
+                ]
 
-        # -------------------------
+            portfolio_value += (
+                position["qty"]
+                * price
+            )
+
+        # ====================================================
         # NEW ENTRIES
-        # -------------------------
+        # ====================================================
 
-        slots = TOP_N - len(holdings)
+        slots = (
+            TOP_N
+            - len(holdings)
+        )
 
         if slots > 0:
 
-            target = value / TOP_N
+            target_value = (
+                portfolio_value
+                / TOP_N
+            )
 
-            for sym in top10:
+            for symbol in top10:
 
                 if slots <= 0:
                     break
 
-                if sym in holdings:
+                if symbol in holdings:
                     continue
 
-                r = signals[sym].loc[date]
-                price = float(r.price)
+                row = signals[
+                    symbol
+                ].loc[date]
 
-                qty = int(target // price)
+                price = float(
+                    row["price"]
+                )
+
+                if price <= 0:
+                    continue
+
+                qty = int(
+                    target_value
+                    // price
+                )
 
                 if qty < 1:
                     continue
 
-                trade_value = qty * price
-                bcost = buy_cost(trade_value)
+                trade_value = (
+                    qty * price
+                )
 
-                if trade_value + bcost > cash:
+                buy_fee = buy_cost(
+                    trade_value
+                )
+
+                required = (
+                    trade_value
+                    + buy_fee
+                )
+
+                if required > cash:
                     continue
 
-                cash -= trade_value + bcost
+                cash -= required
 
-                holdings[sym] = {
-                    "qty": qty,
-                    "entry_price": price,
-                    "entry_date": date,
-                    "buy_cost": bcost,
-                    "entry_rank": rank[sym],
-                    "entry_score": round(
-                        float(r.rs_score),4
-                    )
+                holdings[symbol] = {
+
+                    "qty":
+                        qty,
+
+                    "entry_price":
+                        price,
+
+                    "entry_date":
+                        date,
+
+                    "buy_cost":
+                        buy_fee,
+
+                    "entry_rank":
+                        rank[symbol],
+
+                    "entry_score":
+                        round(
+                            float(
+                                row["rs_score"]
+                            ),
+                            4
+                        )
                 }
 
                 slots -= 1
 
-        # -------------------------
-        # FINAL EQUITY
-        # -------------------------
+        # ====================================================
+        # FINAL DAILY EQUITY
+        # ====================================================
 
-        value = cash
+        portfolio_value = cash
 
-        for sym, pos in holdings.items():
+        for symbol, position in (
+            holdings.items()
+        ):
 
-            if date in signals[sym].index:
-                price = float(signals[sym].loc[date].price)
+            if date in signals[
+                symbol
+            ].index:
+
+                price = float(
+                    signals[
+                        symbol
+                    ].loc[
+                        date,
+                        "price"
+                    ]
+                )
+
             else:
-                price = pos["entry_price"]
 
-            value += pos["qty"] * price
+                price = position[
+                    "entry_price"
+                ]
 
-        equity.append({
-            "date": date.strftime("%Y-%m-%d"),
-            "portfolio_value_rs": round(value,2),
-            "equity": round(value/STARTING_CAPITAL,8),
-            "return_pct": round(
-                (value/STARTING_CAPITAL-1)*100,4
-            ),
-            "cash_rs": round(cash,2),
-            "n_holdings": len(holdings),
-            "top10": ",".join(top10),
-            "holdings": ",".join(sorted(holdings))
-        })
-
-    # -------------------------
-    # MARK OPEN POSITIONS
-    # -------------------------
-
-    if days:
-
-        last = days[-1]
-
-        for sym, pos in holdings.items():
-
-            r = signals[sym].loc[last]
-            price = float(r.price)
-
-            gross = pos["qty"] * price
-            scost = sell_cost(gross)
-            proceeds = gross - scost
-
-            basis = (
-                pos["qty"] * pos["entry_price"]
-                + pos["buy_cost"]
+            portfolio_value += (
+                position["qty"]
+                * price
             )
 
-            gain = proceeds - basis
+        equity.append({
+
+            "date":
+                date.strftime(
+                    "%Y-%m-%d"
+                ),
+
+            "portfolio_value_rs":
+                round(
+                    portfolio_value,
+                    2
+                ),
+
+            "equity":
+                round(
+                    portfolio_value
+                    / STARTING_CAPITAL,
+                    8
+                ),
+
+            "return_pct":
+                round(
+                    (
+                        portfolio_value
+                        / STARTING_CAPITAL
+                        - 1
+                    ) * 100,
+                    4
+                ),
+
+            "cash_rs":
+                round(
+                    cash,
+                    2
+                ),
+
+            "n_holdings":
+                len(holdings),
+
+            "top10":
+                ",".join(top10),
+
+            "holdings":
+                ",".join(
+                    sorted(
+                        holdings.keys()
+                    )
+                )
+        })
+
+    # ========================================================
+    # BACKTEST-END OPEN POSITIONS
+    # ========================================================
+
+    if trading_days:
+
+        last_date = trading_days[-1]
+
+        final_rank = last_rank
+
+        for symbol, position in (
+            list(holdings.items())
+        ):
+
+            if (
+                symbol not in signals
+                or
+                last_date
+                not in signals[
+                    symbol
+                ].index
+            ):
+                continue
+
+            row = signals[
+                symbol
+            ].loc[last_date]
+
+            price = float(
+                row["price"]
+            )
+
+            gross = (
+                position["qty"]
+                * price
+            )
+
+            sell_fee = sell_cost(
+                gross
+            )
+
+            proceeds = (
+                gross
+                - sell_fee
+            )
+
+            basis = (
+                position["qty"]
+                * position["entry_price"]
+                + position["buy_cost"]
+            )
+
+            gain = (
+                proceeds
+                - basis
+            )
+
             tax = stcg(gain)
-            pnl = gain - tax
+
+            pnl = (
+                gain
+                - tax
+            )
 
             trades.append({
-                "symbol": sym,
-                "entry_date": pos["entry_date"].strftime("%Y-%m-%d"),
-                "exit_date": last.strftime("%Y-%m-%d") + " OPEN",
-                "qty": pos["qty"],
-                "entry_price": round(pos["entry_price"],2),
-                "exit_price": round(price,2),
-                "entry_rank": pos["entry_rank"],
-                "exit_rank": rank.get(sym,""),
-                "entry_rs_score": pos["entry_score"],
-                "exit_rs_score": round(float(r.rs_score),4),
-                "gross_return_pct": round(
-                    (price/pos["entry_price"]-1)*100,2
-                ),
-                "buy_cost_rs": round(pos["buy_cost"],2),
-                "sell_cost_rs": round(scost,2),
-                "stcg_tax_rs": round(tax,2),
-                "net_pnl_rs": round(pnl,2),
-                "net_return_pct": round(
-                    pnl/basis*100,2
-                ),
-                "days_held": (last-pos["entry_date"]).days,
-                "exit_reason": "BACKTEST END"
+
+                "symbol":
+                    symbol,
+
+                "entry_date":
+                    position[
+                        "entry_date"
+                    ].strftime(
+                        "%Y-%m-%d"
+                    ),
+
+                "exit_date":
+                    last_date.strftime(
+                        "%Y-%m-%d"
+                    ) + " OPEN",
+
+                "qty":
+                    position["qty"],
+
+                "entry_price":
+                    round(
+                        position[
+                            "entry_price"
+                        ],
+                        2
+                    ),
+
+                "exit_price":
+                    round(
+                        price,
+                        2
+                    ),
+
+                "entry_rank":
+                    position[
+                        "entry_rank"
+                    ],
+
+                "exit_rank":
+                    final_rank.get(
+                        symbol,
+                        ""
+                    ),
+
+                "entry_rs_score":
+                    position[
+                        "entry_score"
+                    ],
+
+                "exit_rs_score":
+                    round(
+                        float(
+                            row["rs_score"]
+                        ),
+                        4
+                    ),
+
+                "gross_return_pct":
+                    round(
+                        (
+                            price
+                            /
+                            position[
+                                "entry_price"
+                            ]
+                            - 1
+                        ) * 100,
+                        2
+                    ),
+
+                "buy_cost_rs":
+                    round(
+                        position[
+                            "buy_cost"
+                        ],
+                        2
+                    ),
+
+                "sell_cost_rs":
+                    round(
+                        sell_fee,
+                        2
+                    ),
+
+                "stcg_tax_rs":
+                    round(
+                        tax,
+                        2
+                    ),
+
+                "net_pnl_rs":
+                    round(
+                        pnl,
+                        2
+                    ),
+
+                "net_return_pct":
+                    round(
+                        pnl / basis * 100,
+                        2
+                    ),
+
+                "days_held":
+                    (
+                        last_date
+                        -
+                        position[
+                            "entry_date"
+                        ]
+                    ).days,
+
+                "exit_reason":
+                    "BACKTEST END"
             })
 
     return (
@@ -563,289 +1218,838 @@ def run_backtest(signals, days):
         pd.DataFrame(ranking_log)
     )
 
-# =========================
-# SUMMARY
-# =========================
 
-def summary(trades, equity):
+# ============================================================
+# SUMMARY
+# ============================================================
+
+def make_summary(
+    trades,
+    equity,
+    run_timestamp
+):
 
     if equity.empty:
         return {}
 
-    final = float(
-        equity.portfolio_value_rs.iloc[-1]
+    final_value = float(
+        equity[
+            "portfolio_value_rs"
+        ].iloc[-1]
     )
 
     total_return = (
-        final/STARTING_CAPITAL-1
+        final_value
+        / STARTING_CAPITAL
+        - 1
     ) * 100
 
-    peak = equity.equity.cummax()
-
-    dd = (
-        equity.equity/peak-1
-    ) * 100
-
-    max_dd = dd.min()
-
-    closed = (
-        trades[
-            ~trades.exit_date.astype(str).str.contains("OPEN")
-        ]
-        if not trades.empty else trades
+    peak = (
+        equity["equity"]
+        .cummax()
     )
+
+    drawdown = (
+        equity["equity"]
+        / peak
+        - 1
+    ) * 100
+
+    max_dd = float(
+        drawdown.min()
+    )
+
+    if trades.empty:
+
+        closed = trades
+
+    else:
+
+        closed = trades[
+            ~trades[
+                "exit_date"
+            ]
+            .astype(str)
+            .str.contains(
+                "OPEN",
+                na=False
+            )
+        ]
 
     n = len(closed)
 
     if n:
-        win = (closed.net_return_pct > 0).mean()*100
-        avg = closed.net_return_pct.mean()
-        median = closed.net_return_pct.median()
-        avg_days = closed.days_held.mean()
-        best = closed.net_return_pct.max()
-        worst = closed.net_return_pct.min()
-        costs = (
-            closed.buy_cost_rs.sum()
-            + closed.sell_cost_rs.sum()
-        )
-        tax = closed.stcg_tax_rs.sum()
 
-        winners = closed[closed.net_pnl_rs > 0]
-        losers = closed[closed.net_pnl_rs < 0]
-
-        pf = (
-            winners.net_pnl_rs.sum()
-            / abs(losers.net_pnl_rs.sum())
-            if len(losers) else 0
+        win_rate = (
+            (
+                closed[
+                    "net_return_pct"
+                ] > 0
+            ).mean()
+            * 100
         )
+
+        avg_return = (
+            closed[
+                "net_return_pct"
+            ].mean()
+        )
+
+        median_return = (
+            closed[
+                "net_return_pct"
+            ].median()
+        )
+
+        avg_days = (
+            closed[
+                "days_held"
+            ].mean()
+        )
+
+        best = (
+            closed[
+                "net_return_pct"
+            ].max()
+        )
+
+        worst = (
+            closed[
+                "net_return_pct"
+            ].min()
+        )
+
+        transaction_costs = (
+            closed[
+                "buy_cost_rs"
+            ].sum()
+            +
+            closed[
+                "sell_cost_rs"
+            ].sum()
+        )
+
+        tax = (
+            closed[
+                "stcg_tax_rs"
+            ].sum()
+        )
+
+        winners = closed[
+            closed[
+                "net_pnl_rs"
+            ] > 0
+        ]
+
+        losers = closed[
+            closed[
+                "net_pnl_rs"
+            ] < 0
+        ]
+
+        if len(losers):
+
+            profit_factor = (
+                winners[
+                    "net_pnl_rs"
+                ].sum()
+                /
+                abs(
+                    losers[
+                        "net_pnl_rs"
+                    ].sum()
+                )
+            )
+
+        else:
+
+            profit_factor = 0
+
     else:
-        win=avg=median=avg_days=best=worst=costs=tax=pf=0
 
-    daily = equity.equity.pct_change().dropna()
+        win_rate = 0
+        avg_return = 0
+        median_return = 0
+        avg_days = 0
+        best = 0
+        worst = 0
+        transaction_costs = 0
+        tax = 0
+        profit_factor = 0
 
-    ann_return = (
-        equity.equity.iloc[-1]
-        ** (252/len(equity))
-        - 1
-        if len(equity) else 0
+    daily_returns = (
+        equity["equity"]
+        .pct_change()
+        .dropna()
     )
 
-    vol = (
-        daily.std()*np.sqrt(252)
-        if len(daily) else 0
-    )
+    if len(equity) > 1:
 
-    sharpe = (
-        daily.mean()/daily.std()*np.sqrt(252)
-        if len(daily) and daily.std() > 0 else 0
-    )
+        annualized_return = (
+            equity[
+                "equity"
+            ].iloc[-1]
+            **
+            (
+                252
+                /
+                len(equity)
+            )
+            - 1
+        )
+
+    else:
+
+        annualized_return = 0
+
+    if len(daily_returns):
+
+        volatility = (
+            daily_returns.std()
+            * np.sqrt(252)
+        )
+
+    else:
+
+        volatility = 0
+
+    if (
+        len(daily_returns)
+        and
+        daily_returns.std() > 0
+    ):
+
+        sharpe = (
+            daily_returns.mean()
+            /
+            daily_returns.std()
+            *
+            np.sqrt(252)
+        )
+
+    else:
+
+        sharpe = 0
 
     return {
+
         "run_timestamp_ist":
-            datetime.now(ZoneInfo("Asia/Kolkata")).strftime(
-                "%Y-%m-%d %H:%M:%S IST"
+            run_timestamp,
+
+        "backtest_start":
+            BACKTEST_START,
+
+        "backtest_end":
+            BACKTEST_END,
+
+        "starting_capital_rs":
+            STARTING_CAPITAL,
+
+        "final_portfolio_value_rs":
+            round(
+                final_value,
+                2
             ),
-        "backtest_start": BACKTEST_START,
-        "backtest_end": BACKTEST_END,
-        "starting_capital_rs": STARTING_CAPITAL,
-        "final_portfolio_value_rs": round(final,2),
-        "net_total_return_pct": round(total_return,2),
-        "annualized_return_pct": round(ann_return*100,2),
-        "annualized_volatility_pct": round(vol*100,2),
-        "max_drawdown_pct": round(max_dd,2),
-        "sharpe": round(sharpe,3),
-        "n_closed_trades": n,
-        "win_rate_net_pct": round(win,1),
-        "avg_net_return_trade_pct": round(avg,2),
-        "median_net_return_trade_pct": round(median,2),
-        "avg_days_held": round(avg_days,1),
-        "best_net_trade_pct": round(best,2),
-        "worst_net_trade_pct": round(worst,2),
-        "profit_factor": round(pf,3),
-        "transaction_costs_rs": round(costs,2),
-        "stcg_tax_rs": round(tax,2)
+
+        "net_total_return_pct":
+            round(
+                total_return,
+                2
+            ),
+
+        "annualized_return_pct":
+            round(
+                annualized_return * 100,
+                2
+            ),
+
+        "annualized_volatility_pct":
+            round(
+                volatility * 100,
+                2
+            ),
+
+        "max_drawdown_pct":
+            round(
+                max_dd,
+                2
+            ),
+
+        "sharpe":
+            round(
+                sharpe,
+                3
+            ),
+
+        "n_closed_trades":
+            n,
+
+        "win_rate_net_pct":
+            round(
+                win_rate,
+                1
+            ),
+
+        "avg_net_return_trade_pct":
+            round(
+                avg_return,
+                2
+            ),
+
+        "median_net_return_trade_pct":
+            round(
+                median_return,
+                2
+            ),
+
+        "avg_days_held":
+            round(
+                avg_days,
+                1
+            ),
+
+        "best_net_trade_pct":
+            round(
+                best,
+                2
+            ),
+
+        "worst_net_trade_pct":
+            round(
+                worst,
+                2
+            ),
+
+        "profit_factor":
+            round(
+                profit_factor,
+                3
+            ),
+
+        "transaction_costs_rs":
+            round(
+                transaction_costs,
+                2
+            ),
+
+        "stcg_tax_rs":
+            round(
+                tax,
+                2
+            )
     }
 
-# =========================
+
+# ============================================================
 # GOOGLE SHEETS
-# =========================
+# ============================================================
 
-def write_sheets(trades, equity, ranking, result):
+def get_worksheet(
+    spreadsheet,
+    name,
+    rows=100,
+    cols=20
+):
 
-    sid = os.environ.get(SHEET_ID_ENV)
-    cred = os.environ.get(CREDS_ENV)
+    try:
 
-    if not sid or not cred:
-        trades.to_csv("backtest_trades.csv",index=False)
-        equity.to_csv("backtest_equity.csv",index=False)
-        ranking.to_csv("backtest_daily_ranking.csv",index=False)
-        pd.DataFrame([result]).to_csv(
-            "backtest_summary.csv",index=False
+        return spreadsheet.worksheet(name)
+
+    except gspread.WorksheetNotFound:
+
+        return spreadsheet.add_worksheet(
+            title=name,
+            rows=rows,
+            cols=cols
         )
-        return
 
-    credentials = Credentials.from_service_account_info(
-        json.loads(cred),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+
+def resize_sheet(
+    worksheet,
+    rows,
+    cols
+):
+
+    rows = max(
+        int(rows),
+        100
     )
 
-    sh = gspread.authorize(credentials).open_by_key(sid)
+    cols = max(
+        int(cols),
+        20
+    )
 
-    # -------------------------
-    # SUMMARY + PARAMETERS
-    # -------------------------
+    if (
+        worksheet.row_count < rows
+        or
+        worksheet.col_count < cols
+    ):
 
-    try:
-        ws = sh.worksheet(SUMMARY_SHEET)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(
-            title=SUMMARY_SHEET,
-            rows=100,
-            cols=10
+        worksheet.resize(
+            rows=max(
+                worksheet.row_count,
+                rows
+            ),
+            cols=max(
+                worksheet.col_count,
+                cols
+            )
         )
 
-    ws.clear()
+
+def write_dataframe(
+    worksheet,
+    start_row,
+    dataframe,
+    chunk_size=2000
+):
+
+    if dataframe.empty:
+        return start_row
+
+    values = [
+        list(dataframe.columns)
+    ] + dataframe.fillna("").values.tolist()
+
+    total_rows = len(values)
+    total_cols = len(
+        values[0]
+    )
+
+    resize_sheet(
+        worksheet,
+        start_row + total_rows + 5,
+        total_cols + 2
+    )
+
+    for i in range(
+        0,
+        total_rows,
+        chunk_size
+    ):
+
+        chunk = values[
+            i:i + chunk_size
+        ]
+
+        worksheet.update(
+            chunk,
+            f"A{start_row + i}"
+        )
+
+        time.sleep(0.1)
+
+    return (
+        start_row
+        + total_rows
+    )
+
+
+def write_sheets(
+    trades,
+    equity,
+    ranking,
+    result
+):
+
+    sheet_id = os.environ.get(
+        SHEET_ID_ENV
+    )
+
+    credentials_json = os.environ.get(
+        CREDS_ENV
+    )
+
+    if (
+        not sheet_id
+        or
+        not credentials_json
+    ):
+
+        print(
+            "Google credentials missing. "
+            "Saving CSV."
+        )
+
+        trades.to_csv(
+            "backtest_trades.csv",
+            index=False
+        )
+
+        equity.to_csv(
+            "backtest_equity.csv",
+            index=False
+        )
+
+        ranking.to_csv(
+            "backtest_daily_ranking.csv",
+            index=False
+        )
+
+        pd.DataFrame(
+            [result]
+        ).to_csv(
+            "backtest_summary.csv",
+            index=False
+        )
+
+        return
+
+    credentials = (
+        Credentials
+        .from_service_account_info(
+            json.loads(
+                credentials_json
+            ),
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets"
+            ]
+        )
+    )
+
+    spreadsheet = (
+        gspread
+        .authorize(credentials)
+        .open_by_key(sheet_id)
+    )
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    summary_ws = get_worksheet(
+        spreadsheet,
+        SUMMARY_SHEET,
+        rows=100,
+        cols=10
+    )
+
+    summary_ws.clear()
 
     params = {
-        "BACKTEST_START": BACKTEST_START,
-        "BACKTEST_END": BACKTEST_END,
-        "RUN_TIMESTAMP": result["run_timestamp_ist"],
-        "BENCHMARK": BENCHMARK,
-        "STARTING_CAPITAL": STARTING_CAPITAL,
-        "TOP_N": TOP_N,
-        "EXIT_RANK": EXIT_RANK,
-        "MIN_PRICE": MIN_PRICE,
-        "MIN_AVG_VOLUME": MIN_AVG_VOLUME,
-        "VOLUME_LOOKBACK": VOLUME_LOOKBACK,
-        "PRICE_TT": "7/7",
-        "RS_LINE_TT": "7/7",
-        "RS_SCORE": "40% 63D + 20% 126D + 20% 189D + 20% 252D",
-        "ENTRY": "Top 10 eligible stocks",
-        "HOLD": "Rank 1-15",
-        "EXIT": "Rank >15",
-        "BLUE_DOT": "NO",
-        "GREEN_DOT": "NO",
-        "VCP": "NO",
-        "STOP_LOSS": "NO",
-        "TRAILING_STOP": "NO",
-        "RS_20EMA_EXIT": "NO",
-        "EXECUTION": "Daily EOD close",
-        "CALCULATION": "Python",
-        "SHEET_ROLE": "Output only"
+
+        "BACKTEST_START":
+            BACKTEST_START,
+
+        "BACKTEST_END":
+            BACKTEST_END,
+
+        "RUN_TIMESTAMP":
+            result[
+                "run_timestamp_ist"
+            ],
+
+        "BENCHMARK":
+            BENCHMARK,
+
+        "STARTING_CAPITAL":
+            STARTING_CAPITAL,
+
+        "TOP_N":
+            TOP_N,
+
+        "EXIT_RANK":
+            EXIT_RANK,
+
+        "MIN_PRICE":
+            MIN_PRICE,
+
+        "MIN_AVG_VOLUME":
+            MIN_AVG_VOLUME,
+
+        "VOLUME_LOOKBACK":
+            VOLUME_LOOKBACK,
+
+        "PRICE_TT":
+            "7/7",
+
+        "RS_LINE_TT":
+            "7/7",
+
+        "RS_SCORE":
+            "40% 63D + 20% 126D + 20% 189D + 20% 252D",
+
+        "ENTRY":
+            "Top 10 eligible stocks",
+
+        "HOLD":
+            "Rank 1-15",
+
+        "EXIT":
+            "Rank >15",
+
+        "BLUE_DOT":
+            "NO",
+
+        "GREEN_DOT":
+            "NO",
+
+        "VCP":
+            "NO",
+
+        "STOP_LOSS":
+            "NO",
+
+        "TRAILING_STOP":
+            "NO",
+
+        "RS_20EMA_EXIT":
+            "NO",
+
+        "EXECUTION":
+            "Daily EOD close",
+
+        "CALCULATION":
+            "Python",
+
+        "SHEET_ROLE":
+            "Output only"
     }
 
-    rows = [["PARAMETER","VALUE"]]
-    rows += [[k,v] for k,v in params.items()]
-    rows += [["",""]]
-    rows += [["PERFORMANCE","VALUE"]]
-    rows += [[k,v] for k,v in result.items()]
+    summary_rows = [
+        ["PARAMETER", "VALUE"]
+    ]
 
-    ws.update(rows,"A1")
+    summary_rows += [
+        [key, value]
+        for key, value in params.items()
+    ]
 
-    # -------------------------
+    summary_rows += [
+        ["", ""],
+        ["PERFORMANCE", "VALUE"]
+    ]
+
+    summary_rows += [
+        [key, value]
+        for key, value in result.items()
+    ]
+
+    resize_sheet(
+        summary_ws,
+        len(summary_rows) + 5,
+        4
+    )
+
+    summary_ws.update(
+        summary_rows,
+        "A1"
+    )
+
+    # ========================================================
     # BACKTEST DATA
-    # -------------------------
+    # ========================================================
 
-    try:
-        wb = sh.worksheet(BACKTEST_SHEET)
-    except gspread.WorksheetNotFound:
-        wb = sh.add_worksheet(
-            title=BACKTEST_SHEET,
-            rows=1000,
-            cols=20
-        )
+    backtest_ws = get_worksheet(
+        spreadsheet,
+        BACKTEST_SHEET,
+        rows=1000,
+        cols=20
+    )
 
-    wb.clear()
+    backtest_ws.clear()
 
     row = 1
 
-    def put(title, df):
+    backtest_ws.update(
+        [["TRADE LOG"]],
+        f"A{row}"
+    )
 
-        nonlocal row
+    row += 1
 
-        wb.update([[title]],f"A{row}")
-        row += 1
+    row = write_dataframe(
+        backtest_ws,
+        row,
+        trades
+    )
 
-        if not df.empty:
+    row += 2
 
-            values = [
-                list(df.columns)
-            ] + df.fillna("").values.tolist()
+    backtest_ws.update(
+        [["DAILY EQUITY CURVE"]],
+        f"A{row}"
+    )
 
-            wb.update(values,f"A{row}")
-            row += len(values) + 2
-        else:
-            row += 2
+    row += 1
 
-    put("TRADE LOG", trades)
-    put("DAILY EQUITY CURVE", equity)
-    put("DAILY ELIGIBLE RANKING", ranking)
+    row = write_dataframe(
+        backtest_ws,
+        row,
+        equity
+    )
 
-# =========================
-# MAIN
-# =========================
+    row += 2
 
-def main():
+    backtest_ws.update(
+        [["DAILY ELIGIBLE RANKING"]],
+        f"A{row}"
+    )
 
-    started = datetime.now(
-        ZoneInfo("Asia/Kolkata")
+    row += 1
+
+    write_dataframe(
+        backtest_ws,
+        row,
+        ranking
     )
 
     print(
-        f"\nBACKTEST START: "
-        f"{started.strftime('%Y-%m-%d %H:%M:%S IST')}"
+        "Google Sheets updated."
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    start_time = datetime.now(
+        ZoneInfo("Asia/Kolkata")
+    )
+
+    timestamp = start_time.strftime(
+        "%Y-%m-%d %H:%M:%S IST"
+    )
+
+    print(
+        f"\nBACKTEST START: {timestamp}"
+    )
+
+    print(
+        f"BACKTEST END: {BACKTEST_END}"
     )
 
     tickers = load_tickers()
 
     download_start = (
-        pd.Timestamp(BACKTEST_START)
-        - pd.DateOffset(
+        pd.Timestamp(
+            BACKTEST_START
+        )
+        -
+        pd.DateOffset(
             years=DOWNLOAD_YEARS_BEFORE_START
         )
     ).strftime("%Y-%m-%d")
 
+    # Yahoo end is exclusive.
     download_end = (
-        pd.Timestamp(BACKTEST_END)
-        + pd.Timedelta(days=1)
+        pd.Timestamp(
+            BACKTEST_END
+        )
+        +
+        pd.Timedelta(days=1)
     ).strftime("%Y-%m-%d")
 
-    benchmark = get_benchmark(
-        download_start,
-        download_end
+    print(
+        f"Universe: {len(tickers)}"
     )
+
+    print(
+        f"Download: "
+        f"{download_start} -> "
+        f"{download_end}"
+    )
+
+    # ========================================================
+    # BENCHMARK
+    # ========================================================
+
+    benchmark = download_benchmark(
+        download_start,
+        BACKTEST_END
+    )
+
+    # ========================================================
+    # STOCK SIGNALS
+    # ========================================================
 
     signals = build_signals(
         tickers,
         download_start,
-        download_end,
+        BACKTEST_END,
         benchmark
     )
 
-    days = benchmark.index[
-        (benchmark.index >= pd.Timestamp(BACKTEST_START)) &
-        (benchmark.index <= pd.Timestamp(BACKTEST_END))
+    # ========================================================
+    # TRADING DAYS
+    # ========================================================
+
+    trading_days = benchmark.index[
+        (
+            benchmark.index
+            >= pd.Timestamp(
+                BACKTEST_START
+            )
+        )
+        &
+        (
+            benchmark.index
+            <= pd.Timestamp(
+                BACKTEST_END
+            )
+        )
     ]
 
+    # If today's EOD data is not available,
+    # Yahoo's latest available trading day is used.
+    if len(trading_days):
+
+        actual_last_day = (
+            trading_days[-1]
+            .strftime("%Y-%m-%d")
+        )
+
+    else:
+
+        raise RuntimeError(
+            "No trading days available."
+        )
+
     print(
-        f"Stocks: {len(signals)} | "
-        f"Days: {len(days)} | "
-        f"End: {BACKTEST_END}"
+        f"Trading days: "
+        f"{len(trading_days)}"
     )
+
+    print(
+        f"Actual data end: "
+        f"{actual_last_day}"
+    )
+
+    # ========================================================
+    # BACKTEST
+    # ========================================================
 
     trades, equity, ranking = run_backtest(
         signals,
-        days
+        trading_days
     )
 
-    result = summary(
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    result = make_summary(
         trades,
-        equity
+        equity,
+        timestamp
     )
 
-    print("\nFINAL RESULTS")
-    for k,v in result.items():
-        print(f"{k}: {v}")
+    print(
+        "\nFINAL RESULTS"
+    )
+
+    for key, value in result.items():
+
+        print(
+            f"{key}: {value}"
+        )
+
+    # ========================================================
+    # GOOGLE SHEETS
+    # ========================================================
 
     write_sheets(
         trades,
@@ -854,15 +2058,36 @@ def main():
         result
     )
 
-    finished = datetime.now(
+    finish_time = datetime.now(
         ZoneInfo("Asia/Kolkata")
     )
 
     print(
         f"\nBACKTEST COMPLETE: "
-        f"{finished.strftime('%Y-%m-%d %H:%M:%S IST')}"
+        f"{finish_time.strftime('%Y-%m-%d %H:%M:%S IST')}"
     )
 
 
+# ============================================================
+# RUN
+# ============================================================
+
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        main()
+
+    except Exception as e:
+
+        print(
+            "\nBACKTEST FAILED"
+        )
+
+        print(
+            f"{type(e).__name__}: {e}"
+        )
+
+        traceback.print_exc()
+
+        raise
