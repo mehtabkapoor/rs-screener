@@ -1,5 +1,5 @@
 """
-RS Screener Backtest - SIMPLIFIED MODEL
+RS Screener Backtest - SIMPLIFIED MODEL - CORRECTED
 
 RULES
 -----
@@ -13,21 +13,44 @@ Portfolio       : Top 10
 Weight          : Equal weight at entry
 Rebalance       : Every trading day EOD
 Exit rule       : Sell when rank among eligible universe > 15
-Diagnostics     : Blue Dot / 1Y RS cross / Green Dot only
-Costs           : Buy + sell transaction costs
-STCG            : 20.8% effective on positive realized gains
-Equity          : Daily mark-to-market
-Terminal value  : Marked AND liquidation
-Charts          : Equity Curve + Drawdown
 
-IMPORTANT
----------
-BACKTEST_END = None
+IMPORTANT PORTFOLIO LOGIC
+--------------------------
+After exits, the portfolio is immediately refilled from the
+current Top 10 eligible stocks.
 
-This means the backtest automatically runs until the latest
-trading data actually available from Yahoo Finance.
+A stock is NOT bought merely because a slot is empty.
 
-It does NOT assume today's date is the latest available date.
+The replacement must be:
+    1. eligible
+    2. inside today's Top 10
+    3. not already held
+
+Available cash is allocated across vacant target positions.
+
+If fewer than 10 eligible stocks exist, fewer than 10 holdings
+are allowed.
+
+If sufficient cash exists but integer-share rounding prevents
+a purchase, the engine attempts to use the remaining available
+cash rather than abandoning the slot.
+
+Costs
+-----
+Buy + sell transaction costs
+STCG = 20.8% effective on positive realized gains
+
+Equity
+------
+Daily mark-to-market.
+
+Terminal value
+--------------
+Marked AND liquidation.
+
+Charts
+------
+Equity Curve + Drawdown
 """
 
 import time
@@ -50,14 +73,11 @@ BENCHMARK_FALLBACK = "^NSEI"
 
 STOCKS_FILE = "stocks.csv"
 
-# Download enough history to calculate 252-day indicators
-# plus the 200-day moving averages and 1-month slope.
 DOWNLOAD_YEARS_BEFORE_START = 3
 
 BACKTEST_START = "2016-04-01"
 
-# IMPORTANT:
-# None = automatically use latest available market data
+# None = latest available market data
 BACKTEST_END = None
 
 MIN_PRICE = 20
@@ -69,6 +89,8 @@ LOOKBACK_DAYS = 250
 MAX_PLAUSIBLE_DAILY_MOVE = 0.30
 
 TOP_N = 10
+
+# Exit only when rank becomes worse than this.
 EXIT_RANK = 15
 
 STARTING_CAPITAL = 1_000_000
@@ -115,13 +137,19 @@ def get_download_dates():
         pd.DateOffset(years=DOWNLOAD_YEARS_BEFORE_START)
     )
 
-    # None means Yahoo Finance should return latest available data
     if BACKTEST_END is None:
-        return download_start.strftime("%Y-%m-%d"), None
+
+        return (
+            download_start.strftime("%Y-%m-%d"),
+            None
+        )
 
     backtest_end = pd.Timestamp(BACKTEST_END)
 
-    download_end = backtest_end + pd.Timedelta(days=1)
+    download_end = (
+        backtest_end +
+        pd.Timedelta(days=1)
+    )
 
     return (
         download_start.strftime("%Y-%m-%d"),
@@ -136,6 +164,7 @@ def get_download_dates():
 def load_tickers():
 
     if not os.path.exists(STOCKS_FILE):
+
         raise FileNotFoundError(
             f"Could not find {STOCKS_FILE}"
         )
@@ -143,6 +172,7 @@ def load_tickers():
     df = pd.read_csv(STOCKS_FILE)
 
     if "symbol" not in df.columns:
+
         raise ValueError(
             "stocks.csv must contain a column named 'symbol'."
         )
@@ -155,10 +185,14 @@ def load_tickers():
         .tolist()
     )
 
-    symbols = [s for s in symbols if s]
+    symbols = [
+        s for s in symbols
+        if s
+    ]
 
     return [
-        s if s.endswith(".NS") else s + ".NS"
+        s if s.endswith(".NS")
+        else s + ".NS"
         for s in symbols
     ]
 
@@ -169,25 +203,40 @@ def load_tickers():
 
 def clean_price_series(close):
 
-    close = close.copy().sort_index()
+    close = (
+        close
+        .copy()
+        .sort_index()
+    )
 
     pct_change = close.pct_change()
 
-    bad = pct_change.abs() > MAX_PLAUSIBLE_DAILY_MOVE
+    bad = (
+        pct_change.abs() >
+        MAX_PLAUSIBLE_DAILY_MOVE
+    )
 
-    n_bad = int(bad.sum())
+    n_bad = int(
+        bad.sum()
+    )
 
     if n_bad == 0:
+
         return close, 0
 
     cleaned = close.copy()
 
     for idx in close.index[bad]:
 
-        pos = cleaned.index.get_loc(idx)
+        pos = (
+            cleaned.index.get_loc(idx)
+        )
 
         if pos > 0:
-            cleaned.iloc[pos] = cleaned.iloc[pos - 1]
+
+            cleaned.iloc[pos] = (
+                cleaned.iloc[pos - 1]
+            )
 
     return cleaned, n_bad
 
@@ -198,17 +247,38 @@ def clean_price_series(close):
 
 def buy_side_cost(trade_value):
 
-    stt = STT_RATE * trade_value
+    stt = (
+        STT_RATE *
+        trade_value
+    )
 
-    stamp = STAMP_DUTY_RATE * trade_value
+    stamp = (
+        STAMP_DUTY_RATE *
+        trade_value
+    )
 
-    exch = EXCHANGE_CHARGE_RATE * trade_value
+    exch = (
+        EXCHANGE_CHARGE_RATE *
+        trade_value
+    )
 
-    sebi = SEBI_CHARGE_RATE * trade_value
+    sebi = (
+        SEBI_CHARGE_RATE *
+        trade_value
+    )
 
-    gst = GST_RATE * (exch + sebi)
+    gst = (
+        GST_RATE *
+        (exch + sebi)
+    )
 
-    return stt + stamp + exch + sebi + gst
+    return (
+        stt +
+        stamp +
+        exch +
+        sebi +
+        gst
+    )
 
 
 # ============================================================
@@ -217,13 +287,25 @@ def buy_side_cost(trade_value):
 
 def sell_side_cost(trade_value):
 
-    stt = STT_RATE * trade_value
+    stt = (
+        STT_RATE *
+        trade_value
+    )
 
-    exch = EXCHANGE_CHARGE_RATE * trade_value
+    exch = (
+        EXCHANGE_CHARGE_RATE *
+        trade_value
+    )
 
-    sebi = SEBI_CHARGE_RATE * trade_value
+    sebi = (
+        SEBI_CHARGE_RATE *
+        trade_value
+    )
 
-    gst = GST_RATE * (exch + sebi)
+    gst = (
+        GST_RATE *
+        (exch + sebi)
+    )
 
     return (
         stt +
@@ -241,9 +323,13 @@ def sell_side_cost(trade_value):
 def stcg_tax(net_gain):
 
     if net_gain <= 0:
+
         return 0.0
 
-    return net_gain * STCG_EFFECTIVE_RATE
+    return (
+        net_gain *
+        STCG_EFFECTIVE_RATE
+    )
 
 
 # ============================================================
@@ -252,7 +338,9 @@ def stcg_tax(net_gain):
 
 def download_benchmark():
 
-    download_start, download_end = get_download_dates()
+    download_start, download_end = (
+        get_download_dates()
+    )
 
     print(
         f"\nBenchmark download: "
@@ -277,12 +365,19 @@ def download_benchmark():
             )
 
             if data.empty:
+
                 continue
 
             close = data["Close"]
 
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
+            if isinstance(
+                close,
+                pd.DataFrame
+            ):
+
+                close = (
+                    close.iloc[:, 0]
+                )
 
             close = (
                 close
@@ -291,15 +386,21 @@ def download_benchmark():
             )
 
             if close.empty:
+
                 continue
 
-            close, n_bad = clean_price_series(close)
+            close, n_bad = (
+                clean_price_series(
+                    close
+                )
+            )
 
             if n_bad:
 
                 print(
                     f"Benchmark {ticker}: "
-                    f"repaired {n_bad} implausible data point(s)"
+                    f"repaired {n_bad} "
+                    f"implausible data point(s)"
                 )
 
             print(
@@ -330,18 +431,34 @@ def download_benchmark():
 
 def trend_template_series(s):
 
-    sma50 = s.rolling(50).mean()
+    sma50 = (
+        s.rolling(50)
+        .mean()
+    )
 
-    sma150 = s.rolling(150).mean()
+    sma150 = (
+        s.rolling(150)
+        .mean()
+    )
 
-    sma200 = s.rolling(200).mean()
+    sma200 = (
+        s.rolling(200)
+        .mean()
+    )
 
-    sma200_1mo = sma200.shift(21)
+    sma200_1mo = (
+        sma200.shift(21)
+    )
 
-    low52 = s.rolling(252).min()
+    low52 = (
+        s.rolling(252)
+        .min()
+    )
 
-    high52 = s.rolling(252).max()
-
+    high52 = (
+        s.rolling(252)
+        .max()
+    )
 
     c1 = (
         (s > sma150) &
@@ -373,7 +490,6 @@ def trend_template_series(s):
         s >= 0.75 * high52
     )
 
-
     met = (
         c1.astype(int) +
         c2.astype(int) +
@@ -398,7 +514,10 @@ def compute_signals_for_stock(
 ):
 
     aligned = pd.concat(
-        [close, bench_close],
+        [
+            close,
+            bench_close
+        ],
         axis=1,
         join="inner"
     ).dropna()
@@ -409,13 +528,13 @@ def compute_signals_for_stock(
     ]
 
     if len(aligned) < 280:
+
         return None
 
-
-    volume = volume.reindex(
-        aligned.index
+    volume = (
+        volume
+        .reindex(aligned.index)
     )
-
 
     # --------------------------------------------------------
     # RS RATIO
@@ -426,19 +545,20 @@ def compute_signals_for_stock(
         aligned["b"]
     )
 
-
     # --------------------------------------------------------
-    # RETURN FUNCTION
+    # RETURN
     # --------------------------------------------------------
 
-    def pct_return(series, days):
+    def pct_return(
+        series,
+        days
+    ):
 
         return (
             series /
             series.shift(days) -
             1
         )
-
 
     # --------------------------------------------------------
     # RAW RS SCORE
@@ -447,25 +567,36 @@ def compute_signals_for_stock(
     rs_score = (
 
         0.40 *
-        pct_return(aligned["s"], 63)
+        pct_return(
+            aligned["s"],
+            63
+        )
 
         +
 
         0.20 *
-        pct_return(aligned["s"], 126)
+        pct_return(
+            aligned["s"],
+            126
+        )
 
         +
 
         0.20 *
-        pct_return(aligned["s"], 189)
+        pct_return(
+            aligned["s"],
+            189
+        )
 
         +
 
         0.20 *
-        pct_return(aligned["s"], 252)
+        pct_return(
+            aligned["s"],
+            252
+        )
 
     ) * 100
-
 
     # --------------------------------------------------------
     # BLUE DOT
@@ -483,7 +614,6 @@ def compute_signals_for_stock(
         previous_rs_high
     )
 
-
     # --------------------------------------------------------
     # PRICE NEW HIGH
     # --------------------------------------------------------
@@ -500,7 +630,6 @@ def compute_signals_for_stock(
         previous_price_high
     )
 
-
     # --------------------------------------------------------
     # GREEN DOT
     # --------------------------------------------------------
@@ -510,24 +639,25 @@ def compute_signals_for_stock(
         (~price_at_new_high)
     )
 
-
     # --------------------------------------------------------
     # TREND TEMPLATE
     # --------------------------------------------------------
 
-    tt_pass = trend_template_series(
-        aligned["s"]
+    tt_pass = (
+        trend_template_series(
+            aligned["s"]
+        )
     )
-
 
     # --------------------------------------------------------
     # RS LINE TREND TEMPLATE
     # --------------------------------------------------------
 
-    rs_tt_pass = trend_template_series(
-        rs_ratio
+    rs_tt_pass = (
+        trend_template_series(
+            rs_ratio
+        )
     )
-
 
     # --------------------------------------------------------
     # LIQUIDITY
@@ -535,7 +665,9 @@ def compute_signals_for_stock(
 
     rolling_avg_volume = (
         volume
-        .rolling(VOLUME_LOOKBACK)
+        .rolling(
+            VOLUME_LOOKBACK
+        )
         .mean()
     )
 
@@ -550,12 +682,11 @@ def compute_signals_for_stock(
         MIN_AVG_VOLUME
     )
 
-
     # --------------------------------------------------------
     # OUTPUT
     # --------------------------------------------------------
 
-    out = pd.DataFrame({
+    return pd.DataFrame({
 
         "price":
         aligned["s"],
@@ -581,7 +712,44 @@ def compute_signals_for_stock(
     })
 
 
-    return out
+# ============================================================
+# MARK PORTFOLIO
+# ============================================================
+
+def mark_portfolio(
+    cash,
+    holdings,
+    all_signals,
+    date
+):
+
+    value = cash
+
+    for sym, pos in holdings.items():
+
+        df = all_signals[sym]
+
+        if date in df.index:
+
+            price = float(
+                df.loc[
+                    date,
+                    "price"
+                ]
+            )
+
+        else:
+
+            price = float(
+                pos["entry_price"]
+            )
+
+        value += (
+            pos["qty"] *
+            price
+        )
+
+    return value
 
 
 # ============================================================
@@ -593,13 +761,17 @@ def run_backtest(
     trading_days
 ):
 
-    cash = STARTING_CAPITAL
+    cash = float(
+        STARTING_CAPITAL
+    )
 
     holdings = {}
 
     trade_log = []
 
     equity_curve = []
+
+    portfolio_diagnostics = []
 
 
     # ========================================================
@@ -608,55 +780,63 @@ def run_backtest(
 
     for date in trading_days:
 
-
         # ----------------------------------------------------
-        # ELIGIBLE POOL
+        # BUILD ELIGIBLE UNIVERSE
         # ----------------------------------------------------
 
         pool = []
 
-
-        for sym, df in all_signals.items():
+        for sym, df in (
+            all_signals.items()
+        ):
 
             if date not in df.index:
+
                 continue
 
             row = df.loc[date]
 
+            if pd.isna(
+                row["rs_score"]
+            ):
 
-            if pd.isna(row["rs_score"]):
                 continue
 
+            if not bool(
+                row["liquid"]
+            ):
 
-            if not bool(row["liquid"]):
                 continue
 
+            if not bool(
+                row["tt_pass"]
+            ):
 
-            if not bool(row["tt_pass"]):
                 continue
 
+            if not bool(
+                row["rs_tt_pass"]
+            ):
 
-            if not bool(row["rs_tt_pass"]):
                 continue
-
 
             pool.append(
                 (
                     sym,
-                    float(row["rs_score"])
+                    float(
+                        row["rs_score"]
+                    )
                 )
             )
 
-
         # ----------------------------------------------------
-        # RANK
+        # RANK ELIGIBLE UNIVERSE
         # ----------------------------------------------------
 
         pool.sort(
             key=lambda x: x[1],
             reverse=True
         )
-
 
         rank_lookup = {
 
@@ -667,64 +847,77 @@ def run_backtest(
             enumerate(pool)
         }
 
+        # ----------------------------------------------------
+        # TARGET TOP 10
+        # ----------------------------------------------------
 
-        target_topN = {
-
+        target_topN = [
             sym
-
             for sym, _ in
             pool[:TOP_N]
-        }
+        ]
 
+        target_set = set(
+            target_topN
+        )
 
         # ----------------------------------------------------
         # EXIT
+        #
+        # IMPORTANT:
+        # Exit only if:
+        #   rank > 15
+        # OR
+        #   stock disappeared from eligible universe.
         # ----------------------------------------------------
 
-        for sym in list(holdings.keys()):
+        exited_today = []
 
-            rank = rank_lookup.get(sym)
+        for sym in list(
+            holdings.keys()
+        ):
 
+            rank = (
+                rank_lookup.get(sym)
+            )
 
-            # Still safely inside eligible rank
             if (
                 rank is not None
                 and rank <= EXIT_RANK
             ):
-                continue
 
+                continue
 
             df = all_signals[sym]
 
-
             if date not in df.index:
-                continue
 
+                continue
 
             pos = holdings.pop(sym)
 
-
             exit_price = float(
-                df.loc[date, "price"]
+                df.loc[
+                    date,
+                    "price"
+                ]
             )
-
 
             gross_proceeds = (
                 pos["qty"] *
                 exit_price
             )
 
-
-            s_cost = sell_side_cost(
-                gross_proceeds
+            s_cost = (
+                sell_side_cost(
+                    gross_proceeds
+                )
             )
-
 
             net_proceeds = (
                 gross_proceeds -
                 s_cost
             )
-
 
             cost_basis = (
 
@@ -737,35 +930,30 @@ def run_backtest(
 
             )
 
-
             net_gain = (
                 net_proceeds -
                 cost_basis
             )
 
-
-            tax = stcg_tax(
-                net_gain
+            tax = (
+                stcg_tax(
+                    net_gain
+                )
             )
-
 
             cash += (
                 net_proceeds -
                 tax
             )
 
-
-            gross_return_pct = round(
+            gross_return_pct = (
 
                 (
                     exit_price /
                     pos["entry_price"] -
                     1
-                ) * 100,
-
-                2
+                ) * 100
             )
-
 
             net_return_pct = (
 
@@ -776,20 +964,22 @@ def run_backtest(
                 cost_basis *
                 100
 
-            ) if cost_basis > 0 else 0
+                if cost_basis > 0
 
-
-            exit_reason = (
-
-                f"Rank > {EXIT_RANK}"
-
-                if rank is not None
-
-                else
-
-                "Left eligible universe"
+                else 0
             )
 
+            if rank is None:
+
+                exit_reason = (
+                    "Left eligible universe"
+                )
+
+            else:
+
+                exit_reason = (
+                    f"Rank > {EXIT_RANK}"
+                )
 
             trade_log.append({
 
@@ -822,7 +1012,10 @@ def run_backtest(
                 ),
 
                 "gross_return_pct":
-                gross_return_pct,
+                round(
+                    gross_return_pct,
+                    2
+                ),
 
                 "buy_cost_rs":
                 round(
@@ -870,107 +1063,222 @@ def run_backtest(
 
             })
 
-
-        # ----------------------------------------------------
-        # PORTFOLIO VALUE BEFORE NEW ENTRIES
-        # ----------------------------------------------------
-
-        portfolio_value = cash
-
-
-        for sym, pos in holdings.items():
-
-            df = all_signals[sym]
-
-
-            if date in df.index:
-
-                price = float(
-                    df.loc[date, "price"]
-                )
-
-            else:
-
-                price = pos["entry_price"]
-
-
-            portfolio_value += (
-                pos["qty"] *
-                price
+            exited_today.append(
+                sym
             )
 
+        # ----------------------------------------------------
+        # CURRENT PORTFOLIO VALUE AFTER EXITS
+        # ----------------------------------------------------
+
+        portfolio_value = (
+            mark_portfolio(
+                cash,
+                holdings,
+                all_signals,
+                date
+            )
+        )
 
         # ----------------------------------------------------
-        # ENTRY
+        # VACANT TARGET SLOTS
+        #
+        # Only current Top 10 stocks can fill them.
         # ----------------------------------------------------
+
+        candidates = [
+
+            sym
+
+            for sym in target_topN
+
+            if sym not in holdings
+        ]
 
         slots_open = (
             TOP_N -
             len(holdings)
         )
 
+        slots_open = max(
+            0,
+            slots_open
+        )
 
-        if slots_open > 0:
+        # ----------------------------------------------------
+        # REFILL
+        #
+        # Allocate the available capital equally among
+        # the vacant target slots.
+        #
+        # This is the critical correction.
+        # ----------------------------------------------------
 
-            slot_capital = (
-                portfolio_value /
-                TOP_N
+        if (
+            slots_open > 0
+            and len(candidates) > 0
+            and cash > 0
+        ):
+
+            # Number of actual candidates that can fill slots
+            n_to_buy = min(
+                slots_open,
+                len(candidates)
             )
 
+            # Divide currently available cash among
+            # remaining target slots.
+            capital_per_slot = (
+                cash /
+                n_to_buy
+            )
 
-            for sym in [
-                s for s, _
-                in pool[:TOP_N]
-            ]:
+            for sym in candidates:
 
+                if (
+                    len(holdings) >=
+                    TOP_N
+                ):
 
-                if slots_open <= 0:
                     break
 
+                df = all_signals[sym]
 
-                if sym in holdings:
+                if date not in df.index:
+
                     continue
-
 
                 price = float(
-                    all_signals[sym]
-                    .loc[date, "price"]
+                    df.loc[
+                        date,
+                        "price"
+                    ]
                 )
 
+                if price <= 0:
 
-                qty = int(
-                    slot_capital //
-                    price
-                ) if price > 0 else 0
-
-
-                if qty < 1:
                     continue
 
+                # --------------------------------------------
+                # Initial equal-weight target
+                # --------------------------------------------
+
+                qty = int(
+                    capital_per_slot //
+                    price
+                )
+
+                # --------------------------------------------
+                # If that doesn't work because of rounding,
+                # use whatever cash can actually buy.
+                # --------------------------------------------
+
+                if qty < 1:
+
+                    # Maximum affordable quantity
+                    # accounting approximately for buy costs.
+                    qty = int(
+                        cash //
+                        (
+                            price *
+                            (
+                                1 +
+                                STT_RATE +
+                                STAMP_DUTY_RATE +
+                                EXCHANGE_CHARGE_RATE +
+                                SEBI_CHARGE_RATE +
+                                GST_RATE *
+                                (
+                                    EXCHANGE_CHARGE_RATE +
+                                    SEBI_CHARGE_RATE
+                                )
+                            )
+                        )
+                    )
+
+                if qty < 1:
+
+                    continue
 
                 trade_value = (
                     qty *
                     price
                 )
 
-
-                b_cost = buy_side_cost(
-                    trade_value
+                b_cost = (
+                    buy_side_cost(
+                        trade_value
+                    )
                 )
-
 
                 total_cost = (
                     trade_value +
                     b_cost
                 )
 
+                # --------------------------------------------
+                # Never spend more than available cash.
+                # --------------------------------------------
 
                 if total_cost > cash:
-                    continue
 
+                    # Reduce quantity until affordable.
+                    max_qty = int(
+                        qty
+                    )
+
+                    while (
+                        max_qty > 0
+                    ):
+
+                        test_value = (
+                            max_qty *
+                            price
+                        )
+
+                        test_cost = (
+                            test_value +
+                            buy_side_cost(
+                                test_value
+                            )
+                        )
+
+                        if (
+                            test_cost <=
+                            cash
+                        ):
+
+                            break
+
+                        max_qty -= 1
+
+                    qty = max_qty
+
+                    if qty < 1:
+
+                        continue
+
+                    trade_value = (
+                        qty *
+                        price
+                    )
+
+                    b_cost = (
+                        buy_side_cost(
+                            trade_value
+                        )
+                    )
+
+                    total_cost = (
+                        trade_value +
+                        b_cost
+                    )
+
+                # --------------------------------------------
+                # EXECUTE BUY
+                # --------------------------------------------
 
                 cash -= total_cost
-
 
                 holdings[sym] = {
 
@@ -988,43 +1296,107 @@ def run_backtest(
 
                 }
 
+                # --------------------------------------------
+                # Recalculate remaining slots and capital.
+                # --------------------------------------------
 
-                slots_open -= 1
-
-
-        # ----------------------------------------------------
-        # DAILY MARK-TO-MARKET
-        # ----------------------------------------------------
-
-        portfolio_value = cash
-
-
-        for sym, pos in holdings.items():
-
-            df = all_signals[sym]
-
-
-            if date in df.index:
-
-                price = float(
-                    df.loc[date, "price"]
+                remaining_slots = (
+                    TOP_N -
+                    len(holdings)
                 )
 
-            else:
+                if remaining_slots > 0:
 
-                price = pos["entry_price"]
+                    capital_per_slot = (
+                        cash /
+                        remaining_slots
+                    )
 
+        # ----------------------------------------------------
+        # FINAL DAILY MARK-TO-MARKET
+        # ----------------------------------------------------
 
-            portfolio_value += (
-                pos["qty"] *
-                price
+        portfolio_value = (
+            mark_portfolio(
+                cash,
+                holdings,
+                all_signals,
+                date
             )
+        )
 
+        # ----------------------------------------------------
+        # DIAGNOSTICS
+        # ----------------------------------------------------
+
+        held_target_count = sum(
+            1
+            for sym in holdings
+            if sym in target_set
+        )
+
+        eligible_count = len(
+            pool
+        )
+
+        portfolio_diagnostics.append({
+
+            "date":
+            date.strftime(
+                "%Y-%m-%d"
+            ),
+
+            "eligible_stocks":
+            eligible_count,
+
+            "top10_count":
+            len(target_topN),
+
+            "n_holdings":
+            len(holdings),
+
+            "cash_rs":
+            round(
+                cash,
+                2
+            ),
+
+            "portfolio_value_rs":
+            round(
+                portfolio_value,
+                2
+            ),
+
+            "exits_today":
+            len(exited_today),
+
+            "entries_today":
+            max(
+                0,
+                len(holdings)
+                -
+                (
+                    len(holdings)
+                    if not exited_today
+                    else 0
+                )
+            ),
+
+            "target_holdings_held":
+            held_target_count,
+
+        })
+
+        # ----------------------------------------------------
+        # EQUITY CURVE
+        # ----------------------------------------------------
 
         equity_curve.append({
 
             "date":
-            date.strftime("%Y-%m-%d"),
+            date.strftime(
+                "%Y-%m-%d"
+            ),
 
             "portfolio_value_rs":
             round(
@@ -1048,11 +1420,13 @@ def run_backtest(
             "n_holdings":
             len(holdings),
 
+            "eligible_stocks":
+            eligible_count,
+
         })
 
-
     # ========================================================
-    # TERMINAL VALUE
+    # TERMINAL MARKED VALUE
     # ========================================================
 
     if equity_curve:
@@ -1068,7 +1442,6 @@ def run_backtest(
             STARTING_CAPITAL
         )
 
-
     # ========================================================
     # TERMINAL LIQUIDATION
     # ========================================================
@@ -1077,16 +1450,20 @@ def run_backtest(
 
     open_positions_detail = []
 
+    if (
+        len(trading_days)
+        and holdings
+    ):
 
-    if len(trading_days) and holdings:
+        last_date = (
+            trading_days[-1]
+        )
 
-        last_date = trading_days[-1]
-
-
-        for sym, pos in holdings.items():
+        for sym, pos in (
+            holdings.items()
+        ):
 
             df = all_signals[sym]
-
 
             if last_date in df.index:
 
@@ -1103,23 +1480,21 @@ def run_backtest(
                     pos["entry_price"]
                 )
 
-
             gross_proceeds = (
                 pos["qty"] *
                 exit_price
             )
 
-
-            s_cost = sell_side_cost(
-                gross_proceeds
+            s_cost = (
+                sell_side_cost(
+                    gross_proceeds
+                )
             )
-
 
             net_proceeds = (
                 gross_proceeds -
                 s_cost
             )
-
 
             cost_basis = (
 
@@ -1132,23 +1507,21 @@ def run_backtest(
 
             )
 
-
             net_gain = (
                 net_proceeds -
                 cost_basis
             )
 
-
-            tax = stcg_tax(
-                net_gain
+            tax = (
+                stcg_tax(
+                    net_gain
+                )
             )
-
 
             liquidation_cash += (
                 net_proceeds -
                 tax
             )
-
 
             open_positions_detail.append({
 
@@ -1187,11 +1560,9 @@ def run_backtest(
 
             })
 
-
     final_liquidation_value = (
         liquidation_cash
     )
-
 
     # ========================================================
     # DATAFRAMES
@@ -1205,6 +1576,9 @@ def run_backtest(
         equity_curve
     )
 
+    diagnostics_df = pd.DataFrame(
+        portfolio_diagnostics
+    )
 
     if not equity_df.empty:
 
@@ -1225,16 +1599,15 @@ def run_backtest(
 
         ).round(3)
 
-
     open_df = pd.DataFrame(
         open_positions_detail
     )
-
 
     return (
         trade_df,
         equity_df,
         open_df,
+        diagnostics_df,
         final_marked_value,
         final_liquidation_value
     )
@@ -1252,8 +1625,8 @@ def summarize(
 ):
 
     if equity_df.empty:
-        return {}
 
+        return {}
 
     net_total_return_marked_pct = round(
 
@@ -1266,7 +1639,6 @@ def summarize(
         2
     )
 
-
     net_total_return_liquidation_pct = round(
 
         (
@@ -1278,12 +1650,10 @@ def summarize(
         2
     )
 
-
     running_max = (
         equity_df["equity"]
         .cummax()
     )
-
 
     drawdown = (
 
@@ -1293,12 +1663,10 @@ def summarize(
 
     ) * 100
 
-
     max_dd = round(
         drawdown.min(),
         2
     )
-
 
     # ========================================================
     # TRADE STATISTICS
@@ -1310,94 +1678,113 @@ def summarize(
 
         n = len(closed)
 
-
         win_rate_net = round(
 
             (
-                closed["net_return_pct"] >
-                0
+                closed[
+                    "net_return_pct"
+                ] > 0
             ).mean() * 100,
 
             1
         )
-
 
         win_rate_gross = round(
 
             (
-                closed["gross_return_pct"] >
-                0
+                closed[
+                    "gross_return_pct"
+                ] > 0
             ).mean() * 100,
 
             1
         )
 
-
         avg_gross = round(
-            closed["gross_return_pct"].mean(),
+            closed[
+                "gross_return_pct"
+            ].mean(),
             2
         )
-
 
         avg_net = round(
-            closed["net_return_pct"].mean(),
+            closed[
+                "net_return_pct"
+            ].mean(),
             2
         )
-
 
         median_net = round(
-            closed["net_return_pct"].median(),
+            closed[
+                "net_return_pct"
+            ].median(),
             2
         )
 
-
         avg_days = round(
-            closed["days_held"].mean(),
+            closed[
+                "days_held"
+            ].mean(),
             1
         )
 
-
         best_gross = (
-            closed["gross_return_pct"].max()
+            closed[
+                "gross_return_pct"
+            ].max()
         )
-
 
         worst_gross = (
-            closed["gross_return_pct"].min()
+            closed[
+                "gross_return_pct"
+            ].min()
         )
-
 
         total_costs_rs = round(
 
             (
-                closed["buy_cost_rs"] +
-                closed["sell_cost_rs"]
+                closed[
+                    "buy_cost_rs"
+                ]
+
+                +
+
+                closed[
+                    "sell_cost_rs"
+                ]
+
             ).sum(),
 
             0
         )
 
-
         total_tax_rs = round(
-            closed["stcg_tax_rs"].sum(),
+
+            closed[
+                "stcg_tax_rs"
+            ].sum(),
+
             0
         )
 
-
         winners = closed[
-            closed["net_return_pct"] > 0
+            closed[
+                "net_return_pct"
+            ] > 0
         ]
-
 
         losers = closed[
-            closed["net_return_pct"] < 0
+            closed[
+                "net_return_pct"
+            ] < 0
         ]
-
 
         avg_winner = (
 
             round(
-                winners["net_return_pct"].mean(),
+                winners[
+                    "net_return_pct"
+                ].mean(),
                 2
             )
 
@@ -1405,12 +1792,13 @@ def summarize(
 
             else 0
         )
-
 
         avg_loser = (
 
             round(
-                losers["net_return_pct"].mean(),
+                losers[
+                    "net_return_pct"
+                ].mean(),
                 2
             )
 
@@ -1419,28 +1807,29 @@ def summarize(
             else 0
         )
 
-
         gp = (
 
-            winners["net_pnl_rs"].sum()
+            winners[
+                "net_pnl_rs"
+            ].sum()
 
             if len(winners)
 
             else 0
         )
 
-
         gl = (
 
             abs(
-                losers["net_pnl_rs"].sum()
+                losers[
+                    "net_pnl_rs"
+                ].sum()
             )
 
             if len(losers)
 
             else 0
         )
-
 
         profit_factor = (
 
@@ -1454,37 +1843,22 @@ def summarize(
             else 0
         )
 
-
     else:
 
         n = 0
-
         win_rate_net = 0
-
         win_rate_gross = 0
-
         avg_gross = 0
-
         avg_net = 0
-
         median_net = 0
-
         avg_days = 0
-
         best_gross = 0
-
         worst_gross = 0
-
         total_costs_rs = 0
-
         total_tax_rs = 0
-
         avg_winner = 0
-
         avg_loser = 0
-
         profit_factor = 0
-
 
     # ========================================================
     # DAILY STATISTICS
@@ -1495,7 +1869,6 @@ def summarize(
         .pct_change()
         .dropna()
     )
-
 
     if len(daily_returns):
 
@@ -1511,31 +1884,32 @@ def summarize(
             equity_df
         )
 
-
         annualized_return = (
 
             equity_df["equity"].iloc[-1]
             **
             (
                 252 /
-                max(n_days, 1)
+                max(
+                    n_days,
+                    1
+                )
             )
 
         ) - 1
-
 
         annualized_vol = (
             daily_std *
             np.sqrt(252)
         )
 
-
         sharpe = (
 
             (
                 daily_mean /
                 daily_std
-            ) *
+            )
+            *
             np.sqrt(252)
 
             if daily_std > 0
@@ -1543,13 +1917,11 @@ def summarize(
             else 0
         )
 
-
         downside = (
             daily_returns[
                 daily_returns < 0
             ]
         )
-
 
         downside_std = (
 
@@ -1560,13 +1932,13 @@ def summarize(
             else 0
         )
 
-
         sortino = (
 
             (
                 daily_mean /
                 downside_std
-            ) *
+            )
+            *
             np.sqrt(252)
 
             if downside_std > 0
@@ -1574,23 +1946,20 @@ def summarize(
             else 0
         )
 
-
     else:
 
         annualized_return = 0
-
         annualized_vol = 0
-
         sharpe = 0
-
         sortino = 0
-
 
     calmar = (
 
         round(
             annualized_return /
-            abs(max_dd / 100),
+            abs(
+                max_dd / 100
+            ),
             3
         )
 
@@ -1599,9 +1968,8 @@ def summarize(
         else 0
     )
 
-
     # ========================================================
-    # SUMMARY DICTIONARY
+    # SUMMARY
     # ========================================================
 
     return {
@@ -1725,8 +2093,8 @@ def write_in_chunks(
     total = len(all_rows)
 
     if total == 0:
-        return
 
+        return
 
     for i in range(
         0,
@@ -1742,7 +2110,6 @@ def write_in_chunks(
             start_row + i
         )
 
-
         try:
 
             ws.update(
@@ -1750,39 +2117,21 @@ def write_in_chunks(
                 f"A{row_start}"
             )
 
-
         except Exception as e:
 
             print(
                 f"Write failed for "
                 f"{label} rows "
-                f"{i}-{i+len(chunk)}, "
+                f"{i}-{i + len(chunk)}, "
                 f"retrying once: {e}"
             )
 
-
             time.sleep(5)
 
-
-            try:
-
-                ws.update(
-                    chunk,
-                    f"A{row_start}"
-                )
-
-
-            except Exception as e2:
-
-                print(
-                    f"RETRY FAILED for "
-                    f"{label} rows "
-                    f"{i}-{i+len(chunk)}: "
-                    f"{e2}"
-                )
-
-                raise
-
+            ws.update(
+                chunk,
+                f"A{row_start}"
+            )
 
         print(
             f"Wrote {label}: "
@@ -1806,9 +2155,7 @@ def remove_existing_charts(
             sh.fetch_sheet_metadata()
         )
 
-
         requests = []
-
 
         for sheet in meta.get(
             "sheets",
@@ -1838,13 +2185,12 @@ def remove_existing_charts(
 
                     })
 
-
         if requests:
 
             sh.batch_update({
-                "requests": requests
+                "requests":
+                requests
             })
-
 
             print(
                 f"Removed "
@@ -1852,13 +2198,11 @@ def remove_existing_charts(
                 f"existing chart(s)."
             )
 
-
     except Exception as e:
 
         print(
             "Could not check/remove "
-            f"existing charts "
-            f"(non-fatal): {e}"
+            f"existing charts: {e}"
         )
 
 
@@ -1878,7 +2222,6 @@ def add_charts(
         1 +
         n_equity_rows
     )
-
 
     def make_chart(
         title,
@@ -2044,7 +2387,6 @@ def add_charts(
 
         }
 
-
     requests = [
 
         make_chart(
@@ -2063,7 +2405,6 @@ def add_charts(
 
     ]
 
-
     try:
 
         sh.batch_update({
@@ -2079,19 +2420,20 @@ def add_charts(
     except Exception as e:
 
         print(
-            "Could not add charts "
-            f"(non-fatal): {e}"
+            "Could not add charts: "
+            f"{e}"
         )
 
 
 # ============================================================
-# WRITE RESULTS TO GOOGLE SHEETS
+# WRITE RESULTS
 # ============================================================
 
 def write_to_sheet(
     trade_df,
     equity_df,
     open_df,
+    diagnostics_df,
     summary,
     effective_end_str
 ):
@@ -2104,42 +2446,42 @@ def write_to_sheet(
         CREDS_ENV
     )
 
-
     # --------------------------------------------------------
-    # FALLBACK TO CSV
+    # CSV FALLBACK
     # --------------------------------------------------------
 
-    if not sheet_id or not creds_json:
+    if (
+        not sheet_id
+        or not creds_json
+    ):
 
         print(
             "Missing SHEET_ID/"
             "GOOGLE_CREDENTIALS -- "
-            "saving to CSV instead."
+            "saving to CSV."
         )
-
 
         trade_df.to_csv(
             "backtest_trades.csv",
             index=False
         )
 
-
         equity_df.to_csv(
             "backtest_equity.csv",
             index=False
         )
 
+        open_df.to_csv(
+            "backtest_open_positions.csv",
+            index=False
+        )
 
-        if not open_df.empty:
-
-            open_df.to_csv(
-                "backtest_open_positions.csv",
-                index=False
-            )
-
+        diagnostics_df.to_csv(
+            "backtest_diagnostics.csv",
+            index=False
+        )
 
         return
-
 
     # --------------------------------------------------------
     # GOOGLE AUTH
@@ -2149,11 +2491,9 @@ def write_to_sheet(
         creds_json
     )
 
-
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets"
     ]
-
 
     creds = (
         Credentials
@@ -2163,16 +2503,13 @@ def write_to_sheet(
         )
     )
 
-
     gc = gspread.authorize(
         creds
     )
 
-
     sh = gc.open_by_key(
         sheet_id
     )
-
 
     timestamp = (
         datetime.now()
@@ -2181,24 +2518,27 @@ def write_to_sheet(
         )
     )
 
-
     # --------------------------------------------------------
-    # SHEET SIZE
+    # SHEET
     # --------------------------------------------------------
 
     n_rows_needed = (
 
-        len(trade_df) +
-        len(equity_df) +
-        len(open_df) +
-        len(summary) +
-        60
+        len(trade_df)
+        +
+        len(equity_df)
+        +
+        len(open_df)
+        +
+        len(diagnostics_df)
+        +
+        len(summary)
+        +
+        100
 
     )
 
-
     n_cols_needed = 16
-
 
     try:
 
@@ -2206,51 +2546,35 @@ def write_to_sheet(
             BACKTEST_WORKSHEET
         )
 
-
         if (
             ws.row_count <
             n_rows_needed
-
             or
-
             ws.col_count <
             n_cols_needed
         ):
 
             ws.resize(
-
                 rows=max(
                     ws.row_count,
                     n_rows_needed
                 ),
-
                 cols=max(
                     ws.col_count,
                     n_cols_needed
                 )
-
             )
-
 
     except gspread.WorksheetNotFound:
 
         ws = sh.add_worksheet(
-
             title=
             BACKTEST_WORKSHEET,
-
             rows=
             n_rows_needed,
-
             cols=
             n_cols_needed
-
         )
-
-
-    # --------------------------------------------------------
-    # CLEAR OLD RESULTS
-    # --------------------------------------------------------
 
     remove_existing_charts(
         sh,
@@ -2258,7 +2582,6 @@ def write_to_sheet(
     )
 
     ws.clear()
-
 
     # --------------------------------------------------------
     # HEADER
@@ -2268,12 +2591,13 @@ def write_to_sheet(
 
         [[
 
-            "SIMPLIFIED MODEL BACKTEST | "
+            "CORRECTED TOP-10 BACKTEST | "
             f"run {timestamp} | "
             "NET of costs+STCG | "
             f"Capital: Rs.{STARTING_CAPITAL:,.0f} | "
             "Entry: Price TT + RS TT | "
             f"Exit: rank > {EXIT_RANK} | "
+            "Vacancies refilled from current Top 10 | "
             f"Window: {BACKTEST_START} "
             f"to {effective_end_str}"
 
@@ -2283,31 +2607,24 @@ def write_to_sheet(
 
     )
 
-
     # --------------------------------------------------------
     # SUMMARY
     # --------------------------------------------------------
 
     summary_rows = (
-
         [["Summary", ""]]
-
         +
-
         [
             [k, v]
             for k, v in
             summary.items()
         ]
-
     )
-
 
     ws.update(
         summary_rows,
         "A3"
     )
-
 
     # --------------------------------------------------------
     # TRADE LOG
@@ -2319,17 +2636,14 @@ def write_to_sheet(
         2
     )
 
-
     ws.update(
         [["Trade Log"]],
         f"A{trade_start_row}"
     )
 
-
     trade_header_row = (
         trade_start_row + 1
     )
-
 
     if not trade_df.empty:
 
@@ -2342,9 +2656,7 @@ def write_to_sheet(
                     trade_df.columns
                 )
             ]
-
             +
-
             trade_df.values.tolist(),
 
             start_row=
@@ -2358,39 +2670,29 @@ def write_to_sheet(
 
         )
 
-
     # --------------------------------------------------------
     # OPEN POSITIONS
     # --------------------------------------------------------
 
     open_start_row = (
-
-        trade_header_row +
-
-        len(trade_df) +
-
+        trade_header_row
+        +
+        len(trade_df)
+        +
         3
-
     )
-
 
     ws.update(
-
         [[
             "Open Positions at "
-            "Backtest End "
-            "(mark-to-market)"
+            "Backtest End"
         ]],
-
         f"A{open_start_row}"
-
     )
-
 
     open_header_row = (
         open_start_row + 1
     )
-
 
     if not open_df.empty:
 
@@ -2401,47 +2703,85 @@ def write_to_sheet(
                     open_df.columns
                 )
             ]
-
             +
-
             open_df.values.tolist(),
 
             f"A{open_header_row}"
 
         )
 
+    # --------------------------------------------------------
+    # DIAGNOSTICS
+    # --------------------------------------------------------
+
+    diag_start_row = (
+        open_header_row
+        +
+        max(
+            len(open_df),
+            1
+        )
+        +
+        3
+    )
+
+    ws.update(
+        [["Portfolio Diagnostics"]],
+        f"A{diag_start_row}"
+    )
+
+    diag_header_row = (
+        diag_start_row + 1
+    )
+
+    if not diagnostics_df.empty:
+
+        write_in_chunks(
+
+            ws,
+
+            [
+                list(
+                    diagnostics_df.columns
+                )
+            ]
+            +
+            diagnostics_df.values.tolist(),
+
+            start_row=
+            diag_header_row,
+
+            chunk_size=
+            2000,
+
+            label=
+            "diagnostics"
+
+        )
 
     # --------------------------------------------------------
     # EQUITY CURVE
     # --------------------------------------------------------
 
     equity_start_row = (
-
-        open_header_row +
-
+        diag_header_row
+        +
         max(
-            len(open_df),
+            len(diagnostics_df),
             1
-        ) +
-
+        )
+        +
         3
-
     )
-
 
     ws.update(
-
         [["Daily Equity Curve"]],
-
         f"A{equity_start_row}"
-
     )
-
 
     equity_header_row = (
         equity_start_row + 1
     )
-
 
     if not equity_df.empty:
 
@@ -2454,9 +2794,7 @@ def write_to_sheet(
                     equity_df.columns
                 )
             ]
-
             +
-
             equity_df.values.tolist(),
 
             start_row=
@@ -2470,7 +2808,6 @@ def write_to_sheet(
 
         )
 
-
         add_charts(
 
             sh,
@@ -2483,20 +2820,16 @@ def write_to_sheet(
 
         )
 
-
     print(
 
-        f"\nBacktest results "
-        f"written to "
-        f"'{BACKTEST_WORKSHEET}' tab: "
+        f"\nBacktest results written "
+        f"to '{BACKTEST_WORKSHEET}' tab: "
 
         f"{len(trade_df)} trades, "
 
-        f"{len(equity_df)} "
-        f"trading days, "
+        f"{len(equity_df)} trading days, "
 
-        f"{len(open_df)} "
-        f"open positions."
+        f"{len(open_df)} open positions."
 
     )
 
@@ -2513,12 +2846,10 @@ def main():
 
     tickers = load_tickers()
 
-
     print(
         f"\nLoaded "
         f"{len(tickers)} tickers."
     )
-
 
     # --------------------------------------------------------
     # DOWNLOAD DATES
@@ -2527,7 +2858,6 @@ def main():
     download_start, download_end = (
         get_download_dates()
     )
-
 
     print("=" * 60)
 
@@ -2569,12 +2899,17 @@ def main():
 
     print(
         f"Portfolio        : "
-        f"Top {TOP_N}, equal weight"
+        f"Top {TOP_N}, equal weight at entry"
     )
 
     print(
         f"Exit             : "
         f"rank > {EXIT_RANK}"
+    )
+
+    print(
+        "Vacancy refill   : "
+        "Current Top 10"
     )
 
     print(
@@ -2584,7 +2919,6 @@ def main():
 
     print("=" * 60)
 
-
     # --------------------------------------------------------
     # BENCHMARK
     # --------------------------------------------------------
@@ -2592,7 +2926,6 @@ def main():
     bench_close = (
         download_benchmark()
     )
-
 
     # --------------------------------------------------------
     # STOCK DATA
@@ -2604,7 +2937,6 @@ def main():
 
     batch_size = 50
 
-
     for i in range(
         0,
         len(tickers),
@@ -2615,13 +2947,11 @@ def main():
             i:i + batch_size
         ]
 
-
         print(
             f"\nDownloading batch "
             f"{i}-"
             f"{i + len(batch)}..."
         )
-
 
         try:
 
@@ -2652,7 +2982,6 @@ def main():
 
             )
 
-
         except Exception as e:
 
             print(
@@ -2662,9 +2991,8 @@ def main():
 
             continue
 
-
         # ----------------------------------------------------
-        # PROCESS EACH STOCK
+        # PROCESS STOCKS
         # ----------------------------------------------------
 
         for symbol in batch:
@@ -2685,39 +3013,35 @@ def main():
 
                         continue
 
-
                     sdata = data[
                         symbol
                     ]
 
+                if (
+                    "Close"
+                    not in
+                    sdata.columns
+                ):
 
-                if "Close" not in sdata.columns:
                     continue
 
-
                 close = (
-
                     sdata["Close"]
                     .dropna()
                     .sort_index()
-
                 )
 
-
                 volume = (
-
                     sdata["Volume"]
                     .reindex(
                         close.index
                     )
                     .fillna(0)
-
                 )
 
-
                 if close.empty:
-                    continue
 
+                    continue
 
                 close, n_bad = (
                     clean_price_series(
@@ -2725,11 +3049,9 @@ def main():
                     )
                 )
 
-
                 total_bad_points += (
                     n_bad
                 )
-
 
                 sig = (
                     compute_signals_for_stock(
@@ -2743,7 +3065,6 @@ def main():
                     )
                 )
 
-
                 if sig is not None:
 
                     all_signals[
@@ -2752,7 +3073,6 @@ def main():
                             ""
                         )
                     ] = sig
-
 
             except Exception as e:
 
@@ -2763,9 +3083,7 @@ def main():
 
                 continue
 
-
         time.sleep(1)
-
 
     # --------------------------------------------------------
     # SIGNAL SUMMARY
@@ -2776,15 +3094,13 @@ def main():
         f"{len(all_signals)} stocks."
     )
 
-
     print(
         f"Total data points repaired: "
         f"{total_bad_points}"
     )
 
-
     # --------------------------------------------------------
-    # LATEST AVAILABLE DATE
+    # LATEST DATA
     # --------------------------------------------------------
 
     if all_signals:
@@ -2802,28 +3118,15 @@ def main():
 
         latest_stock_date = None
 
-
     benchmark_latest_date = (
         pd.Timestamp(
             bench_close.index.max()
         )
     )
 
-
-    # ========================================================
-    # EFFECTIVE BACKTEST END
-    # ========================================================
-    #
-    # If BACKTEST_END is None:
-    #     latest benchmark date is used.
-    #
-    # If BACKTEST_END is specified:
-    #     use the earlier of the requested date and
-    #     the latest available benchmark date.
-    #
-    # This prevents a future/non-existent trading date
-    # from entering the backtest.
-    # ========================================================
+    # --------------------------------------------------------
+    # EFFECTIVE END
+    # --------------------------------------------------------
 
     if BACKTEST_END is None:
 
@@ -2843,13 +3146,11 @@ def main():
 
         )
 
-
     print(
         "\nLatest available "
         "benchmark data: "
         f"{benchmark_latest_date.strftime('%Y-%m-%d')}"
     )
-
 
     if latest_stock_date is not None:
 
@@ -2859,16 +3160,14 @@ def main():
             f"{pd.Timestamp(latest_stock_date).strftime('%Y-%m-%d')}"
         )
 
-
     print(
         "Effective backtest "
         "end date: "
         f"{effective_end.strftime('%Y-%m-%d')}"
     )
 
-
     # --------------------------------------------------------
-    # FILTER FUNNEL ON LATEST AVAILABLE DATE
+    # LATEST FILTER FUNNEL
     # --------------------------------------------------------
 
     if all_signals:
@@ -2881,7 +3180,6 @@ def main():
             all_signals.values()
 
         )
-
 
         counts = {
 
@@ -2896,19 +3194,21 @@ def main():
 
         }
 
-
         for sym, df in (
             all_signals.items()
         ):
 
-            if latest_date not in df.index:
-                continue
+            if (
+                latest_date
+                not in
+                df.index
+            ):
 
+                continue
 
             row = df.loc[
                 latest_date
             ]
-
 
             if pd.isna(
                 row["rs_score"]
@@ -2916,16 +3216,13 @@ def main():
 
                 continue
 
-
             if not bool(
                 row["liquid"]
             ):
 
                 continue
 
-
             counts["liquid"] += 1
-
 
             if not bool(
                 row["tt_pass"]
@@ -2933,9 +3230,7 @@ def main():
 
                 continue
 
-
             counts["+tt_pass"] += 1
-
 
             if not bool(
                 row["rs_tt_pass"]
@@ -2943,22 +3238,18 @@ def main():
 
                 continue
 
-
             counts["+rs_tt_pass"] += 1
-
 
         print(
             f"\nFilter funnel on "
             f"{latest_date.strftime('%Y-%m-%d')}:"
         )
 
-
         for k, v in counts.items():
 
             print(
                 f"  {k}: {v}"
             )
-
 
     # --------------------------------------------------------
     # TRADING DAYS
@@ -2984,12 +3275,10 @@ def main():
         ]
     )
 
-
     print(
         f"\nTrading days: "
         f"{len(trading_days)}"
     )
-
 
     if len(trading_days):
 
@@ -3003,15 +3292,15 @@ def main():
             f"{trading_days[-1].strftime('%Y-%m-%d')}"
         )
 
-
     # --------------------------------------------------------
-    # RUN BACKTEST
+    # RUN
     # --------------------------------------------------------
 
     (
         trade_df,
         equity_df,
         open_df,
+        diagnostics_df,
         final_marked,
         final_liq
 
@@ -3022,7 +3311,6 @@ def main():
         trading_days
 
     )
-
 
     # --------------------------------------------------------
     # SUMMARY
@@ -3040,21 +3328,42 @@ def main():
 
     )
 
-
     print(
         "\n--- SUMMARY ---"
     )
 
-
-    for k, v in summary.items():
+    for k, v in (
+        summary.items()
+    ):
 
         print(
             f"{k}: {v}"
         )
 
+    # --------------------------------------------------------
+    # CURRENT HOLDINGS
+    # --------------------------------------------------------
+
+    print(
+        "\n--- OPEN POSITIONS ---"
+    )
+
+    if not open_df.empty:
+
+        print(
+            open_df.to_string(
+                index=False
+            )
+        )
+
+    else:
+
+        print(
+            "No open positions."
+        )
 
     # --------------------------------------------------------
-    # WRITE RESULTS
+    # WRITE
     # --------------------------------------------------------
 
     write_to_sheet(
@@ -3064,6 +3373,8 @@ def main():
         equity_df,
 
         open_df,
+
+        diagnostics_df,
 
         summary,
 
@@ -3088,7 +3399,6 @@ if __name__ == "__main__":
             "\nBACKTEST COMPLETED "
             "SUCCESSFULLY."
         )
-
 
     except Exception as e:
 
