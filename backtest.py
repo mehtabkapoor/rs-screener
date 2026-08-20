@@ -1756,6 +1756,30 @@ def summarize(
 
 
 # ============================================================
+# RACE-SAFE GET-OR-CREATE WORKSHEET
+# ============================================================
+
+def get_or_create_worksheet(sh, title, rows=1000, cols=16):
+    """
+    FIX: sh.worksheet(title) can return "not found" from a stale
+    cached sheet list. If add_worksheet() then fails because the
+    sheet genuinely already exists (created by a concurrent/retried
+    run), fall back to fetching it instead of crashing.
+    """
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        pass
+
+    try:
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+    except gspread.exceptions.APIError as e:
+        if "already exists" in str(e):
+            return sh.worksheet(title)
+        raise
+
+
+# ============================================================
 # GOOGLE SHEETS CHUNK WRITER
 # ============================================================
 
@@ -2245,51 +2269,22 @@ def write_to_sheet(
     n_cols_needed = 16
 
 
-    try:
+    ws = get_or_create_worksheet(
+        sh,
+        BACKTEST_WORKSHEET,
+        rows=n_rows_needed,
+        cols=n_cols_needed
+    )
 
-        ws = sh.worksheet(
-            BACKTEST_WORKSHEET
-        )
+    if (
+        ws.row_count < n_rows_needed
+        or
+        ws.col_count < n_cols_needed
+    ):
 
-
-        if (
-            ws.row_count <
-            n_rows_needed
-
-            or
-
-            ws.col_count <
-            n_cols_needed
-        ):
-
-            ws.resize(
-
-                rows=max(
-                    ws.row_count,
-                    n_rows_needed
-                ),
-
-                cols=max(
-                    ws.col_count,
-                    n_cols_needed
-                )
-
-            )
-
-
-    except gspread.WorksheetNotFound:
-
-        ws = sh.add_worksheet(
-
-            title=
-            BACKTEST_WORKSHEET,
-
-            rows=
-            n_rows_needed,
-
-            cols=
-            n_cols_needed
-
+        ws.resize(
+            rows=max(ws.row_count, n_rows_needed),
+            cols=max(ws.col_count, n_cols_needed)
         )
 
 
