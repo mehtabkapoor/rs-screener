@@ -1,8 +1,8 @@
 """
-RS SCREENER - MINERVINI TREND TEMPLATE + RS
+RS SCREENER - MINERVINI TREND TEMPLATE + RS   (CORRECTED)
 
 ============================================================
-CORE SCREEN
+CORE SCREEN  (RULES UNCHANGED FROM ORIGINAL)
 ============================================================
 
 PRICE
@@ -56,6 +56,36 @@ Green Dot entry
 Regime filter
 
 Blue Dot / 1Y RS Cross / Green Dot remain diagnostic.
+
+============================================================
+ERROR FIXES IN THIS VERSION (no rule/logic changes)
+============================================================
+
+1. QTY PERSISTENCE BUG FIXED:
+   OLD: apply_confirmed_executions() stored only entry_price and
+        entry_date on a confirmed BUY — never the executed qty.
+        build_portfolio() then RECOMPUTED qty every run from
+        today's (capital / TOP_N) / entry_price, so "Position
+        Value (Rs)" for HOLD rows was a target allocation, not
+        true mark-to-market, and silently drifted from what was
+        actually bought whenever capital changed or your fill
+        differed from the suggested qty.
+   NEW: Holdings sheet gains a "qty" column. Confirmed BUY rows
+        store the executed qty (from the Portfolio tab's Qty
+        column). build_portfolio() uses that stored qty directly:
+            Position Value (Rs) = qty * current_price
+        No more silent re-derivation.
+
+2. DATE/TIMEZONE NORMALIZATION ADDED:
+   OLD: No normalization of yfinance's returned index. If a
+        stock's index and the benchmark's index differ in
+        tz-awareness, pd.concat(..., join="inner") can silently
+        return an empty/reduced intersection. compute_diagnostics()
+        would then return None, and the stock would be silently
+        DROPPED from the entire screen with no error logged.
+   NEW: All price/volume series are normalized to tz-naive,
+        midnight-normalized timestamps before any join/concat,
+        matching the safeguard already used in the backtest files.
 """
 
 import time
@@ -115,6 +145,26 @@ PORTFOLIO_HEADER = [
     "Blue Dot", "1Y RS Cross", "Green Dot",
 ]
 
+HOLDINGS_HEADER = ["symbol", "entry_price", "entry_date", "qty"]
+
+
+# ============================================================
+# DATE NORMALIZATION  (NEW)
+# ============================================================
+
+def normalize_dates(index):
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    return idx.normalize()
+
+
+def normalize_series_index(series):
+    s = series.copy()
+    s.index = normalize_dates(s.index)
+    s = s[~s.index.duplicated(keep="last")]
+    return s.sort_index()
+
 
 def get_run_mode():
     event = os.environ.get("GITHUB_EVENT_NAME", "manual")
@@ -162,6 +212,9 @@ def download_benchmark(run_mode):
             if not data.empty:
                 print(f"Benchmark loaded: {tkr}")
                 close = data["Close"]
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+                close = normalize_series_index(close.dropna())
                 if run_mode == "PREVIEW":
                     live = fetch_intraday_last_price([tkr])
                     close = append_preview_price(close, live.get(tkr))
@@ -192,8 +245,8 @@ def fetch_intraday_last_price(tickers):
 def append_preview_price(close_series, live_price):
     if live_price is None:
         return close_series
-    today = pd.Timestamp.now(tz=close_series.index.tz).normalize() if close_series.index.tz \
-        else pd.Timestamp.now().normalize()
+    # close_series is already tz-naive normalized midnight timestamps
+    today = pd.Timestamp.now().normalize()
     last_date = close_series.index[-1].normalize()
     if last_date == today:
         updated = close_series.copy()
@@ -284,8 +337,8 @@ def main():
         for symbol in batch:
             try:
                 sdata = data if len(batch) == 1 else data[symbol]
-                close = sdata["Close"].dropna()
-                volume = sdata["Volume"].dropna()
+                close = normalize_series_index(sdata["Close"].dropna())
+                volume = normalize_series_index(sdata["Volume"].dropna())
                 if close.empty or len(close) < LOOKBACK_DAYS + 2:
                     continue
                 if run_mode == "PREVIEW":
@@ -406,6 +459,12 @@ def read_config(sh):
 
 
 def apply_confirmed_executions(sh):
+    """
+    FIXED: confirmed BUY rows now persist the executed qty
+    (read from the Portfolio tab's Qty column) into the Holdings
+    sheet, instead of storing only entry_price/entry_date and
+    letting build_portfolio() silently re-derive qty later.
+    """
     try:
         port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
     except gspread.WorksheetNotFound:
@@ -415,15 +474,21 @@ def apply_confirmed_executions(sh):
     except Exception as e:
         print(f"Could not read prior Portfolio tab: {e}")
         return
+
     try:
         holdings_ws = sh.worksheet(HOLDINGS_WORKSHEET)
         existing = holdings_ws.get_all_records()
-        holdings = {row["symbol"]: {"entry_price": float(row.get("entry_price") or 0),
-                                     "entry_date": row.get("entry_date", "")}
-                    for row in existing if row.get("symbol")}
+        holdings = {
+            row["symbol"]: {
+                "entry_price": float(row.get("entry_price") or 0),
+                "entry_date": row.get("entry_date", ""),
+                "qty": int(row.get("qty") or 0),
+            }
+            for row in existing if row.get("symbol")
+        }
     except gspread.WorksheetNotFound:
         holdings_ws = sh.add_worksheet(title=HOLDINGS_WORKSHEET, rows=100, cols=5)
-        holdings_ws.update([["symbol", "entry_price", "entry_date"]], "A1")
+        holdings_ws.update([HOLDINGS_HEADER], "A1")
         holdings = {}
 
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -436,16 +501,24 @@ def apply_confirmed_executions(sh):
         symbol = str(row.get("Symbol", "")).strip()
         if not symbol:
             continue
+
         if action == "BUY":
             exec_price_raw = row.get("Execution Price") or row.get("Entry Price")
+            exec_qty_raw = row.get("Qty")
             try:
                 exec_price = float(exec_price_raw)
+                exec_qty = int(exec_qty_raw)
             except (ValueError, TypeError):
-                print(f"Skipping confirmed BUY for {symbol}")
+                print(f"Skipping confirmed BUY for {symbol}: invalid price/qty in row "
+                      f"(Execution Price={exec_price_raw}, Qty={exec_qty_raw})")
                 continue
-            holdings[symbol] = {"entry_price": exec_price, "entry_date": today_str}
+            if exec_qty <= 0:
+                print(f"Skipping confirmed BUY for {symbol}: qty must be > 0, got {exec_qty}")
+                continue
+            holdings[symbol] = {"entry_price": exec_price, "entry_date": today_str, "qty": exec_qty}
             changed = True
-            print(f"Confirmed BUY applied: {symbol} @ {exec_price}")
+            print(f"Confirmed BUY applied: {symbol} @ {exec_price} x {exec_qty}")
+
         elif action == "SELL":
             if symbol in holdings:
                 del holdings[symbol]
@@ -454,8 +527,9 @@ def apply_confirmed_executions(sh):
 
     if changed:
         holdings_ws.clear()
-        rows_out = [["symbol", "entry_price", "entry_date"]] + [
-            [s, v["entry_price"], v["entry_date"]] for s, v in holdings.items()]
+        rows_out = [HOLDINGS_HEADER] + [
+            [s, v["entry_price"], v["entry_date"], v["qty"]] for s, v in holdings.items()
+        ]
         holdings_ws.update(rows_out, "A1")
         print("Holdings updated.")
     else:
@@ -481,12 +555,17 @@ def build_portfolio(universe_df):
     try:
         holdings_ws = sh.worksheet(HOLDINGS_WORKSHEET)
         existing = holdings_ws.get_all_records()
-        current_holdings = {row["symbol"]: {"entry_price": float(row.get("entry_price") or 0),
-                                             "entry_date": row.get("entry_date", "")}
-                             for row in existing if row.get("symbol")}
+        current_holdings = {
+            row["symbol"]: {
+                "entry_price": float(row.get("entry_price") or 0),
+                "entry_date": row.get("entry_date", ""),
+                "qty": int(row.get("qty") or 0),
+            }
+            for row in existing if row.get("symbol")
+        }
     except gspread.WorksheetNotFound:
         holdings_ws = sh.add_worksheet(title=HOLDINGS_WORKSHEET, rows=100, cols=5)
-        holdings_ws.update([["symbol", "entry_price", "entry_date"]], "A1")
+        holdings_ws.update([HOLDINGS_HEADER], "A1")
         current_holdings = {}
 
     # Eligible universe = Price TT + RS TT
@@ -523,9 +602,9 @@ def build_portfolio(universe_df):
     for s in kept:
         entry_price = current_holdings[s]["entry_price"]
         entry_date = current_holdings[s]["entry_date"]
+        qty = current_holdings[s]["qty"]  # FIXED: use actual executed qty, not recomputed
         current_price = price_lookup.get(s, entry_price)
-        position_value = round(capital / TOP_N, 0) if capital > 0 else 0
-        qty = int(position_value / entry_price) if entry_price > 0 else 0
+        position_value = round(qty * current_price, 0)  # FIXED: true mark-to-market
         pnl_pct = round((current_price / entry_price - 1) * 100, 2) if entry_price > 0 else 0
         gross_pnl_rs = qty * (current_price - entry_price)
         s_cost_est = sell_side_cost(qty * current_price) if qty > 0 else 0
@@ -560,15 +639,22 @@ def build_portfolio(universe_df):
 
     for s in pending_sell:
         entry_price = current_holdings[s]["entry_price"]
+        qty = current_holdings[s]["qty"]  # FIXED: use actual executed qty
         current_price = price_lookup.get(s, entry_price)
         pnl_pct = round((current_price / entry_price - 1) * 100, 2) if entry_price > 0 else 0
         rank_val = pool_rank_lookup.get(s, "")
+        gross_pnl_rs = qty * (current_price - entry_price)
+        s_cost_est = sell_side_cost(qty * current_price) if qty > 0 else 0
+        tax_est = estimate_stcg(gross_pnl_rs - s_cost_est)
         rows.append({
             "Action": "SELL", "Symbol": s, "Rank": rank_val,
             "Entry Price": entry_price, "Entry Date": current_holdings[s]["entry_date"],
-            "Current Price": current_price, "Qty": "", "Position Value (Rs)": "",
-            "P&L %": f"{pnl_pct}%", "Buy Cost (Rs)": "", "Sell Cost (Rs)": "",
-            "Est. STCG Tax (Rs)": "", "Blue Dot": "", "1Y RS Cross": "", "Green Dot": "",
+            "Current Price": current_price, "Qty": qty,
+            "Position Value (Rs)": round(qty * current_price, 0),
+            "P&L %": f"{pnl_pct}%", "Buy Cost (Rs)": "",
+            "Sell Cost (Rs)": round(s_cost_est, 2),
+            "Est. STCG Tax (Rs)": round(tax_est, 2),
+            "Blue Dot": "", "1Y RS Cross": "", "Green Dot": "",
         })
 
     n_port_rows_needed = len(rows) + 10
