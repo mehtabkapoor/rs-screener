@@ -671,8 +671,31 @@ def summarize(trade_df, equity_df, final_marked_value, final_liquidation_value):
 
 
 # ============================================================
-# GOOGLE SHEETS HELPERS (unchanged from prior version)
+# GOOGLE SHEETS HELPERS
 # ============================================================
+
+def get_or_create_worksheet(sh, title, rows=1000, cols=40):
+    """
+    Race-safe get-or-create.
+
+    FIX: sh.worksheet(title) can return "not found" from a stale
+    cached sheet list (e.g. if another run/process created the
+    sheet moments earlier). If add_worksheet() then fails because
+    the sheet genuinely already exists server-side, fall back to
+    fetching it instead of crashing.
+    """
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        pass
+
+    try:
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+    except gspread.exceptions.APIError as e:
+        if "already exists" in str(e):
+            return sh.worksheet(title)
+        raise
+
 
 def safe_update(ws, values, cell_range, label=""):
     for attempt in range(MAX_WRITE_RETRIES):
@@ -801,10 +824,7 @@ def write_to_sheet(trade_df, equity_df, top10_df, holdings_df, open_df, summary,
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
 
-    try:
-        ws = sh.worksheet(BACKTEST_WORKSHEET)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=BACKTEST_WORKSHEET, rows=1000, cols=40)
+    ws = get_or_create_worksheet(sh, BACKTEST_WORKSHEET, rows=1000, cols=40)
 
     remove_existing_charts(sh, ws.id)
 
@@ -998,4 +1018,3 @@ if __name__ == "__main__":
         print("\nBACKTEST FAILED")
         print(f"{type(e).__name__}: {e}")
         raise
-
