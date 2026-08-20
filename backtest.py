@@ -1,7 +1,7 @@
 """
-RS Screener Backtest - SIMPLIFIED MODEL
+RS Screener Backtest - SIMPLIFIED MODEL   (CORRECTED)
 
-RULES
+RULES  (UNCHANGED FROM ORIGINAL)
 -----
 Universe        : stocks.csv
 Price filter    : Price > Rs.20
@@ -28,6 +28,33 @@ This means the backtest automatically runs until the latest
 trading data actually available from Yahoo Finance.
 
 It does NOT assume today's date is the latest available date.
+
+============================================================
+ERROR FIXES IN THIS VERSION (no rule/logic changes)
+============================================================
+
+1. DATE/TIMEZONE NORMALIZATION ADDED:
+   OLD: Benchmark and stock price series were used as returned by
+        yfinance with no tz normalization. If the benchmark index
+        ends up tz-aware while a stock's index is tz-naive (or vice
+        versa), comparisons like
+            bench_close.index <= effective_end
+        and pd.concat(..., join="inner") can raise
+            TypeError: Cannot compare tz-naive and tz-aware timestamps
+        or silently return an empty/reduced intersection, corrupting
+        results for affected symbols without any error being logged.
+   NEW: All series are normalized to tz-naive, midnight-normalized
+        timestamps immediately after download, matching the same
+        safeguard already used in top10_rs_backtest.py.
+
+2. VOLUME REINDEX NaN FIX:
+   OLD: volume = volume.reindex(aligned.index)
+        left NaN wherever a stock's volume index didn't exactly
+        match the aligned price index, silently forcing the
+        `liquid` flag False for those rows (NaN > threshold is
+        False) even when trading did occur.
+   NEW: .fillna(0) added after reindex, matching the pattern
+        already used in rs_screener.py / top10_rs_backtest.py.
 """
 
 import time
@@ -50,8 +77,6 @@ BENCHMARK_FALLBACK = "^NSEI"
 
 STOCKS_FILE = "stocks.csv"
 
-# Download enough history to calculate 252-day indicators
-# plus the 200-day moving averages and 1-month slope.
 DOWNLOAD_YEARS_BEFORE_START = 3
 
 BACKTEST_START = "2016-04-01"
@@ -100,6 +125,24 @@ SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
 
 BACKTEST_WORKSHEET = "Backtest"
+
+
+# ============================================================
+# DATE NORMALIZATION  (NEW)
+# ============================================================
+
+def normalize_dates(index):
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    return idx.normalize()
+
+
+def normalize_series_index(series):
+    s = series.copy()
+    s.index = normalize_dates(s.index)
+    s = s[~s.index.duplicated(keep="last")]
+    return s.sort_index()
 
 
 # ============================================================
@@ -169,7 +212,7 @@ def load_tickers():
 
 def clean_price_series(close):
 
-    close = close.copy().sort_index()
+    close = normalize_series_index(close)
 
     pct_change = close.pct_change()
 
@@ -284,11 +327,7 @@ def download_benchmark():
             if isinstance(close, pd.DataFrame):
                 close = close.iloc[:, 0]
 
-            close = (
-                close
-                .dropna()
-                .sort_index()
-            )
+            close = normalize_series_index(close.dropna())
 
             if close.empty:
                 continue
@@ -329,6 +368,8 @@ def download_benchmark():
 # ============================================================
 
 def trend_template_series(s):
+
+    s = normalize_series_index(s)
 
     sma50 = s.rolling(50).mean()
 
@@ -397,6 +438,10 @@ def compute_signals_for_stock(
     bench_close
 ):
 
+    close = normalize_series_index(close)
+    volume = normalize_series_index(volume)
+    bench_close = normalize_series_index(bench_close)
+
     aligned = pd.concat(
         [close, bench_close],
         axis=1,
@@ -412,9 +457,7 @@ def compute_signals_for_stock(
         return None
 
 
-    volume = volume.reindex(
-        aligned.index
-    )
+    volume = volume.reindex(aligned.index).fillna(0)  # FIXED: was leaving NaN -> false liquidity flag
 
 
     # --------------------------------------------------------
@@ -580,6 +623,7 @@ def compute_signals_for_stock(
 
     })
 
+    out.index = normalize_dates(out.index)
 
     return out
 
@@ -608,6 +652,7 @@ def run_backtest(
 
     for date in trading_days:
 
+        date = pd.Timestamp(date).normalize()
 
         # ----------------------------------------------------
         # ELIGIBLE POOL
@@ -1080,7 +1125,7 @@ def run_backtest(
 
     if len(trading_days) and holdings:
 
-        last_date = trading_days[-1]
+        last_date = pd.Timestamp(trading_days[-1]).normalize()
 
 
         for sym, pos in holdings.items():
@@ -2806,7 +2851,7 @@ def main():
     benchmark_latest_date = (
         pd.Timestamp(
             bench_close.index.max()
-        )
+        ).normalize()
     )
 
 
@@ -2837,7 +2882,7 @@ def main():
 
             pd.Timestamp(
                 BACKTEST_END
-            ),
+            ).normalize(),
 
             benchmark_latest_date
 
@@ -2971,7 +3016,7 @@ def main():
                 bench_close.index >=
                 pd.Timestamp(
                     BACKTEST_START
-                )
+                ).normalize()
             )
 
             &
@@ -2982,6 +3027,12 @@ def main():
             )
 
         ]
+    )
+
+    trading_days = (
+        pd.DatetimeIndex(trading_days)
+        .drop_duplicates()
+        .sort_values()
     )
 
 
