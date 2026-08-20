@@ -166,6 +166,29 @@ def normalize_series_index(series):
     return s.sort_index()
 
 
+def get_or_create_worksheet(sh, title, rows=100, cols=10):
+    """
+    Race-safe get-or-create.
+
+    FIX: sh.worksheet(title) can return "not found" from a stale
+    cached sheet list. If add_worksheet() then fails because the
+    sheet genuinely already exists (e.g. a PREVIEW run and the EOD
+    run overlapping, or a retried GitHub Actions job), fall back
+    to fetching it instead of crashing.
+    """
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        pass
+
+    try:
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+    except gspread.exceptions.APIError as e:
+        if "already exists" in str(e):
+            return sh.worksheet(title)
+        raise
+
+
 def get_run_mode():
     event = os.environ.get("GITHUB_EVENT_NAME", "manual")
     force_eod = os.environ.get("FORCE_EOD", "false").strip().lower() == "true"
@@ -448,9 +471,16 @@ def read_config(sh):
         records = cfg_ws.get_all_records()
         settings = {row["Setting"]: row["Value"] for row in records if row.get("Setting")}
     except gspread.WorksheetNotFound:
-        cfg_ws = sh.add_worksheet(title=CONFIG_WORKSHEET, rows=10, cols=3)
-        cfg_ws.update([["Setting", "Value", "Notes"], ["Total Capital (INR)", 0, "EDIT ME"]], "A1")
-        settings = {"Total Capital (INR)": 0}
+        cfg_ws = get_or_create_worksheet(sh, CONFIG_WORKSHEET, rows=10, cols=3)
+        # cfg_ws may be a pre-existing sheet fetched via the race-safe
+        # fallback above — only seed defaults if it's actually empty.
+        existing_values = cfg_ws.get_all_values()
+        if not existing_values:
+            cfg_ws.update([["Setting", "Value", "Notes"], ["Total Capital (INR)", 0, "EDIT ME"]], "A1")
+            settings = {"Total Capital (INR)": 0}
+        else:
+            records = cfg_ws.get_all_records()
+            settings = {row["Setting"]: row["Value"] for row in records if row.get("Setting")}
     try:
         capital = float(settings.get("Total Capital (INR)", 0) or 0)
     except (ValueError, TypeError):
@@ -487,9 +517,21 @@ def apply_confirmed_executions(sh):
             for row in existing if row.get("symbol")
         }
     except gspread.WorksheetNotFound:
-        holdings_ws = sh.add_worksheet(title=HOLDINGS_WORKSHEET, rows=100, cols=5)
-        holdings_ws.update([HOLDINGS_HEADER], "A1")
-        holdings = {}
+        holdings_ws = get_or_create_worksheet(sh, HOLDINGS_WORKSHEET, rows=100, cols=5)
+        existing_values = holdings_ws.get_all_values()
+        if not existing_values:
+            holdings_ws.update([HOLDINGS_HEADER], "A1")
+            holdings = {}
+        else:
+            existing = holdings_ws.get_all_records()
+            holdings = {
+                row["symbol"]: {
+                    "entry_price": float(row.get("entry_price") or 0),
+                    "entry_date": row.get("entry_date", ""),
+                    "qty": int(row.get("qty") or 0),
+                }
+                for row in existing if row.get("symbol")
+            }
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     changed = False
@@ -564,9 +606,21 @@ def build_portfolio(universe_df):
             for row in existing if row.get("symbol")
         }
     except gspread.WorksheetNotFound:
-        holdings_ws = sh.add_worksheet(title=HOLDINGS_WORKSHEET, rows=100, cols=5)
-        holdings_ws.update([HOLDINGS_HEADER], "A1")
-        current_holdings = {}
+        holdings_ws = get_or_create_worksheet(sh, HOLDINGS_WORKSHEET, rows=100, cols=5)
+        existing_values = holdings_ws.get_all_values()
+        if not existing_values:
+            holdings_ws.update([HOLDINGS_HEADER], "A1")
+            current_holdings = {}
+        else:
+            existing = holdings_ws.get_all_records()
+            current_holdings = {
+                row["symbol"]: {
+                    "entry_price": float(row.get("entry_price") or 0),
+                    "entry_date": row.get("entry_date", ""),
+                    "qty": int(row.get("qty") or 0),
+                }
+                for row in existing if row.get("symbol")
+            }
 
     # Eligible universe = Price TT + RS TT
     pool = universe_df[
@@ -659,13 +713,10 @@ def build_portfolio(universe_df):
 
     n_port_rows_needed = len(rows) + 10
     n_port_cols_needed = len(PORTFOLIO_HEADER) + 2
-    try:
-        port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
-        if port_ws.row_count < n_port_rows_needed or port_ws.col_count < n_port_cols_needed:
-            port_ws.resize(rows=max(port_ws.row_count, n_port_rows_needed),
-                            cols=max(port_ws.col_count, n_port_cols_needed))
-    except gspread.WorksheetNotFound:
-        port_ws = sh.add_worksheet(title=PORTFOLIO_WORKSHEET, rows=n_port_rows_needed, cols=n_port_cols_needed)
+    port_ws = get_or_create_worksheet(sh, PORTFOLIO_WORKSHEET, rows=n_port_rows_needed, cols=n_port_cols_needed)
+    if port_ws.row_count < n_port_rows_needed or port_ws.col_count < n_port_cols_needed:
+        port_ws.resize(rows=max(port_ws.row_count, n_port_rows_needed),
+                        cols=max(port_ws.col_count, n_port_cols_needed))
 
     port_ws.clear()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
@@ -702,12 +753,9 @@ def write_to_sheet(df, run_mode="EOD"):
     n_cols_needed = len(df.columns) + 2 if len(df.columns) else 5
 
     sh = gc.open_by_key(sheet_id)
-    try:
-        ws = sh.worksheet(WORKSHEET_NAME)
-        if ws.row_count < n_rows_needed or ws.col_count < n_cols_needed:
-            ws.resize(rows=max(ws.row_count, n_rows_needed), cols=max(ws.col_count, n_cols_needed))
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=n_rows_needed, cols=n_cols_needed)
+    ws = get_or_create_worksheet(sh, WORKSHEET_NAME, rows=n_rows_needed, cols=n_cols_needed)
+    if ws.row_count < n_rows_needed or ws.col_count < n_cols_needed:
+        ws.resize(rows=max(ws.row_count, n_rows_needed), cols=max(ws.col_count, n_cols_needed))
 
     ws.clear()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
