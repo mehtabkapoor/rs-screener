@@ -5,11 +5,9 @@ RS SCREENER — DAILY TOP 10 RS BACKTEST  (CORRECTED)
 
 CHANGES FROM PRIOR VERSION
 ---------------------------
-1. EXIT RULE CHANGED:
-       OLD: retain holding while rank <= 15 (buffer)
-       NEW: retain holding ONLY while rank <= TOP_N (10)
-            i.e. EXIT the moment a stock is not in today's Top 10.
-       Implemented by setting EXIT_RANK = TOP_N.
+1. EXIT RULE: unchanged from original — EXIT_RANK = 15 (rank buffer
+   retained: a held stock exits only when its rank drops below 15,
+   not merely when it falls out of the Top 10 entry list).
 
 2. WEIGHT_PCT BUG FIXED:
        OLD: weight_pct was computed against a running partial sum
@@ -69,7 +67,7 @@ LOOKBACK_DAYS = 250
 MAX_PLAUSIBLE_DAILY_MOVE = 0.30
 
 TOP_N = 10
-EXIT_RANK = TOP_N  # CHANGED: exit the moment a stock is not in Top N (was 15)
+EXIT_RANK = 15  # retain holding while rank <= 15 (rank buffer above Top 10 entry)
 
 STARTING_CAPITAL = 1_000_000
 
@@ -382,7 +380,7 @@ def run_backtest(all_signals, trading_days):
             target_sell, target_buy_ranked = pending_target
 
             # --- SELLS ---
-            for sym in target_sell:
+            for sym, (exit_rank, exit_reason) in target_sell.items():
                 if sym not in holdings:
                     continue
                 df = all_signals[sym]
@@ -418,8 +416,8 @@ def run_backtest(all_signals, trading_days):
                     "net_pnl_rs": round(net_gain - tax, 2),
                     "net_return_pct": round(net_return_pct, 2),
                     "days_held": (date - pos["entry_date"]).days,
-                    "exit_reason": f"Not in Top {TOP_N}",
-                    "exit_rank": "",
+                    "exit_reason": exit_reason,
+                    "exit_rank": exit_rank if exit_rank is not None else "",
                 })
 
             # --- Portfolio value ahead of buys (post-sells) ---
@@ -467,11 +465,15 @@ def run_backtest(all_signals, trading_days):
         pool, rank_lookup, diagnostics = build_pool(all_signals, date)
         target_top10 = [sym for sym, _ in pool[:TOP_N]]
 
-        # Determine sells for tomorrow: currently held but rank > EXIT_RANK (i.e. not in Top N)
-        sells_for_tomorrow = [
-            sym for sym in holdings.keys()
-            if rank_lookup.get(sym) is None or rank_lookup.get(sym) > EXIT_RANK
-        ]
+        # Determine sells for tomorrow: currently held but rank > EXIT_RANK, or dropped
+        # out of the eligible universe entirely.
+        sells_for_tomorrow = {}
+        for sym in holdings.keys():
+            r = rank_lookup.get(sym)
+            if r is None:
+                sells_for_tomorrow[sym] = (None, "Left eligible universe")
+            elif r > EXIT_RANK:
+                sells_for_tomorrow[sym] = (r, f"Rank > {EXIT_RANK}")
         pending_target = (sells_for_tomorrow, target_top10)
 
         # ----------------------------------------------------
