@@ -63,7 +63,8 @@ STCG_EFFECTIVE_RATE = STCG_RATE * (1 + STCG_CESS)
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
 
-BACKTEST_WORKSHEET = "rs top 10 backtest"
+# Worksheet name
+BACKTEST_WORKSHEET = "top 10 rs"
 
 # ============================================================
 # DATE NORMALIZATION
@@ -309,6 +310,8 @@ def run_backtest(all_signals, trading_days):
             portfolio_value += pos["qty"] * price
 
         # 5. Entry Logic (Fill empty slots)
+        # If a stock exits (drops to 9), this calculates slots_open = 1
+        # and buys the next best stock from the top 10 list.
         slots_open = TOP_N - len(holdings)
         if slots_open > 0:
             slot_capital = portfolio_value / TOP_N
@@ -394,7 +397,7 @@ def run_backtest(all_signals, trading_days):
     return trade_df, equity_df, open_df, final_marked_value, final_liquidation_value
 
 # ============================================================
-# SUMMARY & SHEETS OUTPUT (Abbreviated for brevity)
+# SUMMARY
 # ============================================================
 
 def summarize(trade_df, equity_df, final_marked_value, final_liquidation_value):
@@ -446,6 +449,129 @@ def summarize(trade_df, equity_df, final_marked_value, final_liquidation_value):
         "Total STCG Tax Paid (Rs)": total_tax_rs,
     }
 
+# ============================================================
+# HELPER FUNCTIONS FOR GOOGLE SHEETS
+# ============================================================
+
+def get_or_create_worksheet(sh, title, rows=1000, cols=16):
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        pass
+    try:
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+    except gspread.exceptions.APIError as e:
+        if "already exists" in str(e):
+            return sh.worksheet(title)
+        raise
+
+def write_in_chunks(ws, all_rows, start_row, chunk_size, label):
+    total = len(all_rows)
+    if total == 0:
+        return
+    for i in range(0, total, chunk_size):
+        chunk = all_rows[i:i + chunk_size]
+        row_start = start_row + i
+        try:
+            ws.update(chunk, f"A{row_start}")
+        except Exception as e:
+            print(f"Write failed for {label} rows {i}-{i+len(chunk)}, retrying once: {e}")
+            time.sleep(5)
+            try:
+                ws.update(chunk, f"A{row_start}")
+            except Exception as e2:
+                print(f"RETRY FAILED for {label} rows {i}-{i+len(chunk)}: {e2}")
+                raise
+        print(f"Wrote {label}: {min(i + chunk_size, total)}/{total} rows")
+
+def remove_existing_charts(sh, sheet_id):
+    try:
+        meta = sh.fetch_sheet_metadata()
+        requests = []
+        for sheet in meta.get("sheets", []):
+            if sheet["properties"]["sheetId"] == sheet_id:
+                for chart in sheet.get("charts", []):
+                    requests.append({"deleteEmbeddedObject": {"objectId": chart["chartId"]}})
+        if requests:
+            sh.batch_update({"requests": requests})
+            print(f"Removed {len(requests)} existing chart(s).")
+    except Exception as e:
+        print(f"Could not check/remove existing charts (non-fatal): {e}")
+
+def add_charts(sh, sheet_id, equity_header_row_0idx, n_equity_rows):
+    data_end_row = equity_header_row_0idx + 1 + n_equity_rows
+
+    def make_chart(title, y_col_idx, y_axis_title, anchor_row):
+        return {
+            "addChart": {
+                "chart": {
+                    "spec": {
+                        "title": title,
+                        "basicChart": {
+                            "chartType": "LINE",
+                            "legendPosition": "NO_LEGEND",
+                            "axis": [
+                                {"position": "BOTTOM_AXIS", "title": "Date"},
+                                {"position": "LEFT_AXIS", "title": y_axis_title}
+                            ],
+                            "domains": [{
+                                "domain": {
+                                    "sourceRange": {
+                                        "sources": [{
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": equity_header_row_0idx,
+                                            "endRowIndex": data_end_row,
+                                            "startColumnIndex": 0,
+                                            "endColumnIndex": 1,
+                                        }]
+                                    }
+                                }
+                            }],
+                            "series": [{
+                                "series": {
+                                    "sourceRange": {
+                                        "sources": [{
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": equity_header_row_0idx,
+                                            "endRowIndex": data_end_row,
+                                            "startColumnIndex": y_col_idx,
+                                            "endColumnIndex": y_col_idx + 1,
+                                        }]
+                                    }
+                                },
+                                "targetAxis": "LEFT_AXIS",
+                            }],
+                        },
+                    },
+                    "position": {
+                        "overlayPosition": {
+                            "anchorCell": {
+                                "sheetId": sheet_id,
+                                "rowIndex": anchor_row,
+                                "columnIndex": 8,
+                            },
+                            "widthPixels": 650,
+                            "heightPixels": 380,
+                        }
+                    },
+                }
+            }
+        }
+
+    requests = [
+        make_chart("Equity Curve (Rs)", 1, "Portfolio Value (Rs)", equity_header_row_0idx),
+        make_chart("Drawdown (%)", 5, "Drawdown %", equity_header_row_0idx + 22),
+    ]
+    try:
+        sh.batch_update({"requests": requests})
+        print("Equity and drawdown charts added.")
+    except Exception as e:
+        print(f"Could not add charts (non-fatal): {e}")
+
+# ============================================================
+# WRITE RESULTS TO GOOGLE SHEETS
+# ============================================================
+
 def write_to_sheet(trade_df, equity_df, open_df, summary, effective_end_str):
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
@@ -465,18 +591,72 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, effective_end_str):
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
     
-    ws = sh.worksheet(BACKTEST_WORKSHEET) if BACKTEST_WORKSHEET in [s.title for s in sh.worksheets()] else sh.add_worksheet(BACKTEST_WORKSHEET, 1000, 16)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
+
+    n_rows_needed = len(trade_df) + len(equity_df) + len(open_df) + len(summary) + 60
+    n_cols_needed = 16
+
+    ws = get_or_create_worksheet(sh, BACKTEST_WORKSHEET, rows=n_rows_needed, cols=n_cols_needed)
+    if ws.row_count < n_rows_needed or ws.col_count < n_cols_needed:
+        ws.resize(rows=max(ws.row_count, n_rows_needed), cols=max(ws.col_count, n_cols_needed))
+
+    remove_existing_charts(sh, ws.id)
     ws.clear()
 
-    ws.update([["RS TOP 10 BACKTEST", f"Window: {BACKTEST_START} to {effective_end_str}"]], "A1")
-    ws.update([["Summary", ""]], "A3")
-    ws.update([[k, v] for k, v in summary.items()], "A4")
-    
-    ws.update([["Trade Log"]], f"A{3 + len(summary) + 2}")
-    if not trade_df.empty:
-        ws.update([list(trade_df.columns)] + trade_df.values.tolist(), f"A{3 + len(summary) + 3}")
+    # Header
+    ws.update([[
+        "TOP 10 RS BACKTEST | "
+        f"run {timestamp} | "
+        "NET of costs+STCG | "
+        f"Capital: Rs.{STARTING_CAPITAL:,.0f} | "
+        "Entry: Top 10 Raw RS | "
+        "Exit: RS rank > 10 | "
+        f"Window: {BACKTEST_START} to {effective_end_str}"
+    ]], "A1")
 
-    print(f"Backtest results written to '{BACKTEST_WORKSHEET}' tab.")
+    # Summary
+    summary_rows = [["Summary", ""]] + [[k, v] for k, v in summary.items()]
+    ws.update(summary_rows, "A3")
+
+    # Trade Log
+    trade_start_row = 3 + len(summary_rows) + 2
+    ws.update([["Trade Log"]], f"A{trade_start_row}")
+    trade_header_row = trade_start_row + 1
+    if not trade_df.empty:
+        write_in_chunks(
+            ws,
+            [list(trade_df.columns)] + trade_df.values.tolist(),
+            start_row=trade_header_row,
+            chunk_size=2000,
+            label="trade log"
+        )
+
+    # Open Positions
+    open_start_row = trade_header_row + len(trade_df) + 3
+    ws.update([["Open Positions at Backtest End (mark-to-market)"]], f"A{open_start_row}")
+    open_header_row = open_start_row + 1
+    if not open_df.empty:
+        ws.update(
+            [list(open_df.columns)] + open_df.values.tolist(),
+            f"A{open_header_row}"
+        )
+
+    # Equity Curve
+    equity_start_row = open_header_row + max(len(open_df), 1) + 3
+    ws.update([["Daily Equity Curve"]], f"A{equity_start_row}")
+    equity_header_row = equity_start_row + 1
+    
+    if not equity_df.empty:
+        write_in_chunks(
+            ws,
+            [list(equity_df.columns)] + equity_df.values.tolist(),
+            start_row=equity_header_row,
+            chunk_size=2000,
+            label="equity curve"
+        )
+        add_charts(sh, ws.id, equity_header_row - 1, len(equity_df))
+
+    print(f"\nBacktest results written to '{BACKTEST_WORKSHEET}' tab: {len(trade_df)} trades, {len(equity_df)} trading days, {len(open_df)} open positions.")
 
 # ============================================================
 # MAIN
