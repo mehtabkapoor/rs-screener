@@ -132,7 +132,7 @@ STCG_EFFECTIVE_RATE = STCG_RATE * (1 + STCG_CESS)
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
 
-BACKTEST_WORKSHEET = "Backtest"
+BACKTEST_WORKSHEET = "Backtest - RS Top10"
 
 
 # ============================================================
