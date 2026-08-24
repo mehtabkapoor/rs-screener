@@ -101,6 +101,12 @@ RS_12M = 252
 
 TOP_N = 10
 
+# If a held stock goes this many consecutive trading days with
+# no price data (halt, delisting, corporate action, feed gap),
+# force-liquidate it at its last known price instead of holding
+# it indefinitely. See STEP 2 in run_backtest().
+STALE_EXIT_DAYS = 10
+
 STARTING_CAPITAL = 1_000_000
 
 # Maximum plausible daily price movement.
@@ -541,14 +547,18 @@ def build_daily_ranking(
 
 def run_backtest(
     all_stocks,
-    trading_days
+    trading_days,
+    stale_exit_days=STALE_EXIT_DAYS
 ):
 
     cash = float(
         STARTING_CAPITAL
     )
 
-    # holdings[symbol] = {qty, entry_price, entry_date, entry_cost}
+    # holdings[symbol] = {
+    #     qty, entry_price, entry_date, entry_cost,
+    #     last_price, last_price_date, stale_days
+    # }
     holdings = {}
 
     trade_log = []
@@ -585,6 +595,196 @@ def run_backtest(
         )
 
         # ====================================================
+        # STEP 1B                                *** ADDED ***
+        # STALE-DATA TRACKING + FORCE EXIT
+        #
+        # A held stock can go missing from the daily price feed
+        # (halt, delisting, corporate action, data gap) without
+        # ever showing up again in build_daily_ranking(). Left
+        # alone, STEP 2 below would then skip it forever (it can
+        # never get a valid exit_price), freezing that slot
+        # indefinitely -- this is what produced the "stuck since
+        # Sept 2025" position. Force-liquidate at the last known
+        # price once a holding has been stale for
+        # STALE_EXIT_DAYS consecutive trading days, and free the
+        # slot for genuine top-10 candidates.
+        # ====================================================
+
+        for symbol, position in holdings.items():
+
+            row = get_row(
+                all_stocks[symbol],
+                date
+            )
+
+            if row is not None:
+
+                position["last_price"] = float(
+                    row["price"]
+                )
+
+                position["last_price_date"] = date
+
+                position["stale_days"] = 0
+
+            else:
+
+                position["stale_days"] = (
+                    position.get("stale_days", 0)
+                    + 1
+                )
+
+        stale_exit_symbols = [
+            symbol
+            for symbol, position in holdings.items()
+            if position.get("stale_days", 0) >= stale_exit_days
+        ]
+
+        for symbol in sorted(stale_exit_symbols):
+
+            position = holdings.pop(
+                symbol
+            )
+
+            exit_price = float(
+                position["last_price"]
+            )
+
+            qty = position["qty"]
+
+            gross_proceeds = (
+                qty * exit_price
+            )
+
+            sell_cost = sell_side_cost(
+                gross_proceeds
+            )
+
+            net_proceeds = (
+                gross_proceeds
+                - sell_cost
+            )
+
+            cost_basis = (
+                qty * position["entry_price"]
+                +
+                position["entry_cost"]
+            )
+
+            net_gain = (
+                net_proceeds
+                - cost_basis
+            )
+
+            tax = stcg_tax(
+                net_gain
+            )
+
+            cash += (
+                net_proceeds
+                - tax
+            )
+
+            gross_return_pct = (
+                exit_price
+                /
+                position["entry_price"]
+                - 1
+            ) * 100
+
+            net_pnl = (
+                net_gain
+                - tax
+            )
+
+            net_return_pct = (
+                net_pnl
+                /
+                cost_basis
+                * 100
+            ) if cost_basis > 0 else 0
+
+            trade_log.append({
+
+                "symbol": symbol,
+
+                "entry_date":
+                    position["entry_date"]
+                    .strftime("%Y-%m-%d"),
+
+                "exit_date":
+                    date.strftime("%Y-%m-%d"),
+
+                "qty": qty,
+
+                "entry_price":
+                    round(
+                        position["entry_price"],
+                        4
+                    ),
+
+                "exit_price":
+                    round(
+                        exit_price,
+                        4
+                    ),
+
+                "gross_return_pct":
+                    round(
+                        gross_return_pct,
+                        2
+                    ),
+
+                "buy_cost_rs":
+                    round(
+                        position["entry_cost"],
+                        2
+                    ),
+
+                "sell_cost_rs":
+                    round(
+                        sell_cost,
+                        2
+                    ),
+
+                "stcg_tax_rs":
+                    round(
+                        tax,
+                        2
+                    ),
+
+                "net_pnl_rs":
+                    round(
+                        net_pnl,
+                        2
+                    ),
+
+                "net_return_pct":
+                    round(
+                        net_return_pct,
+                        2
+                    ),
+
+                "days_held":
+                    (
+                        date
+                        -
+                        position["entry_date"]
+                    ).days,
+
+                "action":
+                    "EXIT",
+
+                "exit_reason":
+                    f"STALE_DATA_FORCE_EXIT "
+                    f"(no price for "
+                    f"{stale_exit_days}+ days, "
+                    f"marked at last known price "
+                    f"{position['last_price_date'].strftime('%Y-%m-%d')})"
+
+            })
+
+        # ====================================================
         # STEP 2
         # EXIT -- SELL HOLDINGS NO LONGER IN TODAY'S TOP 10
         # ====================================================
@@ -603,8 +803,9 @@ def run_backtest(
             )
 
             if row is None:
-                # No price today. Keep position, try again
-                # on the next trading day (unchanged behavior).
+                # No price today but not yet past the stale
+                # threshold (STEP 1B handles the permanent-gap
+                # case). Keep position, try again next day.
                 continue
 
             exit_price = float(
@@ -738,7 +939,10 @@ def run_backtest(
                     ).days,
 
                 "action":
-                    "EXIT"
+                    "EXIT",
+
+                "exit_reason":
+                    "TOP10_DROP"
 
             })
 
@@ -759,7 +963,12 @@ def run_backtest(
             mark_price = (
                 float(row["price"])
                 if row is not None
-                else float(position["entry_price"])
+                else float(
+                    position.get(
+                        "last_price",
+                        position["entry_price"]
+                    )
+                )
             )
 
             portfolio_value += (
@@ -848,7 +1057,13 @@ def run_backtest(
 
                     "entry_date": date,
 
-                    "entry_cost": buy_cost
+                    "entry_cost": buy_cost,
+
+                    "last_price": price,
+
+                    "last_price_date": date,
+
+                    "stale_days": 0
 
                 }
 
@@ -892,7 +1107,9 @@ def run_backtest(
                     "days_held": "",
 
                     "action":
-                        "ENTRY"
+                        "ENTRY",
+
+                    "exit_reason": ""
 
                 })
 
@@ -920,8 +1137,14 @@ def run_backtest(
 
             else:
 
+                # No price today; mark at the last known
+                # traded price (tracked in STEP 1B) rather
+                # than the stale original entry price.
                 mark_price = float(
-                    position["entry_price"]
+                    position.get(
+                        "last_price",
+                        position["entry_price"]
+                    )
                 )
 
             market_value = (
@@ -970,7 +1193,13 @@ def run_backtest(
                 ),
 
             "n_holdings":
-                len(holdings)
+                len(holdings),
+
+            "eligible_pool_size":
+                len(ranking),
+
+            "top10_target_size":
+                len(today_top10)
 
         })
 
@@ -1085,7 +1314,10 @@ def run_backtest(
             else:
 
                 exit_price = float(
-                    position["entry_price"]
+                    position.get(
+                        "last_price",
+                        position["entry_price"]
+                    )
                 )
 
             gross_proceeds = (
@@ -1804,7 +2036,8 @@ def remove_existing_charts(
 # (ported from backtest.py; column indices adjusted for this
 # script's equity_df layout: date(0), portfolio_value_rs(1),
 # cash_rs(2), invested_value_rs(3), equity_multiple(4),
-# n_holdings(5), drawdown_pct(6))
+# n_holdings(5), eligible_pool_size(6), top10_target_size(7),
+# drawdown_pct(8))
 # ============================================================
 
 def add_charts(
@@ -1953,9 +2186,16 @@ def add_charts(
 
         make_chart(
             "Drawdown (%)",
-            6,
+            8,
             "Drawdown %",
             equity_header_row_0idx + 22
+        ),
+
+        make_chart(
+            "Eligible Pool Size vs Top-10 Target",
+            6,
+            "Stock Count",
+            equity_header_row_0idx + 44
         ),
 
     ]
