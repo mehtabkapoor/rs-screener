@@ -1,21 +1,23 @@
 """
-RS SCREENER - MINERVINI TREND TEMPLATE + RS   (CORRECTED)
+RS SCREENER - PURE RS TOP-10   (MODIFIED)
 
 ============================================================
-CORE SCREEN  (RULES UNCHANGED FROM ORIGINAL)
+CORE RULES (CHANGED FROM PRIOR VERSION)
 ============================================================
 
 PRICE
 ------
-Price > Rs.20
+Price > Rs.20   (tradability floor, not a trend-template rule)
 
 LIQUIDITY
 ---------
-20-day average volume > 100,000 shares
+20-day average volume > 100,000 shares   (tradability floor)
 
-PRICE TREND TEMPLATE
---------------------
-7/7 Minervini Trend Template
+ELIGIBILITY
+-----------
+NONE. No Price Trend Template. No RS Trend Template. Every stock in
+stocks.csv that clears the two tradability floors above gets an RS
+score and a rank. That's the entire eligible pool.
 
 RS
 --
@@ -25,25 +27,36 @@ RS Score:
     20% 9-month return
     20% 12-month return
 
-RS Line Trend Template
-----------------------
-Same 7/7 Trend Template logic applied to
-relative-strength line = Stock / Benchmark
-
 RANKING
 -------
-Eligible stocks ranked by raw RS Score descending.
+Whole eligible universe ranked by raw RS Score descending.
 
 PORTFOLIO
 ---------
-Top 10
-Equal weight
-Daily EOD rebalance
+Top 10, equal weight at time of purchase only (no daily reweighting
+of positions already held).
 
 EXIT
 ----
-Sell when RS rank drops greater than 15
-(i.e. rank > 15 among the current eligible universe).
+Sell a held stock the day its rank falls outside the top 10
+(rank > 10), or it drops out of the eligible pool entirely.
+No buffer. (Prior EXIT_RANK=15 buffer has been removed.)
+
+REBALANCE / FUNDING RULE
+-------------------------
+- Stocks already held that are still ranked 1-10: left exactly as is.
+  No trim, no top-up, no reweight.
+- Stocks that exit today: sold. Net proceeds (sale value minus
+  sell-side cost) are pooled into a single "freed cash" amount for
+  the day.
+- New entrants (top-10 names not already held) that fill those
+  exit-vacated slots: freed cash is split EQUALLY across all of
+  today's new entrants, regardless of which specific sale funded
+  which slot.
+- Exception: if a slot is open with no corresponding exit today
+  (day 1 cold start, or a portfolio that starts with fewer than 10
+  holdings), that slot falls back to the fixed sizing used
+  previously: Total Capital (from Config sheet) / TOP_N.
 
 NO:
 ----
@@ -51,41 +64,21 @@ VCP
 Volume dry-up
 Pivot / breakout volume
 Price stop
-Blue Dot entry
-Green Dot entry
+Price Trend Template
+RS Trend Template
 Regime filter
+EXIT_RANK buffer
 
-Blue Dot / 1Y RS Cross / Green Dot remain diagnostic.
+Blue Dot / 1Y RS Cross / Green Dot remain diagnostic-only columns —
+they do not affect entry, exit, or ranking.
 
 ============================================================
-ERROR FIXES IN THIS VERSION (no rule/logic changes)
+CARRIED OVER UNCHANGED FROM PRIOR VERSION
 ============================================================
-
-1. QTY PERSISTENCE BUG FIXED:
-   OLD: apply_confirmed_executions() stored only entry_price and
-        entry_date on a confirmed BUY — never the executed qty.
-        build_portfolio() then RECOMPUTED qty every run from
-        today's (capital / TOP_N) / entry_price, so "Position
-        Value (Rs)" for HOLD rows was a target allocation, not
-        true mark-to-market, and silently drifted from what was
-        actually bought whenever capital changed or your fill
-        differed from the suggested qty.
-   NEW: Holdings sheet gains a "qty" column. Confirmed BUY rows
-        store the executed qty (from the Portfolio tab's Qty
-        column). build_portfolio() uses that stored qty directly:
-            Position Value (Rs) = qty * current_price
-        No more silent re-derivation.
-
-2. DATE/TIMEZONE NORMALIZATION ADDED:
-   OLD: No normalization of yfinance's returned index. If a
-        stock's index and the benchmark's index differ in
-        tz-awareness, pd.concat(..., join="inner") can silently
-        return an empty/reduced intersection. compute_diagnostics()
-        would then return None, and the stock would be silently
-        DROPPED from the entire screen with no error logged.
-   NEW: All price/volume series are normalized to tz-naive,
-        midnight-normalized timestamps before any join/concat,
-        matching the safeguard already used in the backtest files.
+- QTY PERSISTENCE FIX: Holdings sheet stores executed qty; positions
+  are marked-to-market from that stored qty, never re-derived.
+- DATE/TIMEZONE NORMALIZATION: all price/volume series normalized to
+  tz-naive, midnight-normalized timestamps before any join/concat.
 """
 
 import time
@@ -119,8 +112,7 @@ MIN_PRICE = 20
 MIN_AVG_VOLUME = 100_000
 VOLUME_LOOKBACK = 20
 
-TOP_N = 10
-EXIT_RANK = 15          # sell when rank > EXIT_RANK
+TOP_N = 10               # both portfolio size AND exit threshold now (rank > TOP_N = exit)
 INTRADAY_INTERVAL = "5m"
 
 STT_RATE = 0.001
@@ -149,7 +141,7 @@ HOLDINGS_HEADER = ["symbol", "entry_price", "entry_date", "qty"]
 
 
 # ============================================================
-# DATE NORMALIZATION  (NEW)
+# DATE NORMALIZATION
 # ============================================================
 
 def normalize_dates(index):
@@ -168,13 +160,9 @@ def normalize_series_index(series):
 
 def get_or_create_worksheet(sh, title, rows=100, cols=10):
     """
-    Race-safe get-or-create.
-
-    FIX: sh.worksheet(title) can return "not found" from a stale
-    cached sheet list. If add_worksheet() then fails because the
-    sheet genuinely already exists (e.g. a PREVIEW run and the EOD
-    run overlapping, or a retried GitHub Actions job), fall back
-    to fetching it instead of crashing.
+    Race-safe get-or-create. If add_worksheet() fails because the sheet
+    genuinely already exists (overlapping runs / retried Action), fall
+    back to fetching it instead of crashing.
     """
     try:
         return sh.worksheet(title)
@@ -268,7 +256,6 @@ def fetch_intraday_last_price(tickers):
 def append_preview_price(close_series, live_price):
     if live_price is None:
         return close_series
-    # close_series is already tz-naive normalized midnight timestamps
     today = pd.Timestamp.now().normalize()
     last_date = close_series.index[-1].normalize()
     if last_date == today:
@@ -295,32 +282,9 @@ def compute_rs_score(close_series):
     return round(score * 100, 2)
 
 
-def compute_trend_template(series):
-    if len(series) < 273:
-        return None
-    price = series.iloc[-1]
-    sma50 = series.rolling(50).mean().iloc[-1]
-    sma150 = series.rolling(150).mean().iloc[-1]
-    sma200_series = series.rolling(200).mean()
-    sma200 = sma200_series.iloc[-1]
-    sma200_1mo_ago = sma200_series.iloc[-21]
-    if any(pd.isna(x) for x in [sma50, sma150, sma200, sma200_1mo_ago]):
-        return None
-    low_52w = series.tail(252).min()
-    high_52w = series.tail(252).max()
-    criteria = [
-        price > sma150 and price > sma200,
-        sma150 > sma200,
-        sma200 > sma200_1mo_ago,
-        sma50 > sma150 and sma50 > sma200,
-        price > sma50,
-        price >= 1.25 * low_52w,
-        price >= 0.75 * high_52w,
-    ]
-    return sum(criteria) == 7
-
-
 def compute_diagnostics(stock_close, bench_close):
+    """Blue Dot / Green Dot / 1Y RS Cross -- diagnostic only, does not
+    gate entry, exit, or ranking."""
     df = pd.concat([stock_close, bench_close], axis=1, join="inner")
     df.columns = ["stock", "bench"]
     df = df.dropna()
@@ -379,28 +343,15 @@ def main():
                 if rs_score is None:
                     continue
 
-                tt_pass = compute_trend_template(close)
-
-                aligned = pd.concat([close, bench_close], axis=1, join="inner").dropna()
-                aligned.columns = ["s", "b"]
-                rs_ratio_full = aligned["s"] / aligned["b"]
-                rs_tt_pass = compute_trend_template(rs_ratio_full)
-
+                # Diagnostic-only, does not affect eligibility or ranking
                 diagnostics = compute_diagnostics(close, bench_close)
-                if diagnostics is None:
-                    continue
-                blue_dot, green_dot = diagnostics
-
-                screen_pass = (tt_pass is True and rs_tt_pass is True)
+                blue_dot, green_dot = diagnostics if diagnostics is not None else (False, False)
 
                 all_stocks.append({
                     "symbol": symbol.replace(".NS", ""),
                     "rs_score": rs_score,
                     "last_close": round(last_price, 2),
                     "avg20_volume": round(float(avg20_volume), 0),
-                    "tt_pass": tt_pass,
-                    "rs_tt_pass": rs_tt_pass,
-                    "screen_pass": screen_pass,
                     "blue_dot": blue_dot,
                     "one_year_rs_cross": blue_dot,
                     "green_dot": green_dot,
@@ -418,22 +369,14 @@ def main():
 
     universe_df = pd.DataFrame(all_stocks)
 
-    universe_df["tt_pass_label"] = universe_df["tt_pass"].map({True: "PASS", False: "FAIL", None: "N/A"})
-    universe_df["rs_tt_pass_label"] = universe_df["rs_tt_pass"].map({True: "PASS", False: "FAIL", None: "N/A"})
-    universe_df["screen_label"] = universe_df["screen_pass"].map({True: "PASS", False: "FAIL"})
     universe_df["blue_dot_label"] = universe_df["blue_dot"].map({True: "YES", False: ""})
     universe_df["one_year_rs_cross_label"] = universe_df["one_year_rs_cross"].map({True: "YES", False: ""})
     universe_df["green_dot_label"] = universe_df["green_dot"].map({True: "YES", False: ""})
 
     results_df = universe_df[[
         "symbol", "rs_score", "last_close", "avg20_volume",
-        "tt_pass_label", "rs_tt_pass_label",
-        "screen_label",
         "blue_dot_label", "one_year_rs_cross_label", "green_dot_label",
     ]].rename(columns={
-        "tt_pass_label": "price_trend_template",
-        "rs_tt_pass_label": "rs_trend_template",
-        "screen_label": "screen",
         "blue_dot_label": "blue_dot",
         "one_year_rs_cross_label": "one_year_rs_cross",
         "green_dot_label": "green_dot",
@@ -443,17 +386,9 @@ def main():
     results_df["rank"] = range(1, len(results_df) + 1)
     results_df = results_df[["rank"] + [c for c in results_df.columns if c != "rank"]]
 
-    n_tt_pass = (universe_df["tt_pass"] == True).sum()
-    n_rs_tt_pass = (universe_df["rs_tt_pass"] == True).sum()
-    n_screen = (universe_df["screen_pass"] == True).sum()
-    n_both_tt = universe_df[(universe_df["tt_pass"] == True) & (universe_df["rs_tt_pass"] == True)].shape[0]
-
     print("========================================")
-    print(f"Universe scanned: {len(universe_df)}")
-    print(f"Price TT PASS: {n_tt_pass}")
-    print(f"RS TT PASS: {n_rs_tt_pass}")
-    print(f"Both TT PASS: {n_both_tt}")
-    print(f"FINAL SCREEN PASS: {n_screen}")
+    print(f"Universe scanned (eligible, no TT gate): {len(universe_df)}")
+    print(f"Top {TOP_N} by RS score: {results_df.head(TOP_N)['symbol'].tolist()}")
     print("========================================")
 
     write_to_sheet(results_df, run_mode)
@@ -472,8 +407,6 @@ def read_config(sh):
         settings = {row["Setting"]: row["Value"] for row in records if row.get("Setting")}
     except gspread.WorksheetNotFound:
         cfg_ws = get_or_create_worksheet(sh, CONFIG_WORKSHEET, rows=10, cols=3)
-        # cfg_ws may be a pre-existing sheet fetched via the race-safe
-        # fallback above — only seed defaults if it's actually empty.
         existing_values = cfg_ws.get_all_values()
         if not existing_values:
             cfg_ws.update([["Setting", "Value", "Notes"], ["Total Capital (INR)", 0, "EDIT ME"]], "A1")
@@ -490,10 +423,9 @@ def read_config(sh):
 
 def apply_confirmed_executions(sh):
     """
-    FIXED: confirmed BUY rows now persist the executed qty
-    (read from the Portfolio tab's Qty column) into the Holdings
-    sheet, instead of storing only entry_price/entry_date and
-    letting build_portfolio() silently re-derive qty later.
+    Confirmed BUY rows persist the executed qty (read from the Portfolio
+    tab's Qty column) into the Holdings sheet. Positions are always
+    marked-to-market from that stored qty, never re-derived.
     """
     try:
         port_ws = sh.worksheet(PORTFOLIO_WORKSHEET)
@@ -579,6 +511,20 @@ def apply_confirmed_executions(sh):
 
 
 def build_portfolio(universe_df):
+    """
+    Rule set:
+    - Pool = entire eligible universe (no TT gate), ranked by rs_score desc.
+    - kept: currently-held symbols still ranked 1..TOP_N -> untouched.
+    - pending_sell: currently-held symbols ranked > TOP_N or dropped out
+      of the pool entirely -> sold; net proceeds pooled as freed_cash.
+    - pending_buy: top-ranked symbols not currently held, filling
+      exactly (TOP_N - len(kept)) slots.
+      * exit_slots = min(slots_open, len(pending_sell)) of those buys
+        are funded by freed_cash split equally across exit_slots buys.
+      * any remaining slots_open beyond that (cold start / portfolio
+        starting with < TOP_N holdings) fall back to fixed sizing:
+        Total Capital (Config) / TOP_N.
+    """
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
     if not sheet_id or not creds_json:
@@ -622,43 +568,63 @@ def build_portfolio(universe_df):
                 for row in existing if row.get("symbol")
             }
 
-    # Eligible universe = Price TT + RS TT
-    pool = universe_df[
-        (universe_df["tt_pass"] == True) & (universe_df["rs_tt_pass"] == True)
-    ].copy()
-
-    pool = pool.sort_values("rs_score", ascending=False).reset_index(drop=True)
+    # Pool = entire eligible universe, no TT gate
+    pool = universe_df.sort_values("rs_score", ascending=False).reset_index(drop=True)
     pool["rank"] = range(1, len(pool) + 1)
     pool_rank_lookup = dict(zip(pool["symbol"], pool["rank"]))
     price_lookup = dict(zip(universe_df["symbol"], universe_df["last_close"]))
     diag_lookup = {row["symbol"]: row for _, row in universe_df.iterrows()}
 
-    # Target buys = Top N
-    target_topN = set(pool.head(TOP_N)["symbol"].tolist())
-
-    # Keep existing holdings that still rank <= EXIT_RANK
+    # --- Split holdings into kept vs exiting, strict top-TOP_N, no buffer ---
     kept = []
     pending_sell = []
     for s in current_holdings:
         rank = pool_rank_lookup.get(s)
-        if rank is not None and rank <= EXIT_RANK:
+        if rank is not None and rank <= TOP_N:
             kept.append(s)
         else:
-            pending_sell.append(s)
+            pending_sell.append(s)  # rank > TOP_N, or dropped out of pool entirely
 
     slots_open = TOP_N - len(kept)
     pending_buy = ([s for s in pool.head(TOP_N)["symbol"].tolist() if s not in current_holdings][:slots_open]
                     if slots_open > 0 else [])
-    slot_capital = capital / TOP_N if capital > 0 else 0
+
+    # --- Compute freed cash from today's exits (net of sell-side cost) ---
+    freed_cash = 0.0
+    sell_rows_cache = {}
+    for s in pending_sell:
+        entry_price = current_holdings[s]["entry_price"]
+        qty = current_holdings[s]["qty"]
+        current_price = price_lookup.get(s, entry_price)
+        sale_value = qty * current_price
+        s_cost_est = sell_side_cost(sale_value) if qty > 0 else 0
+        net_proceeds = sale_value - s_cost_est
+        freed_cash += net_proceeds
+        sell_rows_cache[s] = (entry_price, qty, current_price, s_cost_est)
+
+    # --- Allocate funding: exit-funded slots first (equal split of freed_cash),
+    #     then any leftover slots fall back to fixed Config-capital sizing ---
+    exit_slots = min(slots_open, len(pending_sell))
+    non_exit_slots = slots_open - exit_slots
+    per_exit_slot_cash = (freed_cash / exit_slots) if exit_slots > 0 else 0.0
+    fixed_slot_cash = (capital / TOP_N) if capital > 0 else 0
+
+    buy_funding = {}
+    for idx, s in enumerate(pending_buy):
+        if idx < exit_slots:
+            buy_funding[s] = per_exit_slot_cash
+        else:
+            buy_funding[s] = fixed_slot_cash
 
     rows = []
 
+    # HOLD rows: unchanged, no reweighting
     for s in kept:
         entry_price = current_holdings[s]["entry_price"]
         entry_date = current_holdings[s]["entry_date"]
-        qty = current_holdings[s]["qty"]  # FIXED: use actual executed qty, not recomputed
+        qty = current_holdings[s]["qty"]
         current_price = price_lookup.get(s, entry_price)
-        position_value = round(qty * current_price, 0)  # FIXED: true mark-to-market
+        position_value = round(qty * current_price, 0)
         pnl_pct = round((current_price / entry_price - 1) * 100, 2) if entry_price > 0 else 0
         gross_pnl_rs = qty * (current_price - entry_price)
         s_cost_est = sell_side_cost(qty * current_price) if qty > 0 else 0
@@ -675,9 +641,10 @@ def build_portfolio(universe_df):
             "Green Dot": ("YES" if diag.get("green_dot", False) else ""),
         })
 
+    # BUY rows: sized per buy_funding (freed cash split, or fixed slot fallback)
     for s in pending_buy:
         current_price = price_lookup.get(s, 0)
-        position_value = round(slot_capital, 0)
+        position_value = round(buy_funding.get(s, 0), 0)
         qty = int(position_value / current_price) if current_price > 0 else 0
         diag = diag_lookup.get(s, {})
         rows.append({
@@ -691,14 +658,12 @@ def build_portfolio(universe_df):
             "Green Dot": ("YES" if diag.get("green_dot", False) else ""),
         })
 
+    # SELL rows
     for s in pending_sell:
-        entry_price = current_holdings[s]["entry_price"]
-        qty = current_holdings[s]["qty"]  # FIXED: use actual executed qty
-        current_price = price_lookup.get(s, entry_price)
+        entry_price, qty, current_price, s_cost_est = sell_rows_cache[s]
         pnl_pct = round((current_price / entry_price - 1) * 100, 2) if entry_price > 0 else 0
-        rank_val = pool_rank_lookup.get(s, "")
+        rank_val = pool_rank_lookup.get(s, "")  # blank/absent if dropped out of pool entirely
         gross_pnl_rs = qty * (current_price - entry_price)
-        s_cost_est = sell_side_cost(qty * current_price) if qty > 0 else 0
         tax_est = estimate_stcg(gross_pnl_rs - s_cost_est)
         rows.append({
             "Action": "SELL", "Symbol": s, "Rank": rank_val,
@@ -723,17 +688,19 @@ def build_portfolio(universe_df):
     invested = sum(r.get("Position Value (Rs)", 0) for r in rows
                     if isinstance(r.get("Position Value (Rs)"), (int, float)))
     summary = (f"Last updated: {timestamp} | Capital: Rs.{capital:,.0f} | Deployed: Rs.{invested:,.0f} | "
-               f"Entry = Price TT + RS TT | Top {TOP_N} by RS Score | "
-               f"Exit = rank > {EXIT_RANK}")
-    if capital == 0:
+               f"No TT gate -- pure Top {TOP_N} by RS Score | "
+               f"Exit = rank > {TOP_N} (no buffer) | "
+               f"Freed cash today: Rs.{freed_cash:,.0f} split across {exit_slots} new buy(s)")
+    if capital == 0 and non_exit_slots > 0:
         summary += " | SET CAPITAL IN CONFIG"
     port_ws.update([[summary]], "A1")
 
     row_lists = [[r.get(col, "") for col in PORTFOLIO_HEADER] for r in rows]
     port_ws.update([PORTFOLIO_HEADER] + row_lists, "A3")
 
-    print(f"Portfolio updated: {len(kept)} held, {len(pending_buy)} BUY, "
-          f"{len(pending_sell)} SELL. Capital: Rs.{capital:,.0f}")
+    print(f"Portfolio updated: {len(kept)} held, {len(pending_buy)} BUY "
+          f"({exit_slots} freed-cash-funded, {non_exit_slots} fixed-slot-funded), "
+          f"{len(pending_sell)} SELL. Capital: Rs.{capital:,.0f} | Freed cash: Rs.{freed_cash:,.0f}")
 
 
 def write_to_sheet(df, run_mode="EOD"):
@@ -760,7 +727,7 @@ def write_to_sheet(df, run_mode="EOD"):
     ws.clear()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
     label = "PREVIEW (intraday, not final)" if run_mode == "PREVIEW" else "EOD FINAL"
-    ws.update([[f"Last updated: {timestamp} | {label} | Price TT + RS TT | Exit rank > {EXIT_RANK}"]], "A1")
+    ws.update([[f"Last updated: {timestamp} | {label} | No TT gate -- pure Top {TOP_N} by RS Score | Exit rank > {TOP_N}"]], "A1")
 
     header = list(df.columns)
     if header:
