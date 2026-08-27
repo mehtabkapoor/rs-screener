@@ -1562,55 +1562,89 @@ def run_backtest(
         )
 
         # ----------------------------------------------------
-        # DAILY % CHANGE COLUMN
+        # EQUITY CURVE, NORMALISED TO ZERO (%)
         #
-        # Day-over-day percentage change of the marked
-        # portfolio value. First row has no prior day, so it
-        # is left blank (NaN).
+        # Not day-over-day change -- this is the cumulative
+        # % move of the total portfolio value, rebased so the
+        # first point of the window reads 0%. Two versions:
+        #
+        # 1. equity_curve_pct_norm: rebased to the very first
+        #    trading day of the whole backtest (i.e. identical
+        #    information to equity_multiple, just expressed as
+        #    a % starting at 0 instead of a multiple starting
+        #    at 1).
+        #
+        # 2. equity_curve_pct_norm_last50: rebased to the
+        #    start of the last 50 trading days only, so the
+        #    last-50-days chart also starts its own line at
+        #    0%. Blank for all rows before that window.
         # ----------------------------------------------------
 
-        equity_df[
-            "daily_pct_change"
-        ] = (
-
+        first_value = float(
             equity_df[
                 "portfolio_value_rs"
-            ]
-            .pct_change()
+            ].iloc[0]
+        )
 
-        ) * 100
-
-        # Replace +/-inf (only possible if a prior day's
-        # value was exactly 0, which should not happen but
-        # is guarded against anyway) before rounding.
         equity_df[
-            "daily_pct_change"
+            "equity_curve_pct_norm"
         ] = (
-            equity_df[
-                "daily_pct_change"
-            ]
-            .replace(
-                [np.inf, -np.inf],
-                np.nan
+
+            (
+                equity_df[
+                    "portfolio_value_rs"
+                ]
+                / first_value
+                - 1
             )
+
+            * 100
+
+        ).round(3)
+
+        last50_window_start = max(
+            len(equity_df) - 50,
+            0
         )
 
-        # Day 1 has no prior day, so pct_change() leaves it
-        # as NaN. NaN/Infinity are not valid JSON, and
-        # gspread's ws.update() will raise
-        # requests.exceptions.InvalidJSONError if any NaN
-        # reaches it. Fill with 0.0 so the value is JSON-safe
-        # and reads naturally as "no change from a
-        # non-existent prior day".
-        equity_df[
-            "daily_pct_change"
-        ] = (
+        last50_base_value = float(
             equity_df[
-                "daily_pct_change"
-            ]
-            .fillna(0.0)
-            .round(3)
+                "portfolio_value_rs"
+            ].iloc[last50_window_start]
         )
+
+        # Start as all-NaN (float column) rather than
+        # assigning "" directly -- newer pandas can infer a
+        # strict string dtype for a column first populated
+        # with "", which then rejects the numeric values
+        # written into it below. NaN keeps the column numeric
+        # end-to-end; sanitize_for_sheets() blanks any
+        # remaining NaN to "" at write time.
+        last50_series = pd.Series(
+            np.nan,
+            index=equity_df.index,
+            dtype=float
+        )
+
+        last50_series.iloc[
+            last50_window_start:
+        ] = (
+
+            (
+                equity_df[
+                    "portfolio_value_rs"
+                ].iloc[last50_window_start:]
+                / last50_base_value
+                - 1
+            )
+
+            * 100
+
+        ).round(3)
+
+        equity_df[
+            "equity_curve_pct_norm_last50"
+        ] = last50_series
 
     trade_df = pd.DataFrame(
         trade_log
@@ -2266,11 +2300,11 @@ def sanitize_for_sheets(df):
     # ws.update() serializes rows through requests, which
     # raises InvalidJSONError if any such value is present
     # anywhere in the payload. This is a blanket safety net
-    # in addition to the explicit fillna(0.0) already applied
-    # to daily_pct_change -- it protects any other numeric
-    # column (present now or added later) that could end up
-    # with NaN/inf, by writing those cells as blank strings
-    # instead of failing the whole upload.
+    # that protects any numeric column (present now or added
+    # later) that could end up with NaN/inf -- e.g. metrics
+    # computed before enough data exists -- by writing those
+    # cells as blank strings instead of failing the whole
+    # upload.
 
     if df.empty:
         return df
@@ -2490,7 +2524,8 @@ def add_charts(
         + n_equity_rows
     )
 
-    # Last-50-days window for the daily % change chart.
+    # Last-50-days window for the last-50-day normalised
+    # equity curve chart.
     last50_start_row = (
         equity_header_row_0idx
         + 1
@@ -2692,27 +2727,29 @@ def add_charts(
             equity_header_row_0idx + 44
         ),
 
-        # Daily % change for the FULL backtest, since
-        # inception -- same start row as the equity curve
-        # itself, so it is never truncated.
+        # Total equity curve, normalised to zero (%), since
+        # inception -- line chart of the whole backtest,
+        # rebased so day 1 = 0%. Same start row as the equity
+        # curve itself, so it is never truncated.
         make_chart(
-            "Daily % Change (Since Inception)",
+            "Equity Curve - Normalised to Zero (%, Since Inception)",
             9,
-            "Daily Change %",
+            "Cumulative Change %",
             equity_header_row_0idx + 66,
-            chart_type="COLUMN"
+            chart_type="LINE"
         ),
 
-        # Daily % change, last 50 trading days only,
-        # zero-baselined column chart so gains/losses read
-        # above/below the zero line -- a zoomed-in companion
-        # to the since-inception chart above.
+        # Equity curve, normalised to zero (%), last 50
+        # trading days only -- rebased so the FIRST day of
+        # this window = 0%, not the start of the backtest. A
+        # zoomed-in companion to the since-inception chart
+        # above.
         make_chart(
-            "Daily % Change (Last 50 Days)",
-            9,
-            "Daily Change %",
+            "Equity Curve - Normalised to Zero (%, Last 50 Days)",
+            10,
+            "Cumulative Change %",
             equity_header_row_0idx + 88,
-            chart_type="COLUMN",
+            chart_type="LINE",
             start_row_override=last50_start_row
         )
 
@@ -2725,8 +2762,9 @@ def add_charts(
         })
 
         print(
-            "Equity, drawdown, pool-size, and daily "
-            "%-change (since-inception + last-50-day) "
+            "Equity, drawdown, pool-size, and "
+            "normalised-to-zero equity curve "
+            "(since-inception + last-50-day) "
             "charts added."
         )
 
