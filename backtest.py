@@ -1566,7 +1566,7 @@ def run_backtest(
         #
         # Not day-over-day change -- this is the cumulative
         # % move of the total portfolio value, rebased so the
-        # first point of the window reads 0%. Two versions:
+        # first point of each window reads 0%.
         #
         # 1. equity_curve_pct_norm: rebased to the very first
         #    trading day of the whole backtest (i.e. identical
@@ -1574,10 +1574,11 @@ def run_backtest(
         #    a % starting at 0 instead of a multiple starting
         #    at 1).
         #
-        # 2. equity_curve_pct_norm_last50: rebased to the
-        #    start of the last 50 trading days only, so the
-        #    last-50-days chart also starts its own line at
-        #    0%. Blank for all rows before that window.
+        # 2. One column per rolling window (last 50 / 100 /
+        #    365 trading days), each rebased to the start of
+        #    its own window so that window's chart line also
+        #    starts at 0%. Blank for all rows before that
+        #    window.
         # ----------------------------------------------------
 
         first_value = float(
@@ -1602,49 +1603,79 @@ def run_backtest(
 
         ).round(3)
 
-        last50_window_start = max(
-            len(equity_df) - 50,
-            0
-        )
+        def build_normalized_window(
+            window_days
+        ):
 
-        last50_base_value = float(
-            equity_df[
-                "portfolio_value_rs"
-            ].iloc[last50_window_start]
-        )
-
-        # Start as all-NaN (float column) rather than
-        # assigning "" directly -- newer pandas can infer a
-        # strict string dtype for a column first populated
-        # with "", which then rejects the numeric values
-        # written into it below. NaN keeps the column numeric
-        # end-to-end; sanitize_for_sheets() blanks any
-        # remaining NaN to "" at write time.
-        last50_series = pd.Series(
-            np.nan,
-            index=equity_df.index,
-            dtype=float
-        )
-
-        last50_series.iloc[
-            last50_window_start:
-        ] = (
-
-            (
-                equity_df[
-                    "portfolio_value_rs"
-                ].iloc[last50_window_start:]
-                / last50_base_value
-                - 1
+            window_start = max(
+                len(equity_df) - window_days,
+                0
             )
 
-            * 100
+            base_value = float(
+                equity_df[
+                    "portfolio_value_rs"
+                ].iloc[window_start]
+            )
 
-        ).round(3)
+            # Start as all-NaN (float column) rather than
+            # assigning "" directly -- newer pandas can infer
+            # a strict string dtype for a column first
+            # populated with "", which then rejects the
+            # numeric values written into it below. NaN keeps
+            # the column numeric end-to-end;
+            # sanitize_for_sheets() blanks any remaining NaN
+            # to "" at write time.
+            series = pd.Series(
+                np.nan,
+                index=equity_df.index,
+                dtype=float
+            )
+
+            series.iloc[
+                window_start:
+            ] = (
+
+                (
+                    equity_df[
+                        "portfolio_value_rs"
+                    ].iloc[window_start:]
+                    / base_value
+                    - 1
+                )
+
+                * 100
+
+            ).round(3)
+
+            return series, window_start
+
+        (
+            last50_series,
+            last50_window_start
+        ) = build_normalized_window(50)
+
+        (
+            last100_series,
+            last100_window_start
+        ) = build_normalized_window(100)
+
+        (
+            last365_series,
+            last365_window_start
+        ) = build_normalized_window(365)
 
         equity_df[
             "equity_curve_pct_norm_last50"
         ] = last50_series
+
+        equity_df[
+            "equity_curve_pct_norm_last100"
+        ] = last100_series
+
+        equity_df[
+            "equity_curve_pct_norm_last365"
+        ] = last365_series
 
     trade_df = pd.DataFrame(
         trade_log
@@ -2524,13 +2555,18 @@ def add_charts(
         + n_equity_rows
     )
 
-    # Last-50-days window for the last-50-day normalised
-    # equity curve chart.
-    last50_start_row = (
-        equity_header_row_0idx
-        + 1
-        + max(n_equity_rows - 50, 0)
-    )
+    # Window start rows for each normalised-window chart.
+    def window_start_row(window_days):
+
+        return (
+            equity_header_row_0idx
+            + 1
+            + max(n_equity_rows - window_days, 0)
+        )
+
+    last50_start_row = window_start_row(50)
+    last100_start_row = window_start_row(100)
+    last365_start_row = window_start_row(365)
 
     def make_chart(
         title,
@@ -2538,7 +2574,8 @@ def add_charts(
         y_axis_title,
         anchor_row,
         chart_type="LINE",
-        start_row_override=None
+        start_row_override=None,
+        show_points=False
     ):
 
         series_start = (
@@ -2546,6 +2583,74 @@ def add_charts(
             if start_row_override is not None
             else equity_header_row_0idx
         )
+
+        series_entry = {
+
+            "series": {
+
+                "sourceRange": {
+
+                    "sources": [
+
+                        {
+
+                            "sheetId":
+                                sheet_id,
+
+                            "startRowIndex":
+                                series_start,
+
+                            "endRowIndex":
+                                data_end_row,
+
+                            "startColumnIndex":
+                                y_col_idx,
+
+                            "endColumnIndex":
+                                y_col_idx + 1
+
+                        }
+
+                    ]
+
+                }
+
+            },
+
+            "targetAxis":
+                "LEFT_AXIS"
+
+        }
+
+        if show_points:
+
+            # Visible dot at every data point (end-of-day
+            # mark on the line), plus a data label showing
+            # that point's own value -- the cumulative %
+            # change -- printed next to the dot.
+            series_entry[
+                "pointStyle"
+            ] = {
+
+                "size":
+                    5,
+
+                "shape":
+                    "CIRCLE"
+
+            }
+
+            series_entry[
+                "dataLabel"
+            ] = {
+
+                "type":
+                    "DATA",
+
+                "placement":
+                    "ABOVE"
+
+            }
 
         return {
 
@@ -2626,45 +2731,7 @@ def add_charts(
                             ],
 
                             "series": [
-
-                                {
-
-                                    "series": {
-
-                                        "sourceRange": {
-
-                                            "sources": [
-
-                                                {
-
-                                                    "sheetId":
-                                                        sheet_id,
-
-                                                    "startRowIndex":
-                                                        series_start,
-
-                                                    "endRowIndex":
-                                                        data_end_row,
-
-                                                    "startColumnIndex":
-                                                        y_col_idx,
-
-                                                    "endColumnIndex":
-                                                        y_col_idx + 1
-
-                                                }
-
-                                            ]
-
-                                        }
-
-                                    },
-
-                                    "targetAxis":
-                                        "LEFT_AXIS"
-
-                                }
-
+                                series_entry
                             ]
 
                         }
@@ -2739,18 +2806,38 @@ def add_charts(
             chart_type="LINE"
         ),
 
-        # Equity curve, normalised to zero (%), last 50
-        # trading days only -- rebased so the FIRST day of
-        # this window = 0%, not the start of the backtest. A
-        # zoomed-in companion to the since-inception chart
-        # above.
+        # Equity curve, last 50 trading days -- rebased so the
+        # FIRST day of this window = 0%. Dot marker on every
+        # end-of-day point, with that point's own cumulative
+        # % change value printed next to the dot.
         make_chart(
             "Equity Curve - Normalised to Zero (%, Last 50 Days)",
             10,
             "Cumulative Change %",
             equity_header_row_0idx + 88,
             chart_type="LINE",
-            start_row_override=last50_start_row
+            start_row_override=last50_start_row,
+            show_points=True
+        ),
+
+        # Same idea, last 100 trading days.
+        make_chart(
+            "Equity Curve - Normalised to Zero (%, Last 100 Days)",
+            11,
+            "Cumulative Change %",
+            equity_header_row_0idx + 110,
+            chart_type="LINE",
+            start_row_override=last100_start_row
+        ),
+
+        # Same idea, last 365 trading days.
+        make_chart(
+            "Equity Curve - Normalised to Zero (%, Last 365 Days)",
+            12,
+            "Cumulative Change %",
+            equity_header_row_0idx + 132,
+            chart_type="LINE",
+            start_row_override=last365_start_row
         )
 
     ]
@@ -2763,9 +2850,8 @@ def add_charts(
 
         print(
             "Equity, drawdown, pool-size, and "
-            "normalised-to-zero equity curve "
-            "(since-inception + last-50-day) "
-            "charts added."
+            "normalised-to-zero equity curve charts "
+            "(since-inception + last-50/100/365-day) added."
         )
 
     except Exception as e:
