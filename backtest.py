@@ -2639,14 +2639,26 @@ def add_charts(
             equity_header_row_0idx + 44
         ),
 
-        # Daily % change, last 50 trading days, zero-baselined
-        # column chart so gains/losses read above/below the
-        # zero line.
+        # Daily % change for the FULL backtest, since
+        # inception -- same start row as the equity curve
+        # itself, so it is never truncated.
+        make_chart(
+            "Daily % Change (Since Inception)",
+            9,
+            "Daily Change %",
+            equity_header_row_0idx + 66,
+            chart_type="COLUMN"
+        ),
+
+        # Daily % change, last 50 trading days only,
+        # zero-baselined column chart so gains/losses read
+        # above/below the zero line -- a zoomed-in companion
+        # to the since-inception chart above.
         make_chart(
             "Daily % Change (Last 50 Days)",
             9,
             "Daily Change %",
-            equity_header_row_0idx + 66,
+            equity_header_row_0idx + 88,
             chart_type="COLUMN",
             start_row_override=last50_start_row
         )
@@ -2660,8 +2672,9 @@ def add_charts(
         })
 
         print(
-            "Equity, drawdown, pool-size, "
-            "and daily %-change charts added."
+            "Equity, drawdown, pool-size, and daily "
+            "%-change (since-inception + last-50-day) "
+            "charts added."
         )
 
     except Exception as e:
