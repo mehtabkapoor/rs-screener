@@ -1580,12 +1580,35 @@ def run_backtest(
 
         ) * 100
 
+        # Replace +/-inf (only possible if a prior day's
+        # value was exactly 0, which should not happen but
+        # is guarded against anyway) before rounding.
         equity_df[
             "daily_pct_change"
         ] = (
             equity_df[
                 "daily_pct_change"
             ]
+            .replace(
+                [np.inf, -np.inf],
+                np.nan
+            )
+        )
+
+        # Day 1 has no prior day, so pct_change() leaves it
+        # as NaN. NaN/Infinity are not valid JSON, and
+        # gspread's ws.update() will raise
+        # requests.exceptions.InvalidJSONError if any NaN
+        # reaches it. Fill with 0.0 so the value is JSON-safe
+        # and reads naturally as "no change from a
+        # non-existent prior day".
+        equity_df[
+            "daily_pct_change"
+        ] = (
+            equity_df[
+                "daily_pct_change"
+            ]
+            .fillna(0.0)
             .round(3)
         )
 
@@ -2237,6 +2260,36 @@ def summarize(
 # GOOGLE SHEETS
 # ============================================================
 
+def sanitize_for_sheets(df):
+
+    # NaN and +/-Infinity are not valid JSON. gspread's
+    # ws.update() serializes rows through requests, which
+    # raises InvalidJSONError if any such value is present
+    # anywhere in the payload. This is a blanket safety net
+    # in addition to the explicit fillna(0.0) already applied
+    # to daily_pct_change -- it protects any other numeric
+    # column (present now or added later) that could end up
+    # with NaN/inf, by writing those cells as blank strings
+    # instead of failing the whole upload.
+
+    if df.empty:
+        return df
+
+    clean = df.copy()
+
+    clean = clean.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    clean = clean.where(
+        pd.notnull(clean),
+        ""
+    )
+
+    return clean
+
+
 def get_or_create_worksheet(
     sh,
     title,
@@ -2829,11 +2882,20 @@ def write_to_sheet(
 
     )
 
+    def sanitize_scalar(v):
+
+        if isinstance(v, float) and (
+            np.isnan(v) or np.isinf(v)
+        ):
+            return ""
+
+        return v
+
     summary_rows = (
         [["Summary", ""]]
         +
         [
-            [k, v]
+            [k, sanitize_scalar(v)]
             for k, v
             in summary.items()
         ]
@@ -2861,15 +2923,19 @@ def write_to_sheet(
 
     if not trade_df.empty:
 
+        trade_df_clean = sanitize_for_sheets(
+            trade_df
+        )
+
         write_in_chunks(
 
             ws,
 
             [
-                list(trade_df.columns)
+                list(trade_df_clean.columns)
             ]
             +
-            trade_df.values.tolist(),
+            trade_df_clean.values.tolist(),
 
             start_row=
                 trade_header_row,
@@ -2906,13 +2972,17 @@ def write_to_sheet(
 
     if not open_df.empty:
 
+        open_df_clean = sanitize_for_sheets(
+            open_df
+        )
+
         ws.update(
 
             [
-                list(open_df.columns)
+                list(open_df_clean.columns)
             ]
             +
-            open_df.values.tolist(),
+            open_df_clean.values.tolist(),
 
             f"A{open_header_row}"
 
@@ -2940,15 +3010,19 @@ def write_to_sheet(
 
     if not equity_df.empty:
 
+        equity_df_clean = sanitize_for_sheets(
+            equity_df
+        )
+
         write_in_chunks(
 
             ws,
 
             [
-                list(equity_df.columns)
+                list(equity_df_clean.columns)
             ]
             +
-            equity_df.values.tolist(),
+            equity_df_clean.values.tolist(),
 
             start_row=
                 equity_header_row,
