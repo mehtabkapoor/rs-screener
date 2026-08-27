@@ -2575,7 +2575,8 @@ def add_charts(
         anchor_row,
         chart_type="LINE",
         start_row_override=None,
-        show_points=False
+        show_points=False,
+        width_pixels=650
     ):
 
         series_start = (
@@ -2627,7 +2628,16 @@ def add_charts(
             # Visible dot at every data point (end-of-day
             # mark on the line), plus a data label showing
             # that point's own value -- the cumulative %
-            # change -- printed next to the dot.
+            # change -- printed below the dot in a smaller
+            # font so adjacent labels stop overlapping.
+            #
+            # NOTE: the Sheets Charts API does not expose a
+            # rotate/vertical-text property for data labels --
+            # "placement" only accepts ABOVE / BELOW / LEFT /
+            # RIGHT / CENTER / INSIDE_END, none of which rotate
+            # the text itself. BELOW + a smaller font is the
+            # closest available fix for reducing horizontal
+            # overlap between consecutive labels.
             series_entry[
                 "pointStyle"
             ] = {
@@ -2648,7 +2658,14 @@ def add_charts(
                     "DATA",
 
                 "placement":
-                    "ABOVE"
+                    "BELOW",
+
+                "textFormat": {
+
+                    "fontSize":
+                        7
+
+                }
 
             }
 
@@ -2756,7 +2773,7 @@ def add_charts(
                             },
 
                             "widthPixels":
-                                650,
+                                width_pixels,
 
                             "heightPixels":
                                 380
@@ -2809,7 +2826,8 @@ def add_charts(
         # Equity curve, last 50 trading days -- rebased so the
         # FIRST day of this window = 0%. Dot marker on every
         # end-of-day point, with that point's own cumulative
-        # % change value printed next to the dot.
+        # % change value printed below the dot. Widened so 50
+        # labels have room without colliding.
         make_chart(
             "Equity Curve - Normalised to Zero (%, Last 50 Days)",
             10,
@@ -2817,7 +2835,8 @@ def add_charts(
             equity_header_row_0idx + 88,
             chart_type="LINE",
             start_row_override=last50_start_row,
-            show_points=True
+            show_points=True,
+            width_pixels=1100
         ),
 
         # Same idea, last 100 trading days.
