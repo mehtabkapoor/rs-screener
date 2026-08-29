@@ -1671,6 +1671,122 @@ def run_backtest(
 
         ).round(3)
 
+        # ----------------------------------------------------
+        # EQUITY CURVE, NORMALISED TO ZERO (%)
+        #
+        # Not day-over-day change -- the cumulative % move of
+        # the total portfolio value, rebased so the first
+        # point of each window reads 0%.
+        #
+        # 1. equity_curve_pct_norm: rebased to the very first
+        #    trading day of the whole backtest (equivalent
+        #    information to the "equity" column, just as a %
+        #    starting at 0 instead of a multiple starting at
+        #    1).
+        #
+        # 2. One column per rolling window (last 50 / 100 /
+        #    365 trading days), each rebased to the start of
+        #    its own window so that window's chart line also
+        #    starts at 0%. Blank for all rows before that
+        #    window.
+        # ----------------------------------------------------
+
+        first_value = float(
+            equity_df[
+                "portfolio_value_rs"
+            ].iloc[0]
+        )
+
+        equity_df[
+            "equity_curve_pct_norm"
+        ] = (
+
+            (
+                equity_df[
+                    "portfolio_value_rs"
+                ]
+                / first_value
+                - 1
+            )
+
+            * 100
+
+        ).round(3)
+
+        def build_normalized_window(
+            window_days
+        ):
+
+            window_start = max(
+                len(equity_df) - window_days,
+                0
+            )
+
+            base_value = float(
+                equity_df[
+                    "portfolio_value_rs"
+                ].iloc[window_start]
+            )
+
+            # Start as all-NaN (float column) rather than
+            # assigning "" directly -- newer pandas can infer
+            # a strict string dtype for a column first
+            # populated with "", which then rejects the
+            # numeric values written into it below. NaN keeps
+            # the column numeric end-to-end;
+            # sanitize_for_sheets() blanks any remaining NaN
+            # to "" at write time.
+            series = pd.Series(
+                np.nan,
+                index=equity_df.index,
+                dtype=float
+            )
+
+            series.iloc[
+                window_start:
+            ] = (
+
+                (
+                    equity_df[
+                        "portfolio_value_rs"
+                    ].iloc[window_start:]
+                    / base_value
+                    - 1
+                )
+
+                * 100
+
+            ).round(3)
+
+            return series, window_start
+
+        (
+            last50_series,
+            last50_window_start
+        ) = build_normalized_window(50)
+
+        (
+            last100_series,
+            last100_window_start
+        ) = build_normalized_window(100)
+
+        (
+            last365_series,
+            last365_window_start
+        ) = build_normalized_window(365)
+
+        equity_df[
+            "equity_curve_pct_norm_last50"
+        ] = last50_series
+
+        equity_df[
+            "equity_curve_pct_norm_last100"
+        ] = last100_series
+
+        equity_df[
+            "equity_curve_pct_norm_last365"
+        ] = last365_series
+
     open_df = pd.DataFrame(
         open_positions_detail
     )
@@ -2281,6 +2397,40 @@ def get_or_create_worksheet(
 
 
 # ============================================================
+# GOOGLE SHEETS JSON SAFETY
+# ============================================================
+
+def sanitize_for_sheets(df):
+
+    # NaN and +/-Infinity are not valid JSON. gspread's
+    # ws.update() serializes rows through requests, which
+    # raises InvalidJSONError if any such value is present
+    # anywhere in the payload. This is a blanket safety net
+    # that protects any numeric column (present now or added
+    # later) that could end up with NaN/inf -- e.g. metrics
+    # computed before enough data exists -- by writing those
+    # cells as blank strings instead of failing the whole
+    # upload.
+
+    if df.empty:
+        return df
+
+    clean = df.copy()
+
+    clean = clean.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    clean = clean.where(
+        pd.notnull(clean),
+        ""
+    )
+
+    return clean
+
+
+# ============================================================
 # GOOGLE SHEETS CHUNK WRITER
 # ============================================================
 
@@ -2450,12 +2600,119 @@ def add_charts(
         n_equity_rows
     )
 
+    # Window start rows for each normalised-window chart.
+    def window_start_row(window_days):
+
+        return (
+            equity_header_row_0idx
+            + 1
+            + max(n_equity_rows - window_days, 0)
+        )
+
+    last50_start_row = window_start_row(50)
+    last100_start_row = window_start_row(100)
+    last365_start_row = window_start_row(365)
+
     def make_chart(
         title,
         y_col_idx,
         y_axis_title,
-        anchor_row
+        anchor_row,
+        chart_type="LINE",
+        start_row_override=None,
+        show_points=False,
+        width_pixels=650
     ):
+
+        series_start = (
+            start_row_override
+            if start_row_override is not None
+            else equity_header_row_0idx
+        )
+
+        series_entry = {
+
+            "series": {
+
+                "sourceRange": {
+
+                    "sources": [
+
+                        {
+
+                            "sheetId":
+                            sheet_id,
+
+                            "startRowIndex":
+                            series_start,
+
+                            "endRowIndex":
+                            data_end_row,
+
+                            "startColumnIndex":
+                            y_col_idx,
+
+                            "endColumnIndex":
+                            y_col_idx + 1
+
+                        }
+
+                    ]
+
+                }
+
+            },
+
+            "targetAxis":
+            "LEFT_AXIS"
+
+        }
+
+        if show_points:
+
+            # Visible dot at every data point (end-of-day
+            # mark on the line), plus a data label showing
+            # that point's own value -- the cumulative %
+            # change -- printed below the dot in a smaller
+            # font so adjacent labels don't overlap.
+            #
+            # NOTE: the Sheets Charts API does not expose a
+            # rotate/vertical-text property for data labels --
+            # "placement" only accepts ABOVE / BELOW / LEFT /
+            # RIGHT / CENTER / INSIDE_END, none of which rotate
+            # the text itself. BELOW + a smaller font is the
+            # closest available fix for reducing horizontal
+            # overlap between consecutive labels.
+            series_entry[
+                "pointStyle"
+            ] = {
+
+                "size":
+                    5,
+
+                "shape":
+                    "CIRCLE"
+
+            }
+
+            series_entry[
+                "dataLabel"
+            ] = {
+
+                "type":
+                    "DATA",
+
+                "placement":
+                    "BELOW",
+
+                "textFormat": {
+
+                    "fontSize":
+                        7
+
+                }
+
+            }
 
         return {
 
@@ -2471,7 +2728,7 @@ def add_charts(
                         "basicChart": {
 
                             "chartType":
-                            "LINE",
+                            chart_type,
 
                             "legendPosition":
                             "NO_LEGEND",
@@ -2512,7 +2769,7 @@ def add_charts(
                                                     sheet_id,
 
                                                     "startRowIndex":
-                                                    equity_header_row_0idx,
+                                                    series_start,
 
                                                     "endRowIndex":
                                                     data_end_row,
@@ -2536,45 +2793,7 @@ def add_charts(
                             ],
 
                             "series": [
-
-                                {
-
-                                    "series": {
-
-                                        "sourceRange": {
-
-                                            "sources": [
-
-                                                {
-
-                                                    "sheetId":
-                                                    sheet_id,
-
-                                                    "startRowIndex":
-                                                    equity_header_row_0idx,
-
-                                                    "endRowIndex":
-                                                    data_end_row,
-
-                                                    "startColumnIndex":
-                                                    y_col_idx,
-
-                                                    "endColumnIndex":
-                                                    y_col_idx + 1
-
-                                                }
-
-                                            ]
-
-                                        }
-
-                                    },
-
-                                    "targetAxis":
-                                    "LEFT_AXIS"
-
-                                }
-
+                                series_entry
                             ]
 
                         }
@@ -2599,7 +2818,7 @@ def add_charts(
                             },
 
                             "widthPixels":
-                            650,
+                            width_pixels,
 
                             "heightPixels":
                             380
@@ -2630,6 +2849,54 @@ def add_charts(
             equity_header_row_0idx + 22
         ),
 
+        # Total equity curve, normalised to zero (%), since
+        # inception -- line chart of the whole backtest,
+        # rebased so day 1 = 0%. Same start row as the equity
+        # curve itself, so it is never truncated.
+        make_chart(
+            "Equity Curve - Normalised to Zero (%, Since Inception)",
+            6,
+            "Cumulative Change %",
+            equity_header_row_0idx + 44,
+            chart_type="LINE"
+        ),
+
+        # Equity curve, last 50 trading days -- rebased so the
+        # FIRST day of this window = 0%. Dot marker on every
+        # end-of-day point, with that point's own cumulative
+        # % change value printed below the dot. Widened so 50
+        # labels have room without colliding.
+        make_chart(
+            "Equity Curve - Normalised to Zero (%, Last 50 Days)",
+            7,
+            "Cumulative Change %",
+            equity_header_row_0idx + 66,
+            chart_type="LINE",
+            start_row_override=last50_start_row,
+            show_points=True,
+            width_pixels=1100
+        ),
+
+        # Same idea, last 100 trading days.
+        make_chart(
+            "Equity Curve - Normalised to Zero (%, Last 100 Days)",
+            8,
+            "Cumulative Change %",
+            equity_header_row_0idx + 88,
+            chart_type="LINE",
+            start_row_override=last100_start_row
+        ),
+
+        # Same idea, last 365 trading days.
+        make_chart(
+            "Equity Curve - Normalised to Zero (%, Last 365 Days)",
+            9,
+            "Cumulative Change %",
+            equity_header_row_0idx + 110,
+            chart_type="LINE",
+            start_row_override=last365_start_row
+        )
+
     ]
 
     try:
@@ -2640,8 +2907,9 @@ def add_charts(
         })
 
         print(
-            "Equity and drawdown "
-            "charts added."
+            "Equity, drawdown, and normalised-to-zero "
+            "equity curve charts (since-inception + "
+            "last-50/100/365-day) added."
         )
 
     except Exception as e:
@@ -2829,6 +3097,15 @@ def write_to_sheet(
     # SUMMARY
     # ========================================================
 
+    def sanitize_scalar(v):
+
+        if isinstance(v, float) and (
+            np.isnan(v) or np.isinf(v)
+        ):
+            return ""
+
+        return v
+
     summary_rows = (
 
         [["Summary", ""]]
@@ -2836,7 +3113,7 @@ def write_to_sheet(
         +
 
         [
-            [k, v]
+            [k, sanitize_scalar(v)]
             for k, v
             in summary.items()
         ]
@@ -2873,17 +3150,21 @@ def write_to_sheet(
 
     if not trade_df.empty:
 
+        trade_df_clean = sanitize_for_sheets(
+            trade_df
+        )
+
         write_in_chunks(
 
             ws,
 
             [
                 list(
-                    trade_df.columns
+                    trade_df_clean.columns
                 )
             ]
             +
-            trade_df.values.tolist(),
+            trade_df_clean.values.tolist(),
 
             start_row=
             trade_header_row,
@@ -2928,15 +3209,19 @@ def write_to_sheet(
 
     if not open_df.empty:
 
+        open_df_clean = sanitize_for_sheets(
+            open_df
+        )
+
         ws.update(
 
             [
                 list(
-                    open_df.columns
+                    open_df_clean.columns
                 )
             ]
             +
-            open_df.values.tolist(),
+            open_df_clean.values.tolist(),
 
             f"A{open_header_row}"
 
@@ -2970,17 +3255,21 @@ def write_to_sheet(
 
     if not equity_df.empty:
 
+        equity_df_clean = sanitize_for_sheets(
+            equity_df
+        )
+
         write_in_chunks(
 
             ws,
 
             [
                 list(
-                    equity_df.columns
+                    equity_df_clean.columns
                 )
             ]
             +
-            equity_df.values.tolist(),
+            equity_df_clean.values.tolist(),
 
             start_row=
             equity_header_row,
