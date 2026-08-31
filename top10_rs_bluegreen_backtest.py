@@ -1,14 +1,20 @@
 """
-TOP 10 RS ROTATION BACKTEST -- BLUE DOT + GREEN DOT FILTERED
+TOP 10 RS ROTATION BACKTEST -- BLUE DOT FILTERED (GREEN DOT TRACKED, NOT USED FOR ENTRY)
 
 This is a MODIFICATION of the exact-Top-10 rotation engine
-(top10_rs_backtest.py). The ONLY change is the eligibility gate
-used to build the daily ranking:
+(top10_rs_backtest.py). The eligibility gate used to build the
+daily ranking is:
 
     OLD (backtest1):  liquid
-    NEW (this file):  liquid AND blue_dot AND green_dot
+    NEW (this file):  liquid AND blue_dot
 
-Where (identical definitions to backtest2 / the Pine-style diagnostic):
+Green Dot is still COMPUTED for every stock (identical definition
+to backtest2 / the Pine-style diagnostic) and stored in each
+stock's signal data, but it is NOT part of the eligibility gate --
+it's tracked for reference/analysis only, it does not affect which
+stocks are bought, ranked, or held.
+
+Where:
 
     rs_ratio          = stock price / benchmark price
     blue_dot          = rs_ratio makes a new N-day (LOOKBACK_DAYS) high
@@ -17,14 +23,15 @@ Where (identical definitions to backtest2 / the Pine-style diagnostic):
     price_at_new_high = stock price makes a new N-day high
     green_dot         = blue_dot AND (price NOT simultaneously at a new
                          N-day high) -- i.e. RS strength emerging while
-                         price hasn't broken out yet
+                         price hasn't broken out yet. COMPUTED ONLY --
+                         not used to gate entries in this backtest.
 
 PORTFOLIO RULE (every trading day) -- UNCHANGED FROM BACKTEST1
-  1. Rank all eligible stocks (liquid + blue_dot + green_dot) by RS score.
+  1. Rank all eligible stocks (liquid + blue_dot) by RS score.
   2. Target portfolio = today's Top 10 of that filtered/ranked pool.
   3. Existing holdings that remain in target are NEVER resized.
   4. Sell holdings that leave the target (drop out of filtered Top 10,
-     or lose blue_dot/green_dot/liquidity, or vanish from the ranking).
+     or lose blue_dot/liquidity, or vanish from the ranking).
   5. Buy ALL missing names from today's target.
   6. Replacement purchases use AVAILABLE CASH after exits.
   7. Cash is divided across missing Top-10 positions.
@@ -268,9 +275,13 @@ def download_benchmark():
 # RS SCORE: pure price momentum, benchmark-independent (unchanged
 # from backtest1).
 #
-# BLUE DOT / GREEN DOT: benchmark-relative diagnostics (same
-# definitions as backtest2), now used as the ELIGIBILITY GATE
-# instead of being unused/decorative.
+# BLUE DOT: benchmark-relative diagnostic (same definition as
+# backtest2), used as the ELIGIBILITY GATE.
+#
+# GREEN DOT: also computed and stored (same definition as backtest2),
+# but NOT used as part of the eligibility gate here -- kept purely
+# for reference/analysis (e.g. inspecting the sheet/trade log to see
+# which Blue-Dot entries also happened to be Green-Dot).
 # ============================================================
 
 def compute_stock_data(close, volume, bench_close):
@@ -334,10 +345,13 @@ def build_daily_ranking(all_stocks, date):
     """Rank ELIGIBLE stocks by RS, descending.
 
     Eligibility (this backtest only):
-        liquid AND blue_dot AND green_dot
+        liquid AND blue_dot
 
-    This is the sole change vs backtest1's build_daily_ranking,
-    which only required `liquid`.
+    Green Dot is still COMPUTED and stored on every stock's signal
+    row (see compute_stock_data), but it is NOT part of the buying
+    criteria here -- it's tracked/available for reference only. This
+    is the sole change vs backtest1's build_daily_ranking, which only
+    required `liquid`.
     """
 
     ranking = []
@@ -348,7 +362,7 @@ def build_daily_ranking(all_stocks, date):
         rs = row["rs_score"]
         if pd.isna(rs) or not bool(row["liquid"]):
             continue
-        if not bool(row["blue_dot"]) or not bool(row["green_dot"]):
+        if not bool(row["blue_dot"]):
             continue
         price = row["price"]
         if pd.isna(price) or float(price) <= 0:
@@ -398,14 +412,15 @@ def buy_missing_top10(missing_symbols, price_lookup, date, cash, holdings, trade
     """Buy every missing Top-10 name that cash actually allows.
 
     UNLIKE backtest1, this does NOT raise when the exact target can't
-    be fully funded. Blue Dot / Green Dot are transient single-day
-    signals (unlike a slow-moving RS score), so the daily target set
-    can rotate almost completely, fragmenting cash into remainders
-    that occasionally can't cover every missing name. Rather than
-    treat that as fatal, we fill what we can afford (still reserving
-    for later, higher-priority names in RS-rank order) and SKIP any
-    name we can't fund -- it simply stays unheld until cash frees up
-    or it drops out of the target on a later day.
+    be fully funded. Blue Dot is a transient single-day signal
+    (unlike a slow-moving RS score), so the daily target set can
+    rotate almost completely, fragmenting cash into remainders that
+    occasionally can't cover every missing name. Rather than treat
+    that as fatal, we fill what cash currently allows, evenly split
+    across remaining slots (no reservation for later names -- see
+    the in-loop comment for why), and SKIP any name we can't fund --
+    it simply stays unheld until cash frees up or it drops out of
+    the target on a later day.
 
     missing_symbols is already in RS-rank order (best first), so
     skips fall on the lowest-conviction names when cash is tight.
@@ -464,9 +479,9 @@ def buy_missing_top10(missing_symbols, price_lookup, date, cash, holdings, trade
 # ============================================================
 # BACKTEST ENGINE -- UNCHANGED FROM BACKTEST1
 #
-# (build_daily_ranking already encodes the new Blue Dot + Green
-# Dot filter, so everything downstream -- entries, exits, the
-# hard portfolio invariants, mark-to-market -- is identical.)
+# (build_daily_ranking already encodes the Blue Dot filter, so
+# everything downstream -- entries, exits, the hard portfolio
+# invariants, mark-to-market -- is identical.)
 # ============================================================
 
 def run_backtest(all_stocks, trading_days):
@@ -598,7 +613,7 @@ def run_backtest(all_stocks, trading_days):
 
         if day_number % 100 == 0:
             print(f"Processed {day_number}/{n_days} | {date:%Y-%m-%d} | "
-                  f"EligiblePool(Blue+GreenDot)={eligible_pool_size} | "
+                  f"EligiblePool(BlueDot)={eligible_pool_size} | "
                   f"Holdings={len(holdings)} | Cash=Rs.{cash:,.0f} | "
                   f"Equity=Rs.{total_value:,.0f}")
 
@@ -768,9 +783,9 @@ def summarize(equity_df, trade_df, final_marked_value, final_liquidation_value):
         "Total Transaction Costs (Rs)": round(total_costs, 0),
         "Total STCG Tax (Rs)": round(total_tax, 0),
         "RS Formula": "40% 3M + 20% 6M + 20% 9M + 20% 12M",
-        "Entry Filter": f"Blue Dot AND Green Dot (RS-ratio {LOOKBACK_DAYS}D new "
-                         "high, price NOT simultaneously at new high)",
-        "Portfolio": "Exact daily Top 10 of Blue+Green-Dot-filtered RS ranking",
+        "Entry Filter": f"Blue Dot only (RS-ratio {LOOKBACK_DAYS}D new high). "
+                         "Green Dot computed/logged but not part of entry criteria.",
+        "Portfolio": "Exact daily Top 10 of Blue-Dot-filtered RS ranking",
         "Weight": "Available replacement cash divided across missing Top-10 "
                   "names; retained positions untouched",
         "Entry": "Initial filtered Top 10; subsequently every missing name",
@@ -781,8 +796,9 @@ def summarize(equity_df, trade_df, final_marked_value, final_liquidation_value):
                                 "retained positions",
         "Price Filter": f"> Rs.{MIN_PRICE}",
         "Liquidity Filter": f"{VOLUME_LOOKBACK}D average volume > {MIN_AVG_VOLUME:,}",
-        "Other Filters": f"Blue Dot + Green Dot only (lookback {LOOKBACK_DAYS}D). "
-                          "No price/RS trend template, no sector/regime/breadth filter.",
+        "Other Filters": f"Blue Dot only (lookback {LOOKBACK_DAYS}D). Green Dot "
+                          "computed/logged but not gating. No price/RS trend "
+                          "template, no sector/regime/breadth filter.",
     }
 
 
@@ -918,7 +934,7 @@ def add_charts(sh, sheet_id, equity_header_row_0idx, n_equity_rows, equity_colum
         make_chart("Drawdown (%)", "drawdown_pct", "Drawdown %",
                     equity_header_row_0idx + 22),
 
-        make_chart("Eligible Pool Size (Blue+Green Dot)", "eligible_pool_size",
+        make_chart("Eligible Pool Size (Blue Dot)", "eligible_pool_size",
                     "Stock Count", equity_header_row_0idx + 44),
 
         make_chart("Equity Curve - Normalised to Zero (%, Since Inception)",
@@ -991,10 +1007,11 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, unfilled_df, effective
     ws.clear()
 
     ws.update([[
-        "TOP 10 RS ROTATION BACKTEST -- BLUE DOT + GREEN DOT FILTERED | "
+        "TOP 10 RS ROTATION BACKTEST -- BLUE DOT FILTERED (Green Dot tracked, "
+        "not used for entry) | "
         f"run {timestamp} | NET of costs+STCG | "
         f"Capital: Rs.{STARTING_CAPITAL:,.0f} | "
-        "Entry filter: Blue Dot AND Green Dot | "
+        "Entry filter: Blue Dot only | "
         "Target: exact Top 10 of filtered RS ranking | "
         "Retained holdings NOT resized | Sell on drop from filtered Top 10 | "
         "Available exit cash funds all missing names | Same EOD bar | "
@@ -1056,11 +1073,11 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, unfilled_df, effective
 def main():
     print()
     print("=" * 70)
-    print("TOP 10 RS ROTATION BACKTEST -- BLUE DOT + GREEN DOT FILTERED")
+    print("TOP 10 RS ROTATION BACKTEST -- BLUE DOT FILTERED (Green Dot tracked, not used for entry)")
     print("=" * 70)
     print(f"Backtest start : {BACKTEST_START}")
     print(f"Backtest end   : {BACKTEST_END if BACKTEST_END else 'LATEST'}")
-    print("Ranking        : DAILY RS SCORE, FILTERED TO BLUE DOT + GREEN DOT")
+    print("Ranking        : DAILY RS SCORE, FILTERED TO BLUE DOT")
     print("Portfolio      : EXACT TOP 10 OF FILTERED RANKING")
     print("Initial        : BUY ALL FILTERED TOP 10")
     print("Rotation       : SELL ONLY STOCKS LEAVING FILTERED TOP 10")
@@ -1070,7 +1087,8 @@ def main():
     print("Execution      : SAME EOD BAR (T+0)")
     print(f"Price filter   : > Rs.{MIN_PRICE}")
     print(f"Liquidity      : {VOLUME_LOOKBACK}D average volume > {MIN_AVG_VOLUME:,}")
-    print(f"Entry filter   : Blue Dot AND Green Dot ({LOOKBACK_DAYS}D lookback)")
+    print(f"Entry filter   : Blue Dot only ({LOOKBACK_DAYS}D lookback). "
+          f"Green Dot computed/logged but not gating.")
     print("Other filters  : NONE")
     print("=" * 70)
 
@@ -1172,7 +1190,7 @@ def main():
     )
 
     if not equity_df.empty:
-        # Under-fill is EXPECTED with a transient filter like Blue+Green
+        # Under-fill is EXPECTED with a transient filter like Blue Dot
         # Dot -- reported for visibility, not treated as a failure.
         broken = equity_df[equity_df["n_holdings"] != equity_df["top10_target_size"]]
         if not broken.empty:
@@ -1185,7 +1203,7 @@ def main():
         low_pool_days = int((equity_df["eligible_pool_size"] < TOP_N).sum())
         if low_pool_days:
             print(f"NOTE: {low_pool_days}/{len(equity_df)} trading days had fewer "
-                  f"than {TOP_N} names passing Blue Dot + Green Dot -- portfolio "
+                  f"than {TOP_N} names passing Blue Dot -- portfolio "
                   f"target itself was <10 names on those days by design.")
 
         if not unfilled_df.empty:
