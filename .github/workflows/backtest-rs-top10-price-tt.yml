@@ -1,4 +1,4 @@
-name: RS Top 10 + Price TT
+name: RS6M Top 10
 
 on:
   workflow_dispatch:
@@ -25,4 +25,4 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: |
-          python "backtest RS Top 10 + Price TT.py"
+          python "top10_rs6m_backtest.py"
