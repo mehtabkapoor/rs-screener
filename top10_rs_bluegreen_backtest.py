@@ -1,49 +1,21 @@
 """
-TOP 10 RS ROTATION BACKTEST -- BLUE DOT FILTERED (GREEN DOT TRACKED, NOT USED FOR ENTRY)
+TOP 10 RS6M ROTATION BACKTEST
 
-This is a MODIFICATION of the exact-Top-10 rotation engine
-(top10_rs_backtest.py). The eligibility gate used to build the
-daily ranking is:
-
-    OLD (backtest1):  liquid
-    NEW (this file):  liquid AND blue_dot
-
-Green Dot is still COMPUTED for every stock (identical definition
-to backtest2 / the Pine-style diagnostic) and stored in each
-stock's signal data, but it is NOT part of the eligibility gate --
-it's tracked for reference/analysis only, it does not affect which
-stocks are bought, ranked, or held.
-
-Where:
-
-    rs_ratio          = stock price / benchmark price
-    blue_dot          = rs_ratio makes a new N-day (LOOKBACK_DAYS) high
-                         i.e. rs_ratio > rolling max of rs_ratio over the
-                         prior LOOKBACK_DAYS (shifted by 1 to exclude today)
-    price_at_new_high = stock price makes a new N-day high
-    green_dot         = blue_dot AND (price NOT simultaneously at a new
-                         N-day high) -- i.e. RS strength emerging while
-                         price hasn't broken out yet. COMPUTED ONLY --
-                         not used to gate entries in this backtest.
-
-PORTFOLIO RULE (every trading day) -- UNCHANGED FROM BACKTEST1
-  1. Rank all eligible stocks (liquid + blue_dot) by RS score.
-  2. Target portfolio = today's Top 10 of that filtered/ranked pool.
-  3. Existing holdings that remain in target are NEVER resized.
-  4. Sell holdings that leave the target (drop out of filtered Top 10,
-     or lose blue_dot/liquidity, or vanish from the ranking).
-  5. Buy ALL missing names from today's target.
+PORTFOLIO RULE (every trading day)
+  1. Rank all eligible stocks by 6-Month RS.
+  2. Target portfolio = today's Top 10 RS stocks.
+  3. Existing holdings that remain Top 10 are NEVER resized.
+  4. Sell holdings that leave Top 10 or disappear from ranking.
+  5. Buy ALL missing names from today's Top 10.
   6. Replacement purchases use AVAILABLE CASH after exits.
   7. Cash is divided across missing Top-10 positions.
   8. Transaction costs are included in affordability calculations.
-  9. If >=10 eligible (filtered) stocks exist and all required stocks
-     are affordable, the portfolio MUST finish with exactly 10 holdings.
+  9. If >=10 eligible stocks exist and all required stocks are
+     affordable, the portfolio MUST finish with exactly 10 holdings.
 
 There is NO daily sell/rebuy, NO continuous equal weighting,
-NO rank-11 substitution, NO price/RS trend template, NO
-sector/regime/breadth filter. Note this is a much narrower/stricter
-filter than the trend template used in backtest2 -- expect fewer
-eligible names on many days, and possibly days with <10 eligible.
+NO rank-11 substitution, NO trend template, NO RS line,
+NO sector/regime/breadth filter.
 """
 
 import os
@@ -76,12 +48,7 @@ MIN_PRICE = 20
 MIN_AVG_VOLUME = 100_000
 VOLUME_LOOKBACK = 20
 
-RS_3M, RS_6M, RS_9M, RS_12M = 63, 126, 189, 252
-RS_WEIGHTS = (0.40, 0.20, 0.20, 0.20)  # 3M / 6M / 9M / 12M
-
-# Blue Dot / Green Dot lookback window (trading days) for the
-# RS-ratio new-high and price new-high checks. Same as backtest2.
-LOOKBACK_DAYS = 250
+RS_PERIOD = 126  # ~6 trading months
 
 TOP_N = 10
 STARTING_CAPITAL = 1_000_000
@@ -112,7 +79,7 @@ STCG_EFFECTIVE_RATE = STCG_RATE * (1 + STCG_CESS)  # 20.8%
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
-BACKTEST_WORKSHEET = "Backtest - RS Top10 BlueGreenDot"
+BACKTEST_WORKSHEET = "Backtest - RS6M Top10"
 
 
 # ============================================================
@@ -228,14 +195,7 @@ def minimum_cash_for_one_share(price):
 
 
 # ============================================================
-# BENCHMARK
-#
-# Here the benchmark is used for TWO things (unlike backtest1,
-# where it was calendar-only):
-#   1. Establishing the common trading-date calendar (as before).
-#   2. Computing rs_ratio = stock price / benchmark price, which
-#      feeds Blue Dot / Green Dot for every stock.
-# It still plays NO role in the RS SCORE used for ranking.
+# BENCHMARK (calendar only -- not part of the RS calculation)
 # ============================================================
 
 def download_benchmark():
@@ -271,63 +231,24 @@ def download_benchmark():
 
 # ============================================================
 # STOCK SIGNAL CALCULATION
-#
-# RS SCORE: pure price momentum, benchmark-independent (unchanged
-# from backtest1).
-#
-# BLUE DOT: benchmark-relative diagnostic (same definition as
-# backtest2), used as the ELIGIBILITY GATE.
-#
-# GREEN DOT: also computed and stored (same definition as backtest2),
-# but NOT used as part of the eligibility gate here -- kept purely
-# for reference/analysis (e.g. inspecting the sheet/trade log to see
-# which Blue-Dot entries also happened to be Green-Dot).
 # ============================================================
 
-def compute_stock_data(close, volume, bench_close):
+def compute_stock_data(close, volume):
     close = normalize_series_index(close)
     volume = normalize_series_index(volume)
-    bench_close = normalize_series_index(bench_close)
-
-    aligned = pd.concat([close, bench_close], axis=1, join="inner").dropna()
-    aligned.columns = ["s", "b"]
-    if len(aligned) < 300:
+    if len(close) < 300:
         return None
 
-    volume = volume.reindex(aligned.index).fillna(0)
     avg_volume = volume.rolling(VOLUME_LOOKBACK).mean()
-    liquid = (aligned["s"] > MIN_PRICE) & (avg_volume > MIN_AVG_VOLUME)
+    liquid = (close > MIN_PRICE) & (avg_volume > MIN_AVG_VOLUME)
 
-    w3, w6, w9, w12 = RS_WEIGHTS
-    rs_score = (
-        w3 * (aligned["s"] / aligned["s"].shift(RS_3M) - 1)
-        + w6 * (aligned["s"] / aligned["s"].shift(RS_6M) - 1)
-        + w9 * (aligned["s"] / aligned["s"].shift(RS_9M) - 1)
-        + w12 * (aligned["s"] / aligned["s"].shift(RS_12M) - 1)
-    ) * 100
-
-    # -- RS ratio vs benchmark (diagnostic input only) --
-    rs_ratio = aligned["s"] / aligned["b"]
-
-    # -- Blue Dot: RS ratio makes a new LOOKBACK_DAYS high --
-    previous_rs_high = rs_ratio.shift(1).rolling(LOOKBACK_DAYS).max()
-    blue_dot = rs_ratio > previous_rs_high
-
-    # -- Price at a new LOOKBACK_DAYS high --
-    previous_price_high = aligned["s"].shift(1).rolling(LOOKBACK_DAYS).max()
-    price_at_new_high = aligned["s"] > previous_price_high
-
-    # -- Green Dot: Blue Dot firing while price has NOT also broken out --
-    green_dot = blue_dot & (~price_at_new_high)
+    rs_score = (close / close.shift(RS_PERIOD) - 1) * 100
 
     result = pd.DataFrame({
-        "price": aligned["s"],
+        "price": close,
         "avg_volume": avg_volume,
         "liquid": liquid,
         "rs_score": rs_score,
-        "rs_ratio": rs_ratio,
-        "blue_dot": blue_dot,
-        "green_dot": green_dot,
     })
     result.index = normalize_dates(result.index)
     return result
@@ -341,78 +262,28 @@ def get_row(df, date):
     return row.iloc[-1] if isinstance(row, pd.DataFrame) else row
 
 
-def build_wide_frames(all_stocks):
-    """Precompute wide (date x symbol) frames ONCE before the backtest
-    loop, instead of doing a per-symbol df.loc[date] Python-level
-    lookup for every stock on every single trading day.
+def build_daily_ranking(all_stocks, date):
+    """Rank all eligible stocks by RS, descending. Rule 1."""
 
-    build_daily_ranking (below) previously iterated `for symbol, df in
-    all_stocks.items(): row = get_row(df, date); ...` inside the daily
-    loop -- that's stocks x days individual pandas .loc calls (e.g.
-    750 stocks x 2,500 days = ~1.9M calls), each carrying real
-    per-call overhead (index hashing, Series construction, dict
-    building). At full NSE-universe scale that alone can run into
-    tens of minutes.
+    ranking = []
+    for symbol, df in all_stocks.items():
+        row = get_row(df, date)
+        if row is None:
+            continue
+        rs = row["rs_score"]
+        if pd.isna(rs) or not bool(row["liquid"]):
+            continue
+        price = row["price"]
+        if pd.isna(price) or float(price) <= 0:
+            continue
+        ranking.append((symbol, float(rs), float(price)))
 
-    Building 4 wide DataFrames up front (one vectorized pd.concat
-    each) and then doing ONE row-slice per frame per day turns that
-    into O(days) vectorized numpy operations instead of O(days x
-    stocks) Python-level ones. Missing dates for a given stock
-    naturally become NaN/False in the wide frame, which matches the
-    original "date not in df.index -> treat as ineligible" behavior.
-    """
-
-    if not all_stocks:
-        empty = pd.DataFrame()
-        return empty, empty, empty, empty
-
-    price_wide = pd.concat({s: df["price"] for s, df in all_stocks.items()}, axis=1)
-    rs_wide = pd.concat({s: df["rs_score"] for s, df in all_stocks.items()}, axis=1)
-    liquid_wide = pd.concat({s: df["liquid"] for s, df in all_stocks.items()},
-                             axis=1).fillna(False).astype(bool)
-    blue_wide = pd.concat({s: df["blue_dot"] for s, df in all_stocks.items()},
-                           axis=1).fillna(False).astype(bool)
-
-    return price_wide, rs_wide, liquid_wide, blue_wide
-
-
-def build_daily_ranking(date, price_wide, rs_wide, liquid_wide, blue_wide):
-    """Rank ELIGIBLE stocks by RS, descending -- vectorized version.
-
-    Eligibility (this backtest only):
-        liquid AND blue_dot
-
-    Green Dot is still COMPUTED and stored on every stock's signal
-    row (see compute_stock_data), but it is NOT part of the buying
-    criteria here -- it's tracked/available for reference only.
-
-    Same semantics as the original per-symbol-loop version, just
-    computed via one row-slice per wide frame instead of iterating
-    every stock in a Python for-loop.
-    """
-
-    date = pd.Timestamp(date).normalize()
-    if rs_wide.empty or date not in rs_wide.index:
-        return []
-
-    rs_row = rs_wide.loc[date]
-    price_row = price_wide.loc[date]
-    liquid_row = liquid_wide.loc[date]
-    blue_row = blue_wide.loc[date]
-
-    eligible = liquid_row & blue_row & rs_row.notna() & price_row.notna() & (price_row > 0)
-    if not eligible.any():
-        return []
-
-    sub_rs = rs_row[eligible].astype(float)
-    sub_price = price_row[eligible].astype(float)
-    ordered = sub_rs.sort_values(ascending=False)
-
-    return [(sym, float(ordered[sym]), float(sub_price[sym])) for sym in ordered.index]
+    ranking.sort(key=lambda x: x[1], reverse=True)
+    return ranking
 
 
 # ============================================================
-# TRADE EXECUTION -- UNCHANGED FROM BACKTEST1
+# TRADE EXECUTION
 # ============================================================
 
 def execute_buy(symbol, price, qty, date, cash, holdings, trade_log):
@@ -445,24 +316,11 @@ def execute_buy(symbol, price, qty, date, cash, holdings, trade_log):
     return cash, True
 
 
-def buy_missing_top10(missing_symbols, price_lookup, date, cash, holdings, trade_log,
-                       unfilled_log=None):
-    """Buy every missing Top-10 name that cash actually allows.
-
-    UNLIKE backtest1, this does NOT raise when the exact target can't
-    be fully funded. Blue Dot is a transient single-day signal
-    (unlike a slow-moving RS score), so the daily target set can
-    rotate almost completely, fragmenting cash into remainders that
-    occasionally can't cover every missing name. Rather than treat
-    that as fatal, we fill what cash currently allows, evenly split
-    across remaining slots (no reservation for later names -- see
-    the in-loop comment for why), and SKIP any name we can't fund --
-    it simply stays unheld until cash frees up or it drops out of
-    the target on a later day.
-
-    missing_symbols is already in RS-rank order (best first), so
-    skips fall on the lowest-conviction names when cash is tight.
-    """
+def buy_missing_top10(missing_symbols, price_lookup, date, cash, holdings, trade_log):
+    """Buy every missing Top-10 name (rules 5-8): reserve enough
+    cash for at least one share of every remaining entrant before
+    sizing the current one, so an earlier purchase can never starve
+    a later one. Cash is otherwise divided ~equally across slots."""
 
     if not missing_symbols:
         return cash
@@ -473,53 +331,46 @@ def buy_missing_top10(missing_symbols, price_lookup, date, cash, holdings, trade
             raise RuntimeError(f"{date:%Y-%m-%d}: Top-10 stock {symbol} "
                                 f"has invalid entry price.")
 
+    minimum_required = sum(minimum_cash_for_one_share(price_lookup[s])
+                            for s in missing_symbols)
+    if cash + 1e-9 < minimum_required:
+        raise RuntimeError(
+            f"{date:%Y-%m-%d}: Cannot fill Top 10. Cash Rs.{cash:,.2f}, but "
+            f"minimum cash required for one share each of {len(missing_symbols)} "
+            f"missing Top-10 stocks is Rs.{minimum_required:,.2f}. Exact "
+            f"10-stock portfolio is impossible without borrowing/fractional shares."
+        )
+
     for i, symbol in enumerate(missing_symbols):
         price = float(price_lookup[symbol])
+        remaining = missing_symbols[i + 1:]
+        reserve_for_later = sum(minimum_cash_for_one_share(price_lookup[s])
+                                 for s in remaining)
+        cash_available = cash - reserve_for_later
         slots_remaining = len(missing_symbols) - i
 
-        # NOTE: no "reserve cash for later names" here (unlike
-        # backtest1). That reservation logic assumed every name was
-        # guaranteed affordable overall (backtest1 checked this
-        # upfront and raised if not). Once full-fill is no longer
-        # guaranteed, reserving for a LATER name that turns out to be
-        # unaffordable anyway would wrongly zero out the budget for
-        # THIS affordable name too. Instead: divide currently
-        # available cash evenly across remaining slots, try to buy
-        # this one, and let any cash a skip leaves behind roll
-        # forward into the next iteration's (recomputed) equal split.
         equal_budget = cash / slots_remaining
         minimum_current = minimum_cash_for_one_share(price)
-        target_budget = min(max(equal_budget, minimum_current), cash)
+        target_budget = max(equal_budget, minimum_current)
+        target_budget = min(target_budget, cash_available)
 
         qty = max_affordable_qty(price, target_budget)
         if qty < 1:
-            # Can't afford even one share within the budget carved out
-            # for this name -- skip it, don't crash the backtest.
-            if unfilled_log is not None:
-                unfilled_log.append({
-                    "date": date.strftime("%Y-%m-%d"), "symbol": symbol,
-                    "price": round(price, 4), "cash_at_skip": round(cash, 2),
-                    "reason": "INSUFFICIENT_CASH_FOR_ONE_SHARE",
-                })
-            continue
+            raise RuntimeError(
+                f"{date:%Y-%m-%d}: Internal sizing failure for {symbol}. "
+                f"Price Rs.{price:,.2f}, budget Rs.{target_budget:,.2f}."
+            )
 
         cash, bought = execute_buy(symbol, price, qty, date, cash, holdings, trade_log)
-        if not bought and unfilled_log is not None:
-            unfilled_log.append({
-                "date": date.strftime("%Y-%m-%d"), "symbol": symbol,
-                "price": round(price, 4), "cash_at_skip": round(cash, 2),
-                "reason": "BUY_EXECUTION_FAILED",
-            })
+        if not bought:
+            raise RuntimeError(f"{date:%Y-%m-%d}: Buy execution unexpectedly "
+                                f"failed for {symbol}.")
 
     return cash
 
 
 # ============================================================
-# BACKTEST ENGINE -- UNCHANGED FROM BACKTEST1
-#
-# (build_daily_ranking already encodes the Blue Dot filter, so
-# everything downstream -- entries, exits, the hard portfolio
-# invariants, mark-to-market -- is identical.)
+# BACKTEST ENGINE
 # ============================================================
 
 def run_backtest(all_stocks, trading_days):
@@ -527,20 +378,13 @@ def run_backtest(all_stocks, trading_days):
     holdings = {}
     trade_log = []
     equity_curve = []
-    unfilled_log = []
     initialized = False
     n_days = len(trading_days)
-
-    print("Building wide (date x symbol) frames for fast daily ranking...")
-    build_start = time.time()
-    price_wide, rs_wide, liquid_wide, blue_wide = build_wide_frames(all_stocks)
-    print(f"Wide frames built in {time.time() - build_start:.1f}s "
-          f"({len(all_stocks)} symbols x {len(rs_wide.index)} dates).")
 
     for day_number, date in enumerate(trading_days, start=1):
         date = pd.Timestamp(date).normalize()
 
-        ranking = build_daily_ranking(date, price_wide, rs_wide, liquid_wide, blue_wide)
+        ranking = build_daily_ranking(all_stocks, date)
         rank_lookup = {sym: rank for rank, (sym, _, _) in enumerate(ranking, start=1)}
         price_lookup = {sym: float(price) for sym, _, price in ranking}
 
@@ -552,11 +396,11 @@ def run_backtest(all_stocks, trading_days):
         if not initialized:
             if today_top10:
                 cash = buy_missing_top10(today_top10, price_lookup, date, cash,
-                                          holdings, trade_log, unfilled_log)
+                                          holdings, trade_log)
             initialized = True
 
         else:
-            # -- exits: sell every holding that dropped out of the target --
+            # -- exits: sell every holding that dropped out of Top 10 --
             exit_symbols = [s for s in holdings if s not in today_top10_set]
 
             for symbol in exit_symbols:
@@ -567,7 +411,7 @@ def run_backtest(all_stocks, trading_days):
                     exit_reason = f"RANK_{rank_lookup.get(symbol)}_DROPPED_OUTSIDE_TOP10"
                 else:
                     exit_price = float(position.get("last_price", position["entry_price"]))
-                    exit_reason = "MISSING_FROM_FILTERED_RANKING_FORCE_EXIT"
+                    exit_reason = "MISSING_FROM_RANKING_FORCE_EXIT"
 
                 qty = int(position["qty"])
                 gross_proceeds = qty * exit_price
@@ -599,7 +443,7 @@ def run_backtest(all_stocks, trading_days):
                     "exit_reason": exit_reason,
                 })
 
-            # -- mark retained holdings, then buy every missing name --
+            # -- mark retained holdings, then buy every missing Top-10 name --
             for symbol, position in holdings.items():
                 if symbol in price_lookup:
                     position["last_price"] = float(price_lookup[symbol])
@@ -608,30 +452,35 @@ def run_backtest(all_stocks, trading_days):
             missing_top10 = [s for s in today_top10 if s not in holdings]
             if missing_top10:
                 cash = buy_missing_top10(missing_top10, price_lookup, date, cash,
-                                          holdings, trade_log, unfilled_log)
+                                          holdings, trade_log)
 
-        # -- portfolio checks (rule 9, RELAXED for this filter) --
-        # backtest1 treated "exactly target_size holdings" as a hard
-        # invariant and raised on any shortfall. Here, because Blue
-        # Dot/Green Dot is a transient signal that can rotate the
-        # target set almost entirely day to day, cash can legitimately
-        # be too fragmented to fill every slot. We still HARD-fail on
-        # holding a stock outside today's target (that would be a real
-        # logic bug), but an under-filled count is expected behavior,
-        # logged rather than fatal.
+        # -- hard portfolio invariants (rule 9) --
         held_symbols = set(holdings.keys())
         expected_symbols = set(today_top10)
 
         illegal_holdings = held_symbols - expected_symbols
         if illegal_holdings:
             raise RuntimeError(f"{date:%Y-%m-%d}: Portfolio contains stocks "
-                                f"outside today's target: {sorted(illegal_holdings)}")
+                                f"outside today's Top 10: {sorted(illegal_holdings)}")
 
         missing_after_rebalance = expected_symbols - held_symbols
-        if missing_after_rebalance and day_number % 100 == 0:
-            print(f"{date:%Y-%m-%d}: under target -- missing "
-                  f"{sorted(missing_after_rebalance)}. "
-                  f"Holdings={len(holdings)}, Target={target_size}, Cash=Rs.{cash:,.2f}")
+        if missing_after_rebalance:
+            raise RuntimeError(
+                f"{date:%Y-%m-%d}: REBALANCE FAILURE. Missing Top-10 stocks "
+                f"after trading: {sorted(missing_after_rebalance)}. "
+                f"Holdings={len(holdings)}, Target={target_size}, Cash=Rs.{cash:,.2f}"
+            )
+
+        if len(holdings) != target_size:
+            raise RuntimeError(f"{date:%Y-%m-%d}: HOLDING COUNT FAILURE. "
+                                f"Expected {target_size}, found {len(holdings)}.")
+
+        if eligible_pool_size >= TOP_N and len(holdings) != TOP_N:
+            raise RuntimeError(
+                f"{date:%Y-%m-%d}: Expected exactly {TOP_N} holdings because "
+                f"eligible pool contains {eligible_pool_size} stocks. "
+                f"Actual holdings={len(holdings)}."
+            )
 
         # -- daily mark-to-market --
         total_value = float(cash)
@@ -657,9 +506,8 @@ def run_backtest(all_stocks, trading_days):
 
         if day_number % 100 == 0:
             print(f"Processed {day_number}/{n_days} | {date:%Y-%m-%d} | "
-                  f"EligiblePool(BlueDot)={eligible_pool_size} | "
-                  f"Holdings={len(holdings)} | Cash=Rs.{cash:,.0f} | "
-                  f"Equity=Rs.{total_value:,.0f}")
+                  f"EligiblePool={eligible_pool_size} | Holdings={len(holdings)} | "
+                  f"Cash=Rs.{cash:,.0f} | Equity=Rs.{total_value:,.0f}")
 
     equity_df = pd.DataFrame(equity_curve)
     if not equity_df.empty:
@@ -671,18 +519,22 @@ def run_backtest(all_stocks, trading_days):
                            if not equity_df.empty else STARTING_CAPITAL)
 
     open_df, final_liquidation_value = _liquidate_open_positions(
-        price_wide, rs_wide, liquid_wide, blue_wide, trading_days, holdings, cash
+        all_stocks, trading_days, holdings, cash
     )
 
-    unfilled_df = pd.DataFrame(unfilled_log)
-
-    return (equity_df, trade_df, open_df, final_marked_value,
-            final_liquidation_value, unfilled_df)
+    return equity_df, trade_df, open_df, final_marked_value, final_liquidation_value
 
 
 def _add_equity_analytics_columns(equity_df):
     """Adds drawdown and normalised-to-zero equity-curve columns.
-    Unchanged from backtest1."""
+
+    equity_curve_pct_norm is the cumulative % move of the total
+    portfolio value since day 1 of the whole backtest (same
+    information as equity_multiple, expressed as % starting at 0
+    instead of a multiple starting at 1). One additional column is
+    added per entry in CHART_WINDOWS, each rebased to 0% at the
+    start of its own rolling window (blank before that window).
+    """
 
     running_max = equity_df["equity_multiple"].cummax()
     equity_df["drawdown_pct"] = ((equity_df["equity_multiple"] / running_max - 1)
@@ -697,6 +549,11 @@ def _add_equity_analytics_columns(equity_df):
         window_start = max(len(equity_df) - window_days, 0)
         base_value = float(equity_df["portfolio_value_rs"].iloc[window_start])
 
+        # NaN (not "") keeps the column numeric end-to-end; newer
+        # pandas can infer a strict string dtype for a column first
+        # populated with "", which then rejects numeric values
+        # written into it afterwards. sanitize_for_sheets() blanks
+        # any remaining NaN to "" at write time.
         series = pd.Series(np.nan, index=equity_df.index, dtype=float)
         series.iloc[window_start:] = (
             (equity_df["portfolio_value_rs"].iloc[window_start:] / base_value - 1) * 100
@@ -706,8 +563,7 @@ def _add_equity_analytics_columns(equity_df):
     return equity_df
 
 
-def _liquidate_open_positions(price_wide, rs_wide, liquid_wide, blue_wide,
-                               trading_days, holdings, cash):
+def _liquidate_open_positions(all_stocks, trading_days, holdings, cash):
     liquidation_cash = float(cash)
     open_positions = []
 
@@ -716,8 +572,7 @@ def _liquidate_open_positions(price_wide, rs_wide, liquid_wide, blue_wide,
 
     last_date = pd.Timestamp(trading_days[-1]).normalize()
     final_price_lookup = {sym: float(price) for sym, _, price
-                           in build_daily_ranking(last_date, price_wide, rs_wide,
-                                                   liquid_wide, blue_wide)}
+                           in build_daily_ranking(all_stocks, last_date)}
 
     for symbol, position in holdings.items():
         exit_price = final_price_lookup.get(
@@ -828,31 +683,32 @@ def summarize(equity_df, trade_df, final_marked_value, final_liquidation_value):
         "Average Days Held": round(avg_days, 1),
         "Total Transaction Costs (Rs)": round(total_costs, 0),
         "Total STCG Tax (Rs)": round(total_tax, 0),
-        "RS Formula": "40% 3M + 20% 6M + 20% 9M + 20% 12M",
-        "Entry Filter": f"Blue Dot only (RS-ratio {LOOKBACK_DAYS}D new high). "
-                         "Green Dot computed/logged but not part of entry criteria.",
-        "Portfolio": "Exact daily Top 10 of Blue-Dot-filtered RS ranking",
+        "RS Formula": "6M Price Rate-of-Change (100% weight)",
+        "Portfolio": "Exact daily Top 10 RS membership",
         "Weight": "Available replacement cash divided across missing Top-10 "
                   "names; retained positions untouched",
-        "Entry": "Initial filtered Top 10; subsequently every missing name",
-        "Exit": "Drops out of filtered Top 10 (rank/dot/liquidity loss) or "
-                "missing from ranking",
+        "Entry": "Initial Top 10; subsequently every missing Top-10 stock",
+        "Exit": "Rank 11+ or missing from eligible ranking",
         "Execution": "Same-day close (T+0)",
         "Rebalance Frequency": "Daily membership check; no resizing of "
                                 "retained positions",
         "Price Filter": f"> Rs.{MIN_PRICE}",
         "Liquidity Filter": f"{VOLUME_LOOKBACK}D average volume > {MIN_AVG_VOLUME:,}",
-        "Other Filters": f"Blue Dot only (lookback {LOOKBACK_DAYS}D). Green Dot "
-                          "computed/logged but not gating. No price/RS trend "
-                          "template, no sector/regime/breadth filter.",
+        "Other Filters": "NONE",
     }
 
 
 # ============================================================
-# GOOGLE SHEETS -- UNCHANGED FROM BACKTEST1
+# GOOGLE SHEETS
 # ============================================================
 
 def sanitize_for_sheets(df):
+    """NaN/+-Infinity are not valid JSON, and gspread's ws.update()
+    will raise InvalidJSONError if either reaches it. Blanks such
+    cells to "" rather than letting one bad value fail the whole
+    upload -- protects any numeric column, present now or added
+    later, that could end up with NaN/inf before enough data exists."""
+
     if df.empty:
         return df
     clean = df.replace([np.inf, -np.inf], np.nan)
@@ -921,6 +777,12 @@ def remove_existing_charts(sh, sheet_id):
 
 
 def add_charts(sh, sheet_id, equity_header_row_0idx, n_equity_rows, equity_columns):
+    """All series are addressed by COLUMN NAME (via equity_columns,
+    the equity_df.columns actually written to the sheet) rather than
+    hardcoded integer positions -- if a column is ever added, removed,
+    or reordered upstream, a chart will raise KeyError instead of
+    silently plotting the wrong series."""
+
     col_idx = {name: i for i, name in enumerate(equity_columns)}
     data_end_row = equity_header_row_0idx + 1 + n_equity_rows
 
@@ -943,6 +805,12 @@ def add_charts(sh, sheet_id, equity_header_row_0idx, n_equity_rows, equity_colum
         }
 
         if show_points:
+            # Dot on every end-of-day point plus that point's own
+            # value printed below it. The Sheets Charts API has no
+            # rotate/vertical-text property for data labels --
+            # "placement" only accepts ABOVE/BELOW/LEFT/RIGHT/
+            # CENTER/INSIDE_END -- so BELOW + a small font is the
+            # closest available fix for reducing label overlap.
             series_entry["pointStyle"] = {"size": 5, "shape": "CIRCLE"}
             series_entry["dataLabel"] = {
                 "type": "DATA", "placement": "BELOW",
@@ -980,13 +848,16 @@ def add_charts(sh, sheet_id, equity_header_row_0idx, n_equity_rows, equity_colum
         make_chart("Drawdown (%)", "drawdown_pct", "Drawdown %",
                     equity_header_row_0idx + 22),
 
-        make_chart("Eligible Pool Size (Blue Dot)", "eligible_pool_size",
-                    "Stock Count", equity_header_row_0idx + 44),
+        make_chart("Eligible Pool Size", "eligible_pool_size", "Stock Count",
+                    equity_header_row_0idx + 44),
 
+        # Since inception -- same start row as the equity curve
+        # itself, so it is never truncated.
         make_chart("Equity Curve - Normalised to Zero (%, Since Inception)",
                     "equity_curve_pct_norm", "Cumulative Change %",
                     equity_header_row_0idx + 66),
 
+        # Last 50 days -- dot + label per point, widened for room.
         make_chart("Equity Curve - Normalised to Zero (%, Last 50 Days)",
                     "equity_curve_pct_norm_last50", "Cumulative Change %",
                     equity_header_row_0idx + 88,
@@ -1012,18 +883,16 @@ def add_charts(sh, sheet_id, equity_header_row_0idx, n_equity_rows, equity_colum
         print(f"Could not add charts (non-fatal): {e}")
 
 
-def write_to_sheet(trade_df, equity_df, open_df, summary, unfilled_df, effective_end_str):
+def write_to_sheet(trade_df, equity_df, open_df, summary, effective_end_str):
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
 
     if not sheet_id or not creds_json:
         print("Missing SHEET_ID/GOOGLE_CREDENTIALS -- saving to CSV instead.")
-        trade_df.to_csv("RS_BlueGreenDot_Trade_Log.csv", index=False)
-        equity_df.to_csv("RS_BlueGreenDot_Equity_Curve.csv", index=False)
+        trade_df.to_csv("RS6M_Trade_Log.csv", index=False)
+        equity_df.to_csv("RS6M_Equity_Curve.csv", index=False)
         if not open_df.empty:
-            open_df.to_csv("RS_BlueGreenDot_Open_Positions.csv", index=False)
-        if not unfilled_df.empty:
-            unfilled_df.to_csv("RS_BlueGreenDot_Unfilled_Slots.csv", index=False)
+            open_df.to_csv("RS6M_Open_Positions.csv", index=False)
         return
 
     creds = Credentials.from_service_account_info(
@@ -1033,15 +902,17 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, unfilled_df, effective
     sh = gc.open_by_key(sheet_id)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
 
+    # Sheet must be wide enough for the widest section actually
+    # being written -- not a fixed guess. Previously hardcoded to
+    # 16, which happened to be enough today but would silently
+    # truncate/error the moment any section grew past it.
     n_cols_needed = max(
         len(trade_df.columns) if not trade_df.empty else 0,
         len(equity_df.columns) if not equity_df.empty else 0,
         len(open_df.columns) if not open_df.empty else 0,
-        len(unfilled_df.columns) if not unfilled_df.empty else 0,
-        2,
+        2,  # summary is always 2 columns (key, value)
     )
-    n_rows_needed = (len(trade_df) + len(equity_df) + len(open_df)
-                      + len(unfilled_df) + len(summary) + 60)
+    n_rows_needed = len(trade_df) + len(equity_df) + len(open_df) + len(summary) + 60
 
     ws = get_or_create_worksheet(sh, BACKTEST_WORKSHEET,
                                   rows=n_rows_needed, cols=n_cols_needed)
@@ -1053,14 +924,12 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, unfilled_df, effective
     ws.clear()
 
     ws.update([[
-        "TOP 10 RS ROTATION BACKTEST -- BLUE DOT FILTERED (Green Dot tracked, "
-        "not used for entry) | "
+        "TOP 10 RS6M ROTATION BACKTEST | "
         f"run {timestamp} | NET of costs+STCG | "
         f"Capital: Rs.{STARTING_CAPITAL:,.0f} | "
-        "Entry filter: Blue Dot only | "
-        "Target: exact Top 10 of filtered RS ranking | "
-        "Retained holdings NOT resized | Sell on drop from filtered Top 10 | "
-        "Available exit cash funds all missing names | Same EOD bar | "
+        "Target: exact Top 10 6M-RS membership | "
+        "Retained Top-10 holdings NOT resized | Sell rank 11+ / missing | "
+        "Available exit cash funds all missing Top-10 names | Same EOD bar | "
         f"Window: {BACKTEST_START} to {effective_end_str}"
     ]], "A1")
 
@@ -1097,19 +966,9 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, unfilled_df, effective
         add_charts(sh, ws.id, equity_header_row - 1, len(equity_df),
                    equity_columns=list(equity_df_clean.columns))
 
-    unfilled_start_row = equity_header_row + len(equity_df) + 3
-    ws.update([["Unfilled Slots (buy attempts skipped -- insufficient cash)"]],
-              f"A{unfilled_start_row}")
-    unfilled_header_row = unfilled_start_row + 1
-
-    if not unfilled_df.empty:
-        unfilled_df_clean = sanitize_for_sheets(unfilled_df)
-        ws.update([list(unfilled_df_clean.columns)] + unfilled_df_clean.values.tolist(),
-                  f"A{unfilled_header_row}")
-
     print(f"\nBacktest results written to '{BACKTEST_WORKSHEET}' tab: "
           f"{len(trade_df)} trades, {len(equity_df)} trading days, "
-          f"{len(open_df)} open positions, {len(unfilled_df)} unfilled buy attempts.")
+          f"{len(open_df)} open positions.")
 
 
 # ============================================================
@@ -1119,22 +978,20 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, unfilled_df, effective
 def main():
     print()
     print("=" * 70)
-    print("TOP 10 RS ROTATION BACKTEST -- BLUE DOT FILTERED (Green Dot tracked, not used for entry)")
+    print("TOP 10 RS6M ROTATION BACKTEST")
     print("=" * 70)
     print(f"Backtest start : {BACKTEST_START}")
     print(f"Backtest end   : {BACKTEST_END if BACKTEST_END else 'LATEST'}")
-    print("Ranking        : DAILY RS SCORE, FILTERED TO BLUE DOT")
-    print("Portfolio      : EXACT TOP 10 OF FILTERED RANKING")
-    print("Initial        : BUY ALL FILTERED TOP 10")
-    print("Rotation       : SELL ONLY STOCKS LEAVING FILTERED TOP 10")
-    print("New entries    : BUY EVERY MISSING FILTERED-TOP-10 STOCK")
+    print("Ranking        : DAILY 6-MONTH RS SCORE ONLY")
+    print("Portfolio      : EXACT TOP 10 RS MEMBERSHIP")
+    print("Initial        : BUY ALL TOP 10")
+    print("Rotation       : SELL ONLY STOCKS LEAVING TOP 10")
+    print("New entries    : BUY EVERY MISSING TOP-10 STOCK")
     print("Existing names : HOLD / NO RESIZING")
     print("Sizing         : AVAILABLE CASH / MISSING SLOTS")
     print("Execution      : SAME EOD BAR (T+0)")
     print(f"Price filter   : > Rs.{MIN_PRICE}")
     print(f"Liquidity      : {VOLUME_LOOKBACK}D average volume > {MIN_AVG_VOLUME:,}")
-    print(f"Entry filter   : Blue Dot only ({LOOKBACK_DAYS}D lookback). "
-          f"Green Dot computed/logged but not gating.")
     print("Other filters  : NONE")
     print("=" * 70)
 
@@ -1145,57 +1002,23 @@ def main():
     print(f"Download start: {download_start}")
     print(f"Download end: {download_end if download_end else 'LATEST'}")
 
-    run_start_time = time.time()
-
     bench_close = download_benchmark()
     bench_close.index = normalize_dates(bench_close.index)
-    print(f"[elapsed {time.time() - run_start_time:.0f}s] Benchmark ready.")
 
     all_stocks = {}
     total_bad_points = 0
-    failed_batches = []
-    # Smaller batches than backtest1/2's 50 reduce how many concurrent
-    # connections hit Yahoo at once -- large concurrent batches are
-    # the most common trigger for Yahoo's per-IP rate limiting on
-    # shared CI runners, which otherwise shows up as yfinance quietly
-    # retrying for a very long time with NO log output at all.
-    batch_size = 25
-    # Hard cap per batch attempt. yfinance/requests can otherwise sit
-    # retrying a rate-limited or unresponsive batch far longer than
-    # this with nothing printed -- better to log the failure, skip
-    # those tickers, and move on than to look "stuck" with no signal.
-    DOWNLOAD_TIMEOUT_SECONDS = 30
-    n_batches = (len(tickers) + batch_size - 1) // batch_size
+    batch_size = 50
 
-    for batch_num, start in enumerate(range(0, len(tickers), batch_size), start=1):
+    for start in range(0, len(tickers), batch_size):
         batch = tickers[start:start + batch_size]
-        batch_start_time = time.time()
-        print(f"\n[elapsed {time.time() - run_start_time:.0f}s] "
-              f"Downloading batch {batch_num}/{n_batches} "
-              f"({start + 1}-{start + len(batch)} of {len(tickers)})")
+        print(f"\nDownloading {start + 1}-{start + len(batch)} of {len(tickers)}")
 
-        data = None
-        for attempt in range(1, 3):
-            try:
-                data = yf.download(batch, start=download_start, end=download_end,
-                                    interval="1d", auto_adjust=True, progress=False,
-                                    group_by="ticker", threads=True,
-                                    timeout=DOWNLOAD_TIMEOUT_SECONDS)
-                break
-            except Exception as e:
-                print(f"  Attempt {attempt}/2 failed after "
-                      f"{time.time() - batch_start_time:.0f}s: {e}")
-                if attempt == 2:
-                    failed_batches.append((batch_num, batch))
-                    print(f"  Giving up on batch {batch_num} after 2 attempts -- "
-                          f"skipping its {len(batch)} tickers.")
-                else:
-                    time.sleep(3)
-
-        print(f"  Batch {batch_num} download call finished in "
-              f"{time.time() - batch_start_time:.0f}s.")
-
-        if data is None:
+        try:
+            data = yf.download(batch, start=download_start, end=download_end,
+                                interval="1d", auto_adjust=True, progress=False,
+                                group_by="ticker", threads=True)
+        except Exception as e:
+            print(f"Batch failed: {e}")
             continue
 
         for symbol in batch:
@@ -1220,7 +1043,7 @@ def main():
                 close, n_bad = clean_price_series(close)
                 total_bad_points += n_bad
 
-                stock_data = compute_stock_data(close, volume, bench_close)
+                stock_data = compute_stock_data(close, volume)
                 if stock_data is None:
                     continue
 
@@ -1231,14 +1054,8 @@ def main():
 
         time.sleep(1)
 
-    print(f"\n[elapsed {time.time() - run_start_time:.0f}s] "
-          f"Stocks with usable data: {len(all_stocks)}")
+    print(f"\nStocks with usable data: {len(all_stocks)}")
     print(f"Repaired data points: {total_bad_points}")
-    if failed_batches:
-        skipped_tickers = [t for _, batch in failed_batches for t in batch]
-        print(f"WARNING: {len(failed_batches)} batch(es) failed after 2 attempts "
-              f"each (likely Yahoo rate-limiting) -- {len(skipped_tickers)} "
-              f"tickers skipped entirely this run: {skipped_tickers}")
 
     if not all_stocks:
         raise RuntimeError("No usable stock data.")
@@ -1270,34 +1087,29 @@ def main():
     print(f"First day: {trading_days[0]:%Y-%m-%d}")
     print(f"Last day: {trading_days[-1]:%Y-%m-%d}")
 
-    print(f"\n[elapsed {time.time() - run_start_time:.0f}s] Running backtest...")
-    backtest_start_time = time.time()
-    equity_df, trade_df, open_df, final_marked, final_liq, unfilled_df = run_backtest(
+    print("\nRunning backtest...")
+    equity_df, trade_df, open_df, final_marked, final_liq = run_backtest(
         all_stocks, trading_days
     )
-    print(f"[elapsed {time.time() - run_start_time:.0f}s] Backtest loop finished "
-          f"in {time.time() - backtest_start_time:.0f}s.")
 
     if not equity_df.empty:
-        # Under-fill is EXPECTED with a transient filter like Blue Dot
-        # Dot -- reported for visibility, not treated as a failure.
         broken = equity_df[equity_df["n_holdings"] != equity_df["top10_target_size"]]
         if not broken.empty:
-            print(f"\nNOTE: {len(broken)}/{len(equity_df)} trading days held fewer "
-                  f"positions than that day's target ({TOP_N} or eligible pool size, "
-                  f"whichever is smaller) -- cash was insufficient to fill every "
-                  f"slot. This is expected with a transient entry filter; see the "
-                  f"'Unfilled Slots' log for details.")
+            print()
+            print(broken.to_string())
+            raise RuntimeError(f"PORTFOLIO AUDIT FAILED: {len(broken)} trading days "
+                                f"did not contain the required number of holdings.")
 
-        low_pool_days = int((equity_df["eligible_pool_size"] < TOP_N).sum())
-        if low_pool_days:
-            print(f"NOTE: {low_pool_days}/{len(equity_df)} trading days had fewer "
-                  f"than {TOP_N} names passing Blue Dot -- portfolio "
-                  f"target itself was <10 names on those days by design.")
+        full_pool = equity_df[equity_df["eligible_pool_size"] >= TOP_N]
+        non_ten = full_pool[full_pool["n_holdings"] != TOP_N]
+        if not non_ten.empty:
+            print()
+            print(non_ten.to_string())
+            raise RuntimeError("TOP-10 AUDIT FAILED: at least one trading day had "
+                                "10+ eligible stocks but did not hold exactly 10.")
 
-        if not unfilled_df.empty:
-            print(f"NOTE: {len(unfilled_df)} individual buy attempts were skipped "
-                  f"for insufficient cash across the whole backtest.")
+        print("\nPORTFOLIO AUDIT PASSED.")
+        print("Every day held exactly the required Top-10 target count.")
 
     summary = summarize(equity_df, trade_df, final_marked, final_liq)
 
@@ -1309,20 +1121,15 @@ def main():
         print(f"{key}: {value}")
     print("=" * 70)
 
-    write_to_sheet(trade_df, equity_df, open_df, summary, unfilled_df,
-                   effective_end.strftime("%Y-%m-%d"))
-    print(f"[elapsed {time.time() - run_start_time:.0f}s] Sheet write finished.")
+    write_to_sheet(trade_df, equity_df, open_df, summary, effective_end.strftime("%Y-%m-%d"))
 
-    equity_df.to_csv("RS_BlueGreenDot_Equity_Curve.csv", index=False)
-    trade_df.to_csv("RS_BlueGreenDot_Trade_Log.csv", index=False)
+    equity_df.to_csv("RS6M_Equity_Curve.csv", index=False)
+    trade_df.to_csv("RS6M_Trade_Log.csv", index=False)
     if not open_df.empty:
-        open_df.to_csv("RS_BlueGreenDot_Open_Positions.csv", index=False)
-    if not unfilled_df.empty:
-        unfilled_df.to_csv("RS_BlueGreenDot_Unfilled_Slots.csv", index=False)
+        open_df.to_csv("RS6M_Open_Positions.csv", index=False)
 
     print("\nCSV files also saved.")
-    print(f"\n[TOTAL elapsed {time.time() - run_start_time:.0f}s] "
-          f"BACKTEST COMPLETED SUCCESSFULLY.")
+    print("\nBACKTEST COMPLETED SUCCESSFULLY.")
 
 
 if __name__ == "__main__":
