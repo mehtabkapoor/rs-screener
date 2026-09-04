@@ -315,10 +315,54 @@ def make_stock_chart(sheet_id, title, header_row_0idx, n_rows, anchor_row):
     }}}
 
 
+def call_with_quota_retry(fn, label, max_retries=6, initial_wait_seconds=15):
+    """Runs a Sheets API call, retrying with exponential backoff on a
+    429/quota-exceeded error. Any other exception is raised immediately."""
+
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            is_quota = "429" in str(e) or "Quota exceeded" in str(e)
+            if not is_quota or attempt == max_retries - 1:
+                print(f"{label} failed: {e}")
+                raise
+            wait = initial_wait_seconds * (2 ** attempt)
+            print(f"Google quota hit on {label}. Waiting {wait}s before retry...")
+            time.sleep(wait)
+
+
+def write_rows_in_chunks(ws, all_rows, chunk_size=1500, label="sheet write"):
+    """Writes a full [row1, row2, ...] grid starting at A1 in a small
+    number of large batched calls (with quota retry) instead of one
+    API call per logical section. This is what keeps a 50-chart
+    screener run under the Sheets 'write requests per minute' quota
+    -- a handful of big calls instead of ~150+ tiny ones."""
+
+    total = len(all_rows)
+    if total == 0:
+        return
+
+    for i in range(0, total, chunk_size):
+        chunk = all_rows[i:i + chunk_size]
+        row_start = i + 1
+        call_with_quota_retry(
+            lambda c=chunk, r=row_start: ws.update(c, f"A{r}"),
+            label=f"{label} rows {i}-{i + len(chunk)}",
+        )
+        print(f"Wrote {label}: {min(i + chunk_size, total)}/{total} rows")
+
+
 def write_to_sheet(ranking_df, stock_series_list, skipped_symbols, as_of_date):
     """stock_series_list: list of (rank, symbol, df[date,price,rs_line])
     in rank order, one block per stock, each with its own chart
-    stacked below the previous one for easy scrolling."""
+    stacked below the previous one for easy scrolling.
+
+    All cell content is assembled into a single in-memory grid first
+    and written in a couple of large chunked calls (write_rows_in_chunks)
+    rather than one ws.update() per stock -- 50 stocks x 2 small calls
+    each blew straight through the Sheets 'write requests per minute'
+    quota (429 error) when this was written incrementally."""
 
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
@@ -338,22 +382,34 @@ def write_to_sheet(ranking_df, stock_series_list, skipped_symbols, as_of_date):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
 
     # Each per-stock block: 1 label row + 1 header row + RS_LINE_WINDOW
-    # data rows + 2 blank rows gap. Fixed block height keeps every
-    # chart anchor calculable up front.
+    # data rows + 2 blank rows gap.
     block_height = RS_LINE_WINDOW + 4
     n_rows_needed = 3 + len(ranking_df) + 3 + len(stock_series_list) * block_height + 20
     n_cols_needed = 6  # A-C used by tables; chart floats over D-onward
 
-    ws = get_or_create_worksheet(sh, SCREENER_WORKSHEET,
-                                  rows=n_rows_needed, cols=n_cols_needed)
+    ws = call_with_quota_retry(
+        lambda: get_or_create_worksheet(sh, SCREENER_WORKSHEET,
+                                         rows=n_rows_needed, cols=n_cols_needed),
+        label="get_or_create_worksheet",
+    )
     if ws.row_count < n_rows_needed or ws.col_count < n_cols_needed:
-        ws.resize(rows=max(ws.row_count, n_rows_needed),
-                   cols=max(ws.col_count, n_cols_needed))
+        call_with_quota_retry(
+            lambda: ws.resize(rows=max(ws.row_count, n_rows_needed),
+                               cols=max(ws.col_count, n_cols_needed)),
+            label="resize",
+        )
 
-    remove_existing_charts(sh, ws.id)
-    ws.clear()
+    call_with_quota_retry(lambda: remove_existing_charts(sh, ws.id), label="remove_existing_charts")
+    call_with_quota_retry(lambda: ws.clear(), label="clear")
 
-    ws.update([[
+    # -- assemble the entire sheet as one in-memory grid --
+    rows = []
+
+    def add_row(vals=None):
+        rows.append(vals if vals is not None else [])
+        return len(rows)  # 1-indexed sheet row just written
+
+    add_row([
         f"RS TOP {TOP_N} SCREENER | run {timestamp} | As of: {as_of_date} | "
         f"RS Formula: {RS_PERIOD}D Price Rate-of-Change | "
         f"Per-stock RS Line: price/benchmark rebased to 100 at day 1 of the "
@@ -361,35 +417,35 @@ def write_to_sheet(ranking_df, stock_series_list, skipped_symbols, as_of_date):
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} skipped: incomplete {RS_LINE_WINDOW}-day history) | "
         f"Price filter > Rs.{MIN_PRICE} | Liquidity > {MIN_AVG_VOLUME:,} ({VOLUME_LOOKBACK}D avg vol)"
-    ]], "A1")
-
-    rank_start_row = 3
-    ws.update([["Ranked Stocks (Rank 1 = Strongest RS)"]], f"A{rank_start_row}")
-    rank_header_row = rank_start_row + 1
+    ])
+    add_row([])
+    add_row(["Ranked Stocks (Rank 1 = Strongest RS)"])
 
     ranking_clean = sanitize_for_sheets(ranking_df)
-    ws.update([list(ranking_clean.columns)] + ranking_clean.values.tolist(),
-              f"A{rank_header_row}")
+    add_row(list(ranking_clean.columns))
+    for r in ranking_clean.values.tolist():
+        add_row(r)
 
     if skipped_symbols:
-        skip_row = rank_header_row + len(ranking_df) + 1
-        ws.update([[f"Skipped (incomplete {RS_LINE_WINDOW}-day history): "
-                     + ", ".join(skipped_symbols)]], f"A{skip_row}")
+        add_row([f"Skipped (incomplete {RS_LINE_WINDOW}-day history): "
+                 + ", ".join(skipped_symbols)])
+
+    add_row([])
+    add_row([])
 
     # -- per-stock blocks, stacked vertically for scrolling --
-    block_start_row = rank_header_row + len(ranking_df) + 4  # 1-indexed sheet row
-
     chart_requests = []
     for rank, symbol, df in stock_series_list:
-        label_row = block_start_row
-        header_row = label_row + 1
+        label_row = add_row([f"Rank {rank} - {symbol}"])
+        header_row = add_row(list(df.columns))
         header_row_0idx = header_row - 1  # 0-indexed for chart API
 
-        ws.update([[f"Rank {rank} - {symbol}"]], f"A{label_row}")
-
         df_clean = sanitize_for_sheets(df)
-        ws.update([list(df_clean.columns)] + df_clean.values.tolist(),
-                  f"A{header_row}")
+        for r in df_clean.values.tolist():
+            add_row(r)
+
+        add_row([])
+        add_row([])
 
         chart_requests.append(make_stock_chart(
             ws.id, f"Rank {rank} - {symbol}: Price & RS Line "
@@ -397,19 +453,25 @@ def write_to_sheet(ranking_df, stock_series_list, skipped_symbols, as_of_date):
             header_row_0idx, len(df), anchor_row=header_row_0idx,
         ))
 
-        block_start_row += block_height
+    write_rows_in_chunks(ws, rows, chunk_size=1500, label="screener sheet")
 
     if chart_requests:
-        try:
-            # Sheets API caps batch_update request size; send in
-            # chunks so a large Top-50 run can't fail as one giant call.
-            chunk = 10
-            for i in range(0, len(chart_requests), chunk):
-                sh.batch_update({"requests": chart_requests[i:i + chunk]})
+        # Sheets API caps batch_update request size; send in chunks
+        # (with quota retry) so a large Top-50 run can't fail as one
+        # giant call or die on a single transient 429.
+        chunk = 10
+        for i in range(0, len(chart_requests), chunk):
+            batch = chart_requests[i:i + chunk]
+            try:
+                call_with_quota_retry(
+                    lambda b=batch: sh.batch_update({"requests": b}),
+                    label=f"chart batch {i + 1}-{i + len(batch)}",
+                )
                 print(f"Added charts {i + 1}-{min(i + chunk, len(chart_requests))} "
                       f"of {len(chart_requests)}")
-        except Exception as e:
-            print(f"Could not add one or more charts (non-fatal): {e}")
+            except Exception as e:
+                print(f"Could not add chart batch {i + 1}-{i + len(batch)} "
+                      f"(non-fatal, continuing): {e}")
 
     print(f"\nScreener results written to '{SCREENER_WORKSHEET}' tab: "
           f"{len(ranking_df)} ranked stocks, {len(stock_series_list)} charts.")
