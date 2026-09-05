@@ -444,6 +444,7 @@ def make_stock_chart(
             },
             "targetAxis": "LEFT_AXIS",
             "color": color,
+            "colorStyle": {"rgbColor": color},
             "lineStyle": {
                 "lineWidth": 2,
                 "type": "SOLID"
@@ -850,8 +851,18 @@ def write_to_sheet(
                     f"Could not add chart batch "
                     f"{i + 1}-"
                     f"{i + len(batch)} "
-                    f"(non-fatal, continuing): {e}"
+                    f"(non-fatal, continuing)"
                 )
+                # Print the full API error body (str(e) alone is often
+                # just a status code) so the real cause is visible.
+                detail = getattr(e, "response", None)
+                if detail is not None:
+                    try:
+                        print("API error body:", detail.text)
+                    except Exception:
+                        print("API error (raw):", repr(e))
+                else:
+                    print("API error (raw):", repr(e))
 
     print(
         f"\nScreener results written to "
