@@ -8,12 +8,15 @@ WHAT THIS DOES (single snapshot, not a backtest)
   3. Ranks all eligible stocks by RS Score, descending (Rank 1 = strongest).
   4. Writes the full ranked table, Rank 1 downward.
   5. For EACH of the Top 50 stocks individually, builds its own
-     small data table (last RS_LINE_WINDOW trading days: date, price,
-     RS Line) and its own two-line chart -- Price on the left axis,
-     RS Line (that stock's price / benchmark price, rebased to 100 at
-     the start of the window) on the right axis. The 50 charts are
-     stacked vertically down the sheet so you can scroll through them
-     one stock at a time, same feel as flipping through price charts.
+     small data table (last RS_LINE_WINDOW trading days: date, price
+     % change, RS Line % change) and its own two-line chart -- both
+     series rebased to 0% at day 1 of the window so they sit on one
+     shared, readable scale. The chart is anchored under column A so
+     it's visible without scrolling right or zooming in; the raw data
+     backing it is written off to the right, out of the way. The 50
+     charts are stacked vertically down the sheet so you can scroll
+     through them one stock at a time, same feel as flipping through
+     price charts.
 
 This is a screener, not a trading system: no positions, no capital,
 no transaction costs, no rebalancing rules. Run it any day for a
@@ -201,10 +204,18 @@ def build_ranking(all_stocks, date):
 # ============================================================
 
 def build_stock_series(all_stocks, symbol, bench_close, trading_days_window):
-    """Returns a DataFrame [date, price, rs_line] for one stock over
-    the window, or None if the stock is missing any day's data in
-    the window. rs_line = (price / benchmark price), rebased to 100
-    at the first day of the window."""
+    """Returns a DataFrame [date, price_pct, rs_line_pct] for one stock
+    over the window, or None if the stock is missing any day's data
+    in the window.
+
+    Both series are normalised to 0% at the start of the window so
+    they sit on one shared, comparable scale:
+      price_pct   = % change in the stock's own price since day 1
+      rs_line_pct = % change in (price / benchmark price) since day 1
+    A rising rs_line_pct above price_pct means the stock is beating
+    the benchmark by more than its own price move suggests -- the two
+    diverging is the signal to watch for.
+    """
 
     df = all_stocks[symbol]
     prices = df["price"].reindex(trading_days_window)
@@ -213,17 +224,21 @@ def build_stock_series(all_stocks, symbol, bench_close, trading_days_window):
     if prices.isna().any() or bench.isna().any() or (bench <= 0).any():
         return None
 
-    ratio = prices / bench
-    base = ratio.iloc[0]
-    if base <= 0 or pd.isna(base):
+    price_base = prices.iloc[0]
+    if price_base <= 0 or pd.isna(price_base):
         return None
+    price_pct = (prices / price_base - 1) * 100
 
-    rs_line = (ratio / base) * 100
+    ratio = prices / bench
+    rs_base = ratio.iloc[0]
+    if rs_base <= 0 or pd.isna(rs_base):
+        return None
+    rs_line_pct = (ratio / rs_base - 1) * 100
 
     return pd.DataFrame({
         "date": [d.strftime("%Y-%m-%d") for d in trading_days_window],
-        "price": prices.round(2).values,
-        "rs_line": rs_line.round(4).values,
+        "price_pct": price_pct.round(3).values,
+        "rs_line_pct": rs_line_pct.round(3).values,
     })
 
 
@@ -267,12 +282,15 @@ def remove_existing_charts(sh, sheet_id):
         print(f"Could not check/remove existing charts (non-fatal): {e}")
 
 
-def make_stock_chart(sheet_id, title, header_row_0idx, n_rows, anchor_row):
-    """Two-series chart for one stock: Price (col B, index 1) on the
-    left axis, RS Line (col C, index 2) on the right axis. Date (col
-    A, index 0) is the domain. Column layout is fixed because every
-    per-stock block is written as its own [date, price, rs_line]
-    table."""
+def make_stock_chart(sheet_id, title, header_row_0idx, n_rows, anchor_row, data_col_start):
+    """Two-series chart for one stock, both normalised to 0% at day 1
+    of the window so they sit on one shared, readable scale:
+      - Price % change (col data_col_start+1) 
+      - RS Line % change (col data_col_start+2)
+    Date (col data_col_start+0) is the domain. The underlying data
+    table lives off to the right of the chart (data_col_start), while
+    the chart itself is anchored at column A so it's the first thing
+    visible without scrolling right or zooming in."""
 
     data_end_row = header_row_0idx + 1 + n_rows
 
@@ -284,6 +302,7 @@ def make_stock_chart(sheet_id, title, header_row_0idx, n_rows, anchor_row):
                 "endColumnIndex": col_index + 1,
             }]}},
             "targetAxis": axis,
+            "pointStyle": {"size": 4, "shape": "CIRCLE"},
         }
 
     return {"addChart": {"chart": {
@@ -294,23 +313,22 @@ def make_stock_chart(sheet_id, title, header_row_0idx, n_rows, anchor_row):
                 "legendPosition": "BOTTOM_LEGEND",
                 "axis": [
                     {"position": "BOTTOM_AXIS", "title": "Date"},
-                    {"position": "LEFT_AXIS", "title": "Price (Rs)"},
-                    {"position": "RIGHT_AXIS", "title": "RS Line (Base=100)"},
+                    {"position": "LEFT_AXIS", "title": "% Change from Day 1 (Base = 0)"},
                 ],
                 "domains": [{"domain": {"sourceRange": {"sources": [{
                     "sheetId": sheet_id, "startRowIndex": header_row_0idx,
-                    "endRowIndex": data_end_row, "startColumnIndex": 0,
-                    "endColumnIndex": 1,
+                    "endRowIndex": data_end_row, "startColumnIndex": data_col_start,
+                    "endColumnIndex": data_col_start + 1,
                 }]}}}],
                 "series": [
-                    series(1, "LEFT_AXIS"),   # price
-                    series(2, "RIGHT_AXIS"),  # rs_line
+                    series(data_col_start + 1, "LEFT_AXIS"),  # price_pct
+                    series(data_col_start + 2, "LEFT_AXIS"),  # rs_line_pct
                 ],
             },
         },
         "position": {"overlayPosition": {
-            "anchorCell": {"sheetId": sheet_id, "rowIndex": anchor_row, "columnIndex": 5},
-            "widthPixels": 750, "heightPixels": 380,
+            "anchorCell": {"sheetId": sheet_id, "rowIndex": anchor_row, "columnIndex": 0},
+            "widthPixels": 850, "heightPixels": 400,
         }},
     }}}
 
@@ -332,12 +350,25 @@ def call_with_quota_retry(fn, label, max_retries=6, initial_wait_seconds=15):
             time.sleep(wait)
 
 
-def write_rows_in_chunks(ws, all_rows, chunk_size=1500, label="sheet write"):
-    """Writes a full [row1, row2, ...] grid starting at A1 in a small
-    number of large batched calls (with quota retry) instead of one
-    API call per logical section. This is what keeps a 50-chart
-    screener run under the Sheets 'write requests per minute' quota
-    -- a handful of big calls instead of ~150+ tiny ones."""
+def col_letter(idx0):
+    """Converts a 0-indexed column number to A1-notation letters
+    (0 -> 'A', 9 -> 'J', 26 -> 'AA', ...)."""
+    letters = ""
+    idx = idx0
+    while True:
+        letters = chr(ord("A") + idx % 26) + letters
+        idx = idx // 26 - 1
+        if idx < 0:
+            break
+    return letters
+
+
+def write_rows_in_chunks(ws, all_rows, chunk_size=1500, label="sheet write", start_col="A"):
+    """Writes a full grid starting at {start_col}1 in a small number
+    of large batched calls (with quota retry) instead of one API call
+    per logical section. This is what keeps a 50-chart screener run
+    under the Sheets 'write requests per minute' quota -- a handful
+    of big calls instead of ~150+ tiny ones."""
 
     total = len(all_rows)
     if total == 0:
@@ -347,21 +378,27 @@ def write_rows_in_chunks(ws, all_rows, chunk_size=1500, label="sheet write"):
         chunk = all_rows[i:i + chunk_size]
         row_start = i + 1
         call_with_quota_retry(
-            lambda c=chunk, r=row_start: ws.update(c, f"A{r}"),
+            lambda c=chunk, r=row_start: ws.update(c, f"{start_col}{r}"),
             label=f"{label} rows {i}-{i + len(chunk)}",
         )
         print(f"Wrote {label}: {min(i + chunk_size, total)}/{total} rows")
 
 
 def write_to_sheet(ranking_df, stock_series_list, skipped_symbols, as_of_date):
-    """stock_series_list: list of (rank, symbol, df[date,price,rs_line])
-    in rank order, one block per stock, each with its own chart
-    stacked below the previous one for easy scrolling.
+    """stock_series_list: list of (rank, symbol, df[date,price_pct,rs_line_pct])
+    in rank order, one block per stock.
 
-    All cell content is assembled into a single in-memory grid first
-    and written in a couple of large chunked calls (write_rows_in_chunks)
-    rather than one ws.update() per stock -- 50 stocks x 2 small calls
-    each blew straight through the Sheets 'write requests per minute'
+    Layout: the chart for each stock is anchored under column A (so
+    it's the first thing visible, no horizontal scroll or zoom needed
+    to read it), while the raw data table backing that chart is
+    written off to the right (DATA_COL_START) on the same rows, kept
+    out of the way but still there to inspect/verify.
+
+    All cell content is assembled into two in-memory grids (left =
+    column A block, right = data-table block) first and written in a
+    couple of large chunked calls (write_rows_in_chunks) rather than
+    one ws.update() per stock -- 50 stocks x several small calls each
+    blew straight through the Sheets 'write requests per minute'
     quota (429 error) when this was written incrementally."""
 
     sheet_id = os.environ.get(SHEET_ID_ENV)
@@ -381,11 +418,13 @@ def write_to_sheet(ranking_df, stock_series_list, skipped_symbols, as_of_date):
     sh = gc.open_by_key(sheet_id)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
 
+    DATA_COL_START = 9  # column J (0-indexed) -- clear of the column-A chart
+
     # Each per-stock block: 1 label row + 1 header row + RS_LINE_WINDOW
     # data rows + 2 blank rows gap.
     block_height = RS_LINE_WINDOW + 4
     n_rows_needed = 3 + len(ranking_df) + 3 + len(stock_series_list) * block_height + 20
-    n_cols_needed = 6  # A-C used by tables; chart floats over D-onward
+    n_cols_needed = DATA_COL_START + 3 + 2  # data table (3 cols) + buffer
 
     ws = call_with_quota_retry(
         lambda: get_or_create_worksheet(sh, SCREENER_WORKSHEET,
@@ -402,58 +441,64 @@ def write_to_sheet(ranking_df, stock_series_list, skipped_symbols, as_of_date):
     call_with_quota_retry(lambda: remove_existing_charts(sh, ws.id), label="remove_existing_charts")
     call_with_quota_retry(lambda: ws.clear(), label="clear")
 
-    # -- assemble the entire sheet as one in-memory grid --
-    rows = []
+    # -- assemble the sheet as two parallel, row-aligned grids --
+    rows_left, rows_right = [], []
 
-    def add_row(vals=None):
-        rows.append(vals if vals is not None else [])
-        return len(rows)  # 1-indexed sheet row just written
+    def add_row(left=None, right=None):
+        rows_left.append(left if left is not None else [])
+        rows_right.append(right if right is not None else [])
+        return len(rows_left)  # 1-indexed sheet row just written
 
-    add_row([
+    add_row(left=[
         f"RS TOP {TOP_N} SCREENER | run {timestamp} | As of: {as_of_date} | "
         f"RS Formula: {RS_PERIOD}D Price Rate-of-Change | "
-        f"Per-stock RS Line: price/benchmark rebased to 100 at day 1 of the "
-        f"last {RS_LINE_WINDOW}-day window | "
+        f"Charts: Price % and RS Line % (price/benchmark), both rebased to 0% "
+        f"at day 1 of the last {RS_LINE_WINDOW}-day window | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} skipped: incomplete {RS_LINE_WINDOW}-day history) | "
         f"Price filter > Rs.{MIN_PRICE} | Liquidity > {MIN_AVG_VOLUME:,} ({VOLUME_LOOKBACK}D avg vol)"
     ])
-    add_row([])
-    add_row(["Ranked Stocks (Rank 1 = Strongest RS)"])
+    add_row()
+    add_row(left=["Ranked Stocks (Rank 1 = Strongest RS)"])
 
     ranking_clean = sanitize_for_sheets(ranking_df)
-    add_row(list(ranking_clean.columns))
+    add_row(left=list(ranking_clean.columns))
     for r in ranking_clean.values.tolist():
-        add_row(r)
+        add_row(left=r)
 
     if skipped_symbols:
-        add_row([f"Skipped (incomplete {RS_LINE_WINDOW}-day history): "
-                 + ", ".join(skipped_symbols)])
+        add_row(left=[f"Skipped (incomplete {RS_LINE_WINDOW}-day history): "
+                       + ", ".join(skipped_symbols)])
 
-    add_row([])
-    add_row([])
+    add_row()
+    add_row()
 
-    # -- per-stock blocks, stacked vertically for scrolling --
+    # -- per-stock blocks: chart anchors under column A, data table
+    # for that chart is written on the same rows starting at DATA_COL_START --
     chart_requests = []
     for rank, symbol, df in stock_series_list:
-        label_row = add_row([f"Rank {rank} - {symbol}"])
-        header_row = add_row(list(df.columns))
+        add_row(left=[f"Rank {rank} - {symbol}"])
+        header_row = add_row(right=list(df.columns))
         header_row_0idx = header_row - 1  # 0-indexed for chart API
 
         df_clean = sanitize_for_sheets(df)
         for r in df_clean.values.tolist():
-            add_row(r)
+            add_row(right=r)
 
-        add_row([])
-        add_row([])
+        add_row()
+        add_row()
 
         chart_requests.append(make_stock_chart(
-            ws.id, f"Rank {rank} - {symbol}: Price & RS Line "
-                   f"(Last {RS_LINE_WINDOW} Days)",
+            ws.id, f"Rank {rank} - {symbol}: Price % vs RS Line % "
+                   f"(Last {RS_LINE_WINDOW} Days, Base=0)",
             header_row_0idx, len(df), anchor_row=header_row_0idx,
+            data_col_start=DATA_COL_START,
         ))
 
-    write_rows_in_chunks(ws, rows, chunk_size=1500, label="screener sheet")
+    write_rows_in_chunks(ws, rows_left, chunk_size=1500,
+                          label="screener sheet (left)", start_col="A")
+    write_rows_in_chunks(ws, rows_right, chunk_size=1500,
+                          label="screener sheet (data, right)", start_col=col_letter(DATA_COL_START))
 
     if chart_requests:
         # Sheets API caps batch_update request size; send in chunks
@@ -489,7 +534,7 @@ def main():
     print(f"RS Formula     : {RS_PERIOD}-day (12M) Price Rate-of-Change")
     print(f"Ranking        : Full eligible universe, descending RS Score")
     print(f"Output         : Top {TOP_N}, Rank 1 downward")
-    print(f"Per-stock chart: Price + RS Line (price/benchmark, rebased 100), "
+    print(f"Per-stock chart: Price % + RS Line % (both rebased to 0% at day 1), "
           f"last {RS_LINE_WINDOW} trading days, one chart per stock")
     print(f"Price filter   : > Rs.{MIN_PRICE}")
     print(f"Liquidity      : {VOLUME_LOOKBACK}D average volume > {MIN_AVG_VOLUME:,}")
