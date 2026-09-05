@@ -12,6 +12,11 @@ WHAT THIS DOES (single snapshot, not a backtest)
      small data table (last RS_LINE_WINDOW trading days: date, price
      % change, RS Line % change) and its own two-line chart -- both
      series rebased to 0% at day 1 of the window.
+  6. The PRICE line is split into two color-coded series so it renders
+     GREEN on any day the stock was ranked in the Top 10 (by RS Score)
+     and BLUE on any day it was outside the Top 10. The RS Line stays
+     a single (orange) series. Boundary days are duplicated across
+     both color segments so the line stays visually continuous.
 
 This is a screener, not a trading system.
 """
@@ -48,6 +53,15 @@ RS_WEIGHTS = (0.40, 0.20, 0.20, 0.20)
 
 TOP_N = 100
 RS_LINE_WINDOW = 50
+
+# Rank threshold used to color the price line (green inside, blue outside)
+TOP10_N = 10
+
+# Chart colors (Google Sheets Color proto: 0-1 floats)
+GREEN_COLOR = {"red": 0.20, "green": 0.65, "blue": 0.33}   # in Top 10
+BLUE_COLOR = {"red": 0.26, "green": 0.52, "blue": 0.96}    # outside Top 10
+RS_LINE_COLOR = {"red": 0.95, "green": 0.55, "blue": 0.10}  # RS line (orange)
+SERIES_COLORS = [GREEN_COLOR, BLUE_COLOR, RS_LINE_COLOR]
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
@@ -234,6 +248,52 @@ def build_ranking(all_stocks, date):
     return ranking
 
 
+def compute_daily_top_sets(all_stocks, trading_days_window, top_n):
+    """
+    For every date in the window, rank the full eligible universe and
+    return the set of symbols that were in the Top `top_n` on that date.
+    Used to color-split each stock's price line (green inside, blue
+    outside the Top N) over the charted window.
+    """
+    sets_by_date = {}
+
+    for d in trading_days_window:
+        ranking = build_ranking(all_stocks, d)
+        sets_by_date[d] = {sym for sym, rs, price, vol in ranking[:top_n]}
+
+    return sets_by_date
+
+
+def split_by_rank(values, flags):
+    """
+    Split a single series into two parallel series based on a boolean
+    flag per point: `in_flag` values go to `top`, everything else goes
+    to `other`. At every day the flag flips, the boundary point is
+    duplicated into both arrays so the two color segments meet at the
+    same x-position instead of leaving a visual gap in the line.
+    """
+    n = len(values)
+    top = [np.nan] * n
+    other = [np.nan] * n
+
+    for i in range(n):
+        if flags[i]:
+            top[i] = values[i]
+        else:
+            other[i] = values[i]
+
+    for i in range(1, n):
+        if flags[i] != flags[i - 1]:
+            if flags[i]:
+                # entering Top N at i -> extend the green segment back to i-1
+                top[i - 1] = values[i - 1]
+            else:
+                # exiting Top N at i -> extend the blue segment back to i-1
+                other[i - 1] = values[i - 1]
+
+    return top, other
+
+
 # ============================================================
 # PRICE + RS LINE
 # ============================================================
@@ -242,7 +302,8 @@ def build_stock_series(
     all_stocks,
     symbol,
     bench_close,
-    trading_days_window
+    trading_days_window,
+    top_sets_by_date
 ):
     df = all_stocks[symbol]
 
@@ -271,12 +332,20 @@ def build_stock_series(
 
     rs_line_pct = (ratio / rs_base - 1) * 100
 
+    flags = [
+        symbol in top_sets_by_date.get(d, set())
+        for d in trading_days_window
+    ]
+
+    top_vals, other_vals = split_by_rank(price_pct.values, flags)
+
     return pd.DataFrame({
         "date": [
             d.strftime("%Y-%m-%d")
             for d in trading_days_window
         ],
-        "price_pct": price_pct.round(3).values,
+        "price_pct_top10": np.round(np.array(top_vals, dtype=float), 3),
+        "price_pct_other": np.round(np.array(other_vals, dtype=float), 3),
         "rs_line_pct": rs_line_pct.round(3).values,
     })
 
@@ -354,11 +423,13 @@ def make_stock_chart(
     header_row_0idx,
     n_rows,
     anchor_row,
-    data_col_start
+    data_col_start,
+    n_series,
+    colors
 ):
     data_end_row = header_row_0idx + 1 + n_rows
 
-    def series(col_index, axis):
+    def series(col_index, color):
         return {
             "series": {
                 "sourceRange": {
@@ -371,9 +442,14 @@ def make_stock_chart(
                     }]
                 }
             },
-            "targetAxis": axis,
+            "targetAxis": "LEFT_AXIS",
+            "color": color,
+            "lineStyle": {
+                "lineWidth": 2,
+                "type": "SOLID"
+            },
             "pointStyle": {
-                "size": 4,
+                "size": 3,
                 "shape": "CIRCLE"
             },
         }
@@ -417,13 +493,10 @@ def make_stock_chart(
                         }],
                         "series": [
                             series(
-                                data_col_start + 1,
-                                "LEFT_AXIS"
-                            ),
-                            series(
-                                data_col_start + 2,
-                                "LEFT_AXIS"
-                            ),
+                                data_col_start + 1 + i,
+                                colors[i]
+                            )
+                            for i in range(n_series)
                         ],
                     },
                 },
@@ -579,7 +652,9 @@ def write_to_sheet(
         + 20
     )
 
-    n_cols_needed = DATA_COL_START + 3 + 2
+    # date column + 3 data series (price_pct_top10, price_pct_other,
+    # rs_line_pct) + buffer columns
+    n_cols_needed = DATA_COL_START + 4 + 2
 
     ws = call_with_quota_retry(
         lambda: get_or_create_worksheet(
@@ -642,8 +717,9 @@ def write_to_sheet(
         f"As of: {as_of_date} | "
         f"RS Formula: 40% 3M + 20% 6M + "
         f"20% 9M + 20% 12M Price Rate-of-Change | "
-        f"Charts: Price % and RS Line % "
-        f"(price/benchmark), both rebased to 0% "
+        f"Charts: Price % (GREEN = in Top {TOP10_N} by RS Score that "
+        f"day, BLUE = outside Top {TOP10_N}) and RS Line % "
+        f"(price/benchmark, orange), all rebased to 0% "
         f"at day 1 of the last "
         f"{RS_LINE_WINDOW}-day window | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
@@ -708,13 +784,16 @@ def write_to_sheet(
                 ws.id,
                 (
                     f"Rank {rank} - {symbol}: "
-                    f"Price % vs RS Line % "
+                    f"Price % (green=Top{TOP10_N}/blue=outside) "
+                    f"vs RS Line % "
                     f"(Last {RS_LINE_WINDOW} Days, Base=0)"
                 ),
                 header_row_0idx,
                 len(df),
                 anchor_row=header_row_0idx,
                 data_col_start=DATA_COL_START,
+                n_series=3,
+                colors=SERIES_COLORS,
             )
         )
 
@@ -811,8 +890,9 @@ def main():
     )
 
     print(
-        "Per-stock chart: Price % + RS Line % "
-        "(both rebased to 0% at day 1), "
+        "Per-stock chart: Price % (green=Top"
+        f"{TOP10_N}/blue=outside) + RS Line % (orange), "
+        "both rebased to 0% at day 1, "
         f"last {RS_LINE_WINDOW} trading days"
     )
 
@@ -1034,6 +1114,18 @@ def main():
             "available; chart window shortened."
         )
 
+    print(
+        f"\nComputing daily Top {TOP10_N} membership "
+        f"across {len(trading_days_window)} days "
+        "(for price line coloring)..."
+    )
+
+    top_sets_by_date = compute_daily_top_sets(
+        all_stocks,
+        trading_days_window,
+        TOP10_N
+    )
+
     stock_series_list = []
     skipped_symbols = []
 
@@ -1050,7 +1142,8 @@ def main():
             all_stocks,
             sym,
             bench_close,
-            trading_days_window
+            trading_days_window,
+            top_sets_by_date
         )
 
         if series_df is None:
