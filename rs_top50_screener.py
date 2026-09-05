@@ -14,9 +14,12 @@ WHAT THIS DOES (single snapshot, not a backtest)
      series rebased to 0% at day 1 of the window.
   6. The PRICE line is split into two color-coded series so it renders
      GREEN on any day the stock was ranked in the Top 10 (by RS Score)
-     and BLUE on any day it was outside the Top 10. The RS Line stays
-     a single (orange) series. Boundary days are duplicated across
-     both color segments so the line stays visually continuous.
+     and BLUE on any day it was outside the Top 10. The RS Line is a
+     single, constant RED series. Boundary days are duplicated across
+     both price color segments so the line stays visually continuous.
+     The actual daily numeric rank is also written out as a plain
+     (uncharted) column so the green/blue split can be audited against
+     real numbers.
 
 This is a screener, not a trading system.
 """
@@ -60,7 +63,7 @@ TOP10_N = 10
 # Chart colors (Google Sheets Color proto: 0-1 floats)
 GREEN_COLOR = {"red": 0.20, "green": 0.65, "blue": 0.33}   # in Top 10
 BLUE_COLOR = {"red": 0.26, "green": 0.52, "blue": 0.96}    # outside Top 10
-RS_LINE_COLOR = {"red": 0.95, "green": 0.55, "blue": 0.10}  # RS line (orange)
+RS_LINE_COLOR = {"red": 0.80, "green": 0.08, "blue": 0.08}  # RS line (solid red)
 SERIES_COLORS = [GREEN_COLOR, BLUE_COLOR, RS_LINE_COLOR]
 
 SHEET_ID_ENV = "SHEET_ID"
@@ -248,20 +251,28 @@ def build_ranking(all_stocks, date):
     return ranking
 
 
-def compute_daily_top_sets(all_stocks, trading_days_window, top_n):
+def compute_daily_rank_maps(all_stocks, trading_days_window):
     """
     For every date in the window, rank the full eligible universe and
-    return the set of symbols that were in the Top `top_n` on that date.
-    Used to color-split each stock's price line (green inside, blue
-    outside the Top N) over the charted window.
+    return {date: {symbol: rank}} (rank 1 = strongest that day). A
+    symbol absent from a given day's map was not eligible that day
+    (illiquid / below price floor / insufficient history).
+
+    This is the single source of truth used both to color-split each
+    stock's price line (green inside Top N, blue outside) and to
+    print the raw daily rank next to the data, so the coloring can be
+    visually audited against the actual numbers.
     """
-    sets_by_date = {}
+    rank_maps = {}
 
     for d in trading_days_window:
         ranking = build_ranking(all_stocks, d)
-        sets_by_date[d] = {sym for sym, rs, price, vol in ranking[:top_n]}
+        rank_maps[d] = {
+            sym: i + 1
+            for i, (sym, rs, price, vol) in enumerate(ranking)
+        }
 
-    return sets_by_date
+    return rank_maps
 
 
 def split_by_rank(values, flags):
@@ -303,7 +314,7 @@ def build_stock_series(
     symbol,
     bench_close,
     trading_days_window,
-    top_sets_by_date
+    rank_maps
 ):
     df = all_stocks[symbol]
 
@@ -332,12 +343,26 @@ def build_stock_series(
 
     rs_line_pct = (ratio / rs_base - 1) * 100
 
-    flags = [
-        symbol in top_sets_by_date.get(d, set())
+    # Daily rank (None = not eligible that day) and the Top-N flag
+    # derived directly from it -- this is what drives the green/blue
+    # split, and the raw rank is also written out as its own column
+    # so the split can be visually checked against real numbers.
+    daily_ranks = [
+        rank_maps.get(d, {}).get(symbol)
         for d in trading_days_window
     ]
 
+    flags = [
+        (r is not None and r <= TOP10_N)
+        for r in daily_ranks
+    ]
+
     top_vals, other_vals = split_by_rank(price_pct.values, flags)
+
+    rank_col = [
+        float(r) if r is not None else np.nan
+        for r in daily_ranks
+    ]
 
     return pd.DataFrame({
         "date": [
@@ -347,6 +372,7 @@ def build_stock_series(
         "price_pct_top10": np.round(np.array(top_vals, dtype=float), 3),
         "price_pct_other": np.round(np.array(other_vals, dtype=float), 3),
         "rs_line_pct": rs_line_pct.round(3).values,
+        "daily_rank": rank_col,
     })
 
 
@@ -653,9 +679,9 @@ def write_to_sheet(
         + 20
     )
 
-    # date column + 3 data series (price_pct_top10, price_pct_other,
-    # rs_line_pct) + buffer columns
-    n_cols_needed = DATA_COL_START + 4 + 2
+    # date column + 3 charted series (price_pct_top10, price_pct_other,
+    # rs_line_pct) + 1 audit column (daily_rank, not charted) + buffer
+    n_cols_needed = DATA_COL_START + 5 + 2
 
     ws = call_with_quota_retry(
         lambda: get_or_create_worksheet(
@@ -720,9 +746,11 @@ def write_to_sheet(
         f"20% 9M + 20% 12M Price Rate-of-Change | "
         f"Charts: Price % (GREEN = in Top {TOP10_N} by RS Score that "
         f"day, BLUE = outside Top {TOP10_N}) and RS Line % "
-        f"(price/benchmark, orange), all rebased to 0% "
+        f"(price/benchmark, RED), all rebased to 0% "
         f"at day 1 of the last "
         f"{RS_LINE_WINDOW}-day window | "
+        f"'daily_rank' column shows the actual rank each day "
+        f"(not charted) to audit the green/blue split | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} skipped: incomplete "
         f"{RS_LINE_WINDOW}-day history) | "
@@ -1126,15 +1154,14 @@ def main():
         )
 
     print(
-        f"\nComputing daily Top {TOP10_N} membership "
-        f"across {len(trading_days_window)} days "
-        "(for price line coloring)..."
+        f"\nComputing daily rank across "
+        f"{len(trading_days_window)} days "
+        "(drives price line coloring + audit column)..."
     )
 
-    top_sets_by_date = compute_daily_top_sets(
+    rank_maps = compute_daily_rank_maps(
         all_stocks,
-        trading_days_window,
-        TOP10_N
+        trading_days_window
     )
 
     stock_series_list = []
@@ -1154,7 +1181,7 @@ def main():
             sym,
             bench_close,
             trading_days_window,
-            top_sets_by_date
+            rank_maps
         )
 
         if series_df is None:
