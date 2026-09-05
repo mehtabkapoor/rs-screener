@@ -446,7 +446,7 @@ def make_stock_chart(
             "color": color,
             "colorStyle": {"rgbColor": color},
             "lineStyle": {
-                "lineWidth": 2,
+                "width": 2,
                 "type": "SOLID"
             },
             "pointStyle": {
