@@ -67,7 +67,7 @@ VOLUME_LOOKBACK = 20
 RS_3M, RS_6M, RS_9M, RS_12M = 63, 126, 189, 252
 RS_WEIGHTS = (0.40, 0.20, 0.20, 0.20)  # 3M / 6M / 9M / 12M
 
-TOP_N = 50
+TOP_N = 100
 RS_LINE_WINDOW = 50   # trading days shown in each per-stock chart
 
 # ============================================================
