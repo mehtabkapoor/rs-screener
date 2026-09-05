@@ -20,6 +20,12 @@ WHAT THIS DOES (single snapshot, not a backtest)
      The actual daily numeric rank is also written out as a plain
      (uncharted) column so the green/blue split can be audited against
      real numbers.
+  7. A Top 10 RS equal-weight, daily-rebalanced cumulative-return
+     equity curve (no costs/slippage modeled) is also built, with
+     20/50/200-day SMA overlays, rebased to 0% at day 1 of the same
+     display window -- a regime/timing overlay, not a real backtest.
+     The most recent day is labeled with the time of the run since it
+     reflects the latest fetched price, not a settled close.
 
 This is a screener, not a trading system.
 """
@@ -45,7 +51,9 @@ BENCHMARK_FALLBACK = "^NSEI"
 
 STOCKS_FILE = "stocks.csv"
 
-DOWNLOAD_YEARS = 2
+DOWNLOAD_YEARS = 3  # bumped from 2: RS_12M lookback (252d) + 200-day SMA
+                     # warmup + 50-day display window needs ~500+ trading
+                     # days of buffer before the equity curve is stable
 
 MIN_PRICE = 20
 MIN_AVG_VOLUME = 100_000
@@ -65,6 +73,16 @@ GREEN_COLOR = {"red": 0.20, "green": 0.65, "blue": 0.33}   # in Top 10
 BLUE_COLOR = {"red": 0.26, "green": 0.52, "blue": 0.96}    # outside Top 10
 RS_LINE_COLOR = {"red": 0.80, "green": 0.08, "blue": 0.08}  # RS line (solid red)
 SERIES_COLORS = [GREEN_COLOR, BLUE_COLOR, RS_LINE_COLOR]
+
+# Top 10 RS equal-weight equity curve (regime/timing overlay)
+EQUITY_SMA_PERIODS = (20, 50, 200)
+EQUITY_COLOR = {"red": 0.15, "green": 0.15, "blue": 0.15}        # equity curve (near-black)
+EQUITY_SMA20_COLOR = {"red": 0.20, "green": 0.60, "blue": 0.86}  # 20 SMA (blue)
+EQUITY_SMA50_COLOR = {"red": 0.95, "green": 0.60, "blue": 0.10}  # 50 SMA (orange)
+EQUITY_SMA200_COLOR = {"red": 0.80, "green": 0.10, "blue": 0.10}  # 200 SMA (red - de-risk trigger)
+EQUITY_SERIES_COLORS = [
+    EQUITY_COLOR, EQUITY_SMA20_COLOR, EQUITY_SMA50_COLOR, EQUITY_SMA200_COLOR
+]
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
@@ -273,6 +291,94 @@ def compute_daily_rank_maps(all_stocks, trading_days_window):
         }
 
     return rank_maps
+
+
+def compute_top10_equity_curve(all_stocks, rank_maps, full_calendar, top_n=10):
+    """
+    Equal-weight, daily-rebalanced cumulative return index for the
+    Top N RS-ranked stocks, using each day's rank as of the PRIOR
+    trading day (no lookahead). Base = 100 on the first day a full
+    Top N portfolio can be formed.
+
+    This is a regime/timing overlay, not a real backtest: no
+    transaction costs, slippage, or entry/exit buffers are modeled,
+    and a day only counts if a full Top N can be formed from the
+    previous day's ranking.
+    """
+    daily_returns = {}
+
+    for i in range(1, len(full_calendar)):
+        prev_day = full_calendar[i - 1]
+        day = full_calendar[i]
+
+        prev_ranks = rank_maps.get(prev_day)
+        if not prev_ranks:
+            continue
+
+        top_syms = [sym for sym, r in prev_ranks.items() if r <= top_n]
+        if len(top_syms) < top_n:
+            continue
+
+        day_returns = []
+        for sym in top_syms:
+            df = all_stocks.get(sym)
+            if df is None or prev_day not in df.index or day not in df.index:
+                continue
+
+            p_prev = df.at[prev_day, "price"]
+            p_curr = df.at[day, "price"]
+
+            if pd.isna(p_prev) or pd.isna(p_curr) or p_prev <= 0:
+                continue
+
+            day_returns.append(p_curr / p_prev - 1)
+
+        if not day_returns:
+            continue
+
+        daily_returns[day] = float(np.mean(day_returns))
+
+    if not daily_returns:
+        return pd.Series(dtype=float)
+
+    ret_series = pd.Series(daily_returns).sort_index()
+    return 100.0 * (1.0 + ret_series).cumprod()
+
+
+def build_top10_equity_table(equity_index, trading_days_window):
+    """
+    Slice the Top N equity curve (and its 20/50/200 SMA, computed on
+    the FULL curve so the SMAs are properly warmed up) down to the
+    display window, then rebase everything to 0% at the window's
+    first day. Rebasing is a simple division by a positive constant,
+    so it preserves exactly where the equity curve crosses each SMA
+    -- it's purely a display transform.
+    """
+    if equity_index.empty:
+        return None
+
+    window_equity = equity_index.reindex(trading_days_window)
+
+    if window_equity.dropna().empty:
+        return None
+
+    base = window_equity.dropna().iloc[0]
+    if pd.isna(base) or base <= 0:
+        return None
+
+    def rebase(s):
+        return (s / base - 1) * 100
+
+    sma_cols = {}
+    for period in EQUITY_SMA_PERIODS:
+        sma = equity_index.rolling(period).mean().reindex(trading_days_window)
+        sma_cols[f"sma{period}_pct"] = rebase(sma).round(3).values
+
+    return pd.DataFrame({
+        "date": [d.strftime("%Y-%m-%d") for d in trading_days_window],
+        "top10_equity_pct": rebase(window_equity).round(3).values,
+        **sma_cols,
+    })
 
 
 def split_by_rank(values, flags):
@@ -629,7 +735,8 @@ def write_to_sheet(
     ranking_df,
     stock_series_list,
     skipped_symbols,
-    as_of_date
+    as_of_date,
+    equity_table=None
 ):
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
@@ -644,6 +751,12 @@ def write_to_sheet(
             "RS_Top50_Ranking.csv",
             index=False
         )
+
+        if equity_table is not None:
+            equity_table.to_csv(
+                "RS_Top10_Equity_Curve.csv",
+                index=False
+            )
 
         for rank, symbol, df in stock_series_list:
             df.to_csv(
@@ -675,6 +788,7 @@ def write_to_sheet(
         3
         + len(ranking_df)
         + 3
+        + block_height  # Top10 equity curve block
         + len(stock_series_list) * block_height
         + 20
     )
@@ -751,6 +865,9 @@ def write_to_sheet(
         f"{RS_LINE_WINDOW}-day window | "
         f"'daily_rank' column shows the actual rank each day "
         f"(not charted) to audit the green/blue split | "
+        f"Top {TOP10_N} RS Equal-Weight Equity Curve included "
+        f"(daily rebalance, no costs) with 20/50/200 SMA overlays "
+        f"for regime timing | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} skipped: incomplete "
         f"{RS_LINE_WINDOW}-day history) | "
@@ -788,6 +905,62 @@ def write_to_sheet(
     add_row()
 
     chart_requests = []
+
+    if equity_table is not None:
+        add_row(left=[
+            f"Top {TOP10_N} RS Equal-Weight Equity Curve "
+            f"(Last {RS_LINE_WINDOW} Days, Daily Rebalance, No Costs) | "
+            "Black = equity curve, Blue = 20 SMA, Orange = 50 SMA, "
+            "Red = 200 SMA -- equity below the red 200 SMA is the "
+            "classic cue to consider de-risking to cash"
+        ])
+
+        eq_header_row = add_row(
+            right=list(equity_table.columns)
+        )
+
+        eq_header_row_0idx = eq_header_row - 1
+
+        eq_table = equity_table.copy()
+
+        # Label the most recent day as intraday/live so it's clear
+        # that value uses the latest fetched price, not a settled close.
+        last_idx = eq_table.index[-1]
+        time_part = timestamp.split(" ", 1)[1] if " " in timestamp else timestamp
+        eq_table.loc[last_idx, "date"] = (
+            f"{eq_table.loc[last_idx, 'date']} (as of {time_part})"
+        )
+
+        eq_clean = sanitize_for_sheets(eq_table)
+
+        for r in eq_clean.values.tolist():
+            add_row(right=r)
+
+        add_row()
+        add_row()
+
+        chart_requests.append(
+            make_stock_chart(
+                ws.id,
+                (
+                    f"Top {TOP10_N} RS Equity Curve vs "
+                    f"20/50/200 SMA (Last {RS_LINE_WINDOW} Days)"
+                ),
+                eq_header_row_0idx,
+                len(eq_table),
+                anchor_row=eq_header_row_0idx,
+                data_col_start=DATA_COL_START,
+                n_series=4,
+                colors=EQUITY_SERIES_COLORS,
+            )
+        )
+    else:
+        add_row(left=[
+            f"Top {TOP10_N} RS Equity Curve: skipped -- not enough "
+            f"history yet for a full Top {TOP10_N} portfolio plus "
+            f"{max(EQUITY_SMA_PERIODS)}-day SMA warmup."
+        ])
+        add_row()
 
     for rank, symbol, df in stock_series_list:
         add_row(
@@ -1155,14 +1328,41 @@ def main():
 
     print(
         f"\nComputing daily rank across "
-        f"{len(trading_days_window)} days "
-        "(drives price line coloring + audit column)..."
+        f"{len(trading_days)} days "
+        "(drives price line coloring, audit column, "
+        "and the Top10 equity curve)..."
     )
 
     rank_maps = compute_daily_rank_maps(
         all_stocks,
+        trading_days
+    )
+
+    equity_index = compute_top10_equity_curve(
+        all_stocks,
+        rank_maps,
+        trading_days,
+        TOP10_N
+    )
+
+    equity_table = build_top10_equity_table(
+        equity_index,
         trading_days_window
     )
+
+    if equity_table is None:
+        print(
+            "\nTop10 equity curve: skipped -- not enough history yet "
+            f"for a full Top {TOP10_N} portfolio plus "
+            f"{max(EQUITY_SMA_PERIODS)}-day SMA warmup. "
+            "This resolves itself as more days of data accumulate."
+        )
+    else:
+        print(
+            f"\nTop10 equity curve built: "
+            f"{len(equity_index)} days of history, "
+            f"{len(equity_table)} days displayed."
+        )
 
     stock_series_list = []
     skipped_symbols = []
@@ -1206,7 +1406,8 @@ def main():
         ranking_df,
         stock_series_list,
         skipped_symbols,
-        as_of_date.strftime("%Y-%m-%d")
+        as_of_date.strftime("%Y-%m-%d"),
+        equity_table
     )
 
     ranking_df.to_csv(
