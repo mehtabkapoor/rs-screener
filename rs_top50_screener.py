@@ -3,8 +3,9 @@ RS TOP 50 SCREENER -- INDIVIDUAL RS LINE + PRICE CHARTS
 
 WHAT THIS DOES (single snapshot, not a backtest)
   1. Downloads price/volume history for the stock universe + benchmark.
-  2. Computes 12-Month RS Score for every eligible stock as of the
-     latest available trading day.
+  2. Computes a weighted multi-timeframe RS Score (40% 3M + 20% 6M +
+     20% 9M + 20% 12M price momentum) for every eligible stock as of
+     the latest available trading day.
   3. Ranks all eligible stocks by RS Score, descending (Rank 1 = strongest).
   4. Writes the full ranked table, Rank 1 downward.
   5. For EACH of the Top 50 stocks individually, builds its own
@@ -44,13 +45,15 @@ BENCHMARK_FALLBACK = "^NSEI"
 
 STOCKS_FILE = "stocks.csv"
 
-DOWNLOAD_YEARS = 2  # history needed: RS_PERIOD + buffer + RS_LINE_WINDOW
+DOWNLOAD_YEARS = 2  # history needed: RS_12M + buffer + RS_LINE_WINDOW
 
 MIN_PRICE = 20
 MIN_AVG_VOLUME = 100_000
 VOLUME_LOOKBACK = 20
 
-RS_PERIOD = 252       # 12-month RS score used for ranking
+RS_3M, RS_6M, RS_9M, RS_12M = 63, 126, 189, 252
+RS_WEIGHTS = (0.40, 0.20, 0.20, 0.20)  # 3M / 6M / 9M / 12M
+
 TOP_N = 50
 RS_LINE_WINDOW = 50   # trading days shown in each per-stock chart
 
@@ -152,13 +155,19 @@ def download_benchmark():
 def compute_stock_data(close, volume):
     close = normalize_series_index(close)
     volume = normalize_series_index(volume)
-    if len(close) < RS_PERIOD + 20:
+    if len(close) < RS_12M + 20:
         return None
 
     avg_volume = volume.rolling(VOLUME_LOOKBACK).mean()
     liquid = (close > MIN_PRICE) & (avg_volume > MIN_AVG_VOLUME)
 
-    rs_score = (close / close.shift(RS_PERIOD) - 1) * 100
+    w3, w6, w9, w12 = RS_WEIGHTS
+    rs_score = (
+        w3 * (close / close.shift(RS_3M) - 1)
+        + w6 * (close / close.shift(RS_6M) - 1)
+        + w9 * (close / close.shift(RS_9M) - 1)
+        + w12 * (close / close.shift(RS_12M) - 1)
+    ) * 100
 
     result = pd.DataFrame({
         "price": close,
@@ -451,7 +460,7 @@ def write_to_sheet(ranking_df, stock_series_list, skipped_symbols, as_of_date):
 
     add_row(left=[
         f"RS TOP {TOP_N} SCREENER | run {timestamp} | As of: {as_of_date} | "
-        f"RS Formula: {RS_PERIOD}D Price Rate-of-Change | "
+        f"RS Formula: 40% 3M + 20% 6M + 20% 9M + 20% 12M Price Rate-of-Change | "
         f"Charts: Price % and RS Line % (price/benchmark), both rebased to 0% "
         f"at day 1 of the last {RS_LINE_WINDOW}-day window | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
@@ -531,7 +540,7 @@ def main():
     print("=" * 70)
     print(f"RS TOP {TOP_N} SCREENER -- INDIVIDUAL RS LINE + PRICE CHARTS")
     print("=" * 70)
-    print(f"RS Formula     : {RS_PERIOD}-day (12M) Price Rate-of-Change")
+    print("RS Formula     : 40% 3M + 20% 6M + 20% 9M + 20% 12M Price Rate-of-Change")
     print(f"Ranking        : Full eligible universe, descending RS Score")
     print(f"Output         : Top {TOP_N}, Rank 1 downward")
     print(f"Per-stock chart: Price % + RS Line % (both rebased to 0% at day 1), "
