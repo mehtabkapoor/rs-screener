@@ -51,6 +51,14 @@ VOLUME_LOOKBACK = 20
 RS_3M, RS_6M, RS_9M, RS_12M = 63, 126, 189, 252
 RS_WEIGHTS = (0.40, 0.20, 0.20, 0.20)  # 3M / 6M / 9M / 12M
 
+# Minimum price-history length for a stock to be eligible at all.
+# Matches the screener's bar exactly (RS_12M lookback + 20-day
+# volume-average buffer) rather than an arbitrary round number --
+# a mismatch here silently drops/adds borderline-history stocks
+# between the two scripts and can flip Top-10 membership near the
+# rank cutoff even though the RS formula itself is identical.
+MIN_HISTORY_DAYS = RS_12M + 20
+
 TOP_N = 10
 STARTING_CAPITAL = 1_000_000
 MAX_PLAUSIBLE_DAILY_MOVE = 0.30
@@ -237,7 +245,7 @@ def download_benchmark():
 def compute_stock_data(close, volume):
     close = normalize_series_index(close)
     volume = normalize_series_index(volume)
-    if len(close) < 300:
+    if len(close) < MIN_HISTORY_DAYS:
         return None
 
     avg_volume = volume.rolling(VOLUME_LOOKBACK).mean()
@@ -999,6 +1007,7 @@ def main():
     print("Execution      : SAME EOD BAR (T+0)")
     print(f"Price filter   : > Rs.{MIN_PRICE}")
     print(f"Liquidity      : {VOLUME_LOOKBACK}D average volume > {MIN_AVG_VOLUME:,}")
+    print(f"Min. history   : {MIN_HISTORY_DAYS} trading days (matches screener)")
     print("Other filters  : NONE")
     print("=" * 70)
 
