@@ -27,6 +27,13 @@ WHAT THIS DOES (single snapshot, not a backtest)
      The most recent day is labeled with the time of the run since it
      reflects the latest fetched price, not a settled close.
 
+  CHART LAYOUT: all charts (the Top10 equity curve chart + every
+  per-stock chart) are anchored together in a single stacked block at
+  the very top of the sheet, above all text and data tables. Each
+  chart's underlying DATA TABLE stays exactly where it always was
+  (equity table, then each ranked stock's own labeled data block) --
+  only the floating chart objects themselves are grouped together.
+
 This is a screener, not a trading system.
 """
 
@@ -83,6 +90,15 @@ EQUITY_SMA200_COLOR = {"red": 0.80, "green": 0.10, "blue": 0.10}  # 200 SMA (red
 EQUITY_SERIES_COLORS = [
     EQUITY_COLOR, EQUITY_SMA20_COLOR, EQUITY_SMA50_COLOR, EQUITY_SMA200_COLOR
 ]
+
+# All charts are stacked together at the top of the sheet, above every
+# text/data row. This is the vertical gap (in grid rows) between one
+# chart's anchor and the next, so consecutively-anchored charts (each
+# rendered at a fixed 400px height) don't visually overlap each other
+# at default Google Sheets row height (~21px). 20 rows * ~21px =~ 420px,
+# comfortably clearing a 400px-tall chart.
+CHART_ROW_SPACING = 20
+CHART_ZONE_BUFFER_ROWS = 2  # small gap after the last chart before text starts
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
@@ -559,6 +575,14 @@ def make_stock_chart(
     n_series,
     colors
 ):
+    """
+    `header_row_0idx`/`n_rows` locate the chart's SOURCE DATA (which
+    stays wherever that stock's/equity's labeled data block lives in
+    the sheet). `anchor_row` is purely the floating chart object's
+    on-screen position and is independent of the data location -- this
+    is what lets every chart be stacked together at the top of the
+    sheet while each data table stays put further down.
+    """
     data_end_row = header_row_0idx + 1 + n_rows
 
     def series(col_index, color):
@@ -784,8 +808,19 @@ def write_to_sheet(
 
     block_height = RS_LINE_WINDOW + 4
 
+    # Number of chart objects that will be stacked together at the top
+    # of the sheet: the Top10 equity chart (if we have enough history)
+    # plus one chart per charted stock.
+    n_equity_chart = 1 if equity_table is not None else 0
+    total_charts = n_equity_chart + len(stock_series_list)
+    charts_zone_rows = (
+        total_charts * CHART_ROW_SPACING
+        + CHART_ZONE_BUFFER_ROWS
+    )
+
     n_rows_needed = (
-        3
+        charts_zone_rows
+        + 3
         + len(ranking_df)
         + 3
         + block_height  # Top10 equity curve block
@@ -852,6 +887,19 @@ def write_to_sheet(
 
         return len(rows_left)
 
+    # Reserve a blank zone at the very top of the sheet for the
+    # stacked charts. All text/data content below is unchanged in
+    # relative order -- it's simply pushed down by this many rows so
+    # every chart can float above it as one grouped block.
+    for _ in range(charts_zone_rows):
+        add_row()
+
+    # Running anchor position for the next chart in the stacked zone
+    # (0-indexed grid row). Each chart advances this by
+    # CHART_ROW_SPACING regardless of where its underlying data table
+    # ends up further down the sheet.
+    next_chart_anchor_row = 0
+
     add_row(left=[
         f"RS TOP {TOP_N} SCREENER | "
         f"run {timestamp} | "
@@ -863,6 +911,8 @@ def write_to_sheet(
         f"(price/benchmark, RED), all rebased to 0% "
         f"at day 1 of the last "
         f"{RS_LINE_WINDOW}-day window | "
+        f"All charts are grouped together at the top of this sheet; "
+        f"each chart's own data table is still labeled below | "
         f"'daily_rank' column shows the actual rank each day "
         f"(not charted) to audit the green/blue split | "
         f"Top {TOP10_N} RS Equal-Weight Equity Curve included "
@@ -948,12 +998,13 @@ def write_to_sheet(
                 ),
                 eq_header_row_0idx,
                 len(eq_table),
-                anchor_row=eq_header_row_0idx,
+                anchor_row=next_chart_anchor_row,
                 data_col_start=DATA_COL_START,
                 n_series=4,
                 colors=EQUITY_SERIES_COLORS,
             )
         )
+        next_chart_anchor_row += CHART_ROW_SPACING
     else:
         add_row(left=[
             f"Top {TOP10_N} RS Equity Curve: skipped -- not enough "
@@ -992,12 +1043,13 @@ def write_to_sheet(
                 ),
                 header_row_0idx,
                 len(df),
-                anchor_row=header_row_0idx,
+                anchor_row=next_chart_anchor_row,
                 data_col_start=DATA_COL_START,
                 n_series=3,
                 colors=SERIES_COLORS,
             )
         )
+        next_chart_anchor_row += CHART_ROW_SPACING
 
     write_rows_in_chunks(
         ws,
