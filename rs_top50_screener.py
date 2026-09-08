@@ -20,19 +20,30 @@ WHAT THIS DOES (single snapshot, not a backtest)
      The actual daily numeric rank is also written out as a plain
      (uncharted) column so the green/blue split can be audited against
      real numbers.
-  7. A Top 10 RS equal-weight, daily-rebalanced cumulative-return
-     equity curve (no costs/slippage modeled) is also built, with
-     20/50/200-day SMA overlays, rebased to 0% at day 1 of the same
-     display window -- a regime/timing overlay, not a real backtest.
+  7. TWO Top 10 RS equal-weight, daily-rebalanced cumulative-return
+     equity curves (no costs/slippage modeled) are also built, with
+     20/50/200-day SMA overlays: one over the last RS_LINE_WINDOW
+     (50) trading days, and a second over the last EQUITY_1Y_WINDOW
+     (252) trading days -- same metrics, same SMA overlays, just a
+     longer lookback so regime shifts are visible over a full year.
+     Both are rebased to 0% at day 1 of their own display window.
      The most recent day is labeled with the time of the run since it
      reflects the latest fetched price, not a settled close.
 
-  CHART LAYOUT: all charts (the Top10 equity curve chart + every
+  CHART LAYOUT: all charts (both Top10 equity curve charts + every
   per-stock chart) are anchored together in a single stacked block at
   the very top of the sheet, above all text and data tables. Each
   chart's underlying DATA TABLE stays exactly where it always was
-  (equity table, then each ranked stock's own labeled data block) --
+  (equity tables, then each ranked stock's own labeled data block) --
   only the floating chart objects themselves are grouped together.
+
+  CHART RELIABILITY: chart-creation requests are sent to the Sheets
+  API in small batches with quota-aware retries. If a batch still
+  fails after retries, each chart in that batch is retried
+  individually (rather than the whole batch being silently dropped),
+  and anything that still can't be added is named explicitly in the
+  run log at the end -- so "a few charts missing" is now always
+  visible and diagnosable instead of a silent, unlabeled gap.
 
 This is a screener, not a trading system.
 """
@@ -83,6 +94,7 @@ SERIES_COLORS = [GREEN_COLOR, BLUE_COLOR, RS_LINE_COLOR]
 
 # Top 10 RS equal-weight equity curve (regime/timing overlay)
 EQUITY_SMA_PERIODS = (20, 50, 200)
+EQUITY_1Y_WINDOW = 252  # second equity curve: last ~1 trading year, same metrics/SMAs
 EQUITY_COLOR = {"red": 0.15, "green": 0.15, "blue": 0.15}        # equity curve (near-black)
 EQUITY_SMA20_COLOR = {"red": 0.20, "green": 0.60, "blue": 0.86}  # 20 SMA (blue)
 EQUITY_SMA50_COLOR = {"red": 0.95, "green": 0.60, "blue": 0.10}  # 50 SMA (orange)
@@ -99,6 +111,13 @@ EQUITY_SERIES_COLORS = [
 # comfortably clearing a 400px-tall chart.
 CHART_ROW_SPACING = 20
 CHART_ZONE_BUFFER_ROWS = 2  # small gap after the last chart before text starts
+
+# Chart batch-creation tuning. Smaller batches + a pause between them
+# reduce the odds of hitting a burst rate limit that kills an entire
+# batch of charts at once; batches that still fail get retried chart
+# by chart so one bad request can't take a whole batch down with it.
+CHART_BATCH_SIZE = 5
+CHART_BATCH_PAUSE_SECONDS = 2
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
@@ -703,6 +722,72 @@ def call_with_quota_retry(
             time.sleep(wait)
 
 
+def add_charts_robust(sh, chart_requests, chart_labels, chunk=CHART_BATCH_SIZE):
+    """
+    Sends addChart requests in small batches with quota-aware retries.
+    A batch that still fails after retries is NOT just skipped: each
+    chart inside it is retried individually, so one bad/rate-limited
+    request can't silently take a whole batch of charts down with it.
+    Anything that still can't be added after that is returned by name
+    so the run log tells you exactly which charts are missing and why,
+    instead of leaving you to notice a gap on the sheet.
+    """
+    total = len(chart_requests)
+    if total == 0:
+        return []
+
+    added = 0
+    failed = []
+
+    for i in range(0, total, chunk):
+        batch = chart_requests[i:i + chunk]
+        labels = chart_labels[i:i + chunk]
+
+        try:
+            call_with_quota_retry(
+                lambda b=batch: sh.batch_update({"requests": b}),
+                label=f"chart batch {i + 1}-{i + len(batch)}"
+            )
+            added += len(batch)
+            print(f"Added charts {i + 1}-{i + len(batch)} of {total}")
+
+        except Exception as e:
+            print(
+                f"Chart batch {i + 1}-{i + len(batch)} failed after "
+                f"retries ({e}); retrying charts individually..."
+            )
+
+            for req, lbl in zip(batch, labels):
+                try:
+                    call_with_quota_retry(
+                        lambda r=req: sh.batch_update({"requests": [r]}),
+                        label=f"chart retry: {lbl}",
+                        max_retries=4,
+                        initial_wait_seconds=10
+                    )
+                    added += 1
+                    print(f"  Recovered chart: {lbl}")
+
+                except Exception as e2:
+                    failed.append(lbl)
+                    detail = getattr(e2, "response", None)
+                    if detail is not None:
+                        try:
+                            print(f"  FAILED chart: {lbl} -> {detail.text}")
+                        except Exception:
+                            print(f"  FAILED chart: {lbl} -> {e2!r}")
+                    else:
+                        print(f"  FAILED chart: {lbl} -> {e2}")
+
+        time.sleep(CHART_BATCH_PAUSE_SECONDS)
+
+    print(f"\nChart summary: {added}/{total} charts added.")
+    if failed:
+        print(f"Charts NOT added ({len(failed)}): {failed}")
+
+    return failed
+
+
 def col_letter(idx0):
     letters = ""
     idx = idx0
@@ -760,7 +845,8 @@ def write_to_sheet(
     stock_series_list,
     skipped_symbols,
     as_of_date,
-    equity_table=None
+    equity_table_50d=None,
+    equity_table_1y=None
 ):
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
@@ -776,9 +862,15 @@ def write_to_sheet(
             index=False
         )
 
-        if equity_table is not None:
-            equity_table.to_csv(
-                "RS_Top10_Equity_Curve.csv",
+        if equity_table_50d is not None:
+            equity_table_50d.to_csv(
+                "RS_Top10_Equity_Curve_50d.csv",
+                index=False
+            )
+
+        if equity_table_1y is not None:
+            equity_table_1y.to_csv(
+                "RS_Top10_Equity_Curve_1y.csv",
                 index=False
             )
 
@@ -807,12 +899,18 @@ def write_to_sheet(
     DATA_COL_START = 9
 
     block_height = RS_LINE_WINDOW + 4
+    block_height_1y = EQUITY_1Y_WINDOW + 4
 
     # Number of chart objects that will be stacked together at the top
-    # of the sheet: the Top10 equity chart (if we have enough history)
-    # plus one chart per charted stock.
-    n_equity_chart = 1 if equity_table is not None else 0
-    total_charts = n_equity_chart + len(stock_series_list)
+    # of the sheet: the two Top10 equity charts (if we have enough
+    # history for each) plus one chart per charted stock.
+    n_equity_chart_50d = 1 if equity_table_50d is not None else 0
+    n_equity_chart_1y = 1 if equity_table_1y is not None else 0
+    total_charts = (
+        n_equity_chart_50d
+        + n_equity_chart_1y
+        + len(stock_series_list)
+    )
     charts_zone_rows = (
         total_charts * CHART_ROW_SPACING
         + CHART_ZONE_BUFFER_ROWS
@@ -823,7 +921,8 @@ def write_to_sheet(
         + 3
         + len(ranking_df)
         + 3
-        + block_height  # Top10 equity curve block
+        + block_height      # Top10 50-day equity curve block
+        + block_height_1y   # Top10 1-year equity curve block
         + len(stock_series_list) * block_height
         + 20
     )
@@ -915,9 +1014,10 @@ def write_to_sheet(
         f"each chart's own data table is still labeled below | "
         f"'daily_rank' column shows the actual rank each day "
         f"(not charted) to audit the green/blue split | "
-        f"Top {TOP10_N} RS Equal-Weight Equity Curve included "
-        f"(daily rebalance, no costs) with 20/50/200 SMA overlays "
-        f"for regime timing | "
+        f"Top {TOP10_N} RS Equal-Weight Equity Curve included twice "
+        f"(daily rebalance, no costs): last {RS_LINE_WINDOW} days and "
+        f"last {EQUITY_1Y_WINDOW} days (1 year), both with "
+        f"20/50/200 SMA overlays for regime timing | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} skipped: incomplete "
         f"{RS_LINE_WINDOW}-day history) | "
@@ -955,11 +1055,24 @@ def write_to_sheet(
     add_row()
 
     chart_requests = []
+    chart_labels = []
 
-    if equity_table is not None:
+    def add_equity_block(equity_table, window_label, window_days):
+        nonlocal next_chart_anchor_row
+
+        if equity_table is None:
+            add_row(left=[
+                f"Top {TOP10_N} RS Equity Curve ({window_label}): "
+                f"skipped -- not enough history yet for a full "
+                f"Top {TOP10_N} portfolio plus "
+                f"{max(EQUITY_SMA_PERIODS)}-day SMA warmup."
+            ])
+            add_row()
+            return
+
         add_row(left=[
             f"Top {TOP10_N} RS Equal-Weight Equity Curve "
-            f"(Last {RS_LINE_WINDOW} Days, Daily Rebalance, No Costs) | "
+            f"({window_label}, Daily Rebalance, No Costs) | "
             "Black = equity curve, Blue = 20 SMA, Orange = 50 SMA, "
             "Red = 200 SMA -- equity below the red 200 SMA is the "
             "classic cue to consider de-risking to cash"
@@ -994,7 +1107,7 @@ def write_to_sheet(
                 ws.id,
                 (
                     f"Top {TOP10_N} RS Equity Curve vs "
-                    f"20/50/200 SMA (Last {RS_LINE_WINDOW} Days)"
+                    f"20/50/200 SMA ({window_label})"
                 ),
                 eq_header_row_0idx,
                 len(eq_table),
@@ -1004,14 +1117,19 @@ def write_to_sheet(
                 colors=EQUITY_SERIES_COLORS,
             )
         )
+        chart_labels.append(f"Equity curve ({window_label})")
         next_chart_anchor_row += CHART_ROW_SPACING
-    else:
-        add_row(left=[
-            f"Top {TOP10_N} RS Equity Curve: skipped -- not enough "
-            f"history yet for a full Top {TOP10_N} portfolio plus "
-            f"{max(EQUITY_SMA_PERIODS)}-day SMA warmup."
-        ])
-        add_row()
+
+    add_equity_block(
+        equity_table_50d,
+        f"Last {RS_LINE_WINDOW} Days",
+        RS_LINE_WINDOW
+    )
+    add_equity_block(
+        equity_table_1y,
+        f"Last {EQUITY_1Y_WINDOW} Days / 1 Year",
+        EQUITY_1Y_WINDOW
+    )
 
     for rank, symbol, df in stock_series_list:
         add_row(
@@ -1049,6 +1167,7 @@ def write_to_sheet(
                 colors=SERIES_COLORS,
             )
         )
+        chart_labels.append(f"Rank {rank} - {symbol}")
         next_chart_anchor_row += CHART_ROW_SPACING
 
     write_rows_in_chunks(
@@ -1067,62 +1186,23 @@ def write_to_sheet(
         start_col=col_letter(DATA_COL_START)
     )
 
-    if chart_requests:
-        chunk = 10
-
-        for i in range(
-            0,
-            len(chart_requests),
-            chunk
-        ):
-            batch = chart_requests[
-                i:i + chunk
-            ]
-
-            try:
-                call_with_quota_retry(
-                    lambda b=batch:
-                        sh.batch_update(
-                            {"requests": b}
-                        ),
-                    label=(
-                        f"chart batch "
-                        f"{i + 1}-"
-                        f"{i + len(batch)}"
-                    )
-                )
-
-                print(
-                    f"Added charts "
-                    f"{i + 1}-"
-                    f"{min(i + chunk, len(chart_requests))} "
-                    f"of {len(chart_requests)}"
-                )
-
-            except Exception as e:
-                print(
-                    f"Could not add chart batch "
-                    f"{i + 1}-"
-                    f"{i + len(batch)} "
-                    f"(non-fatal, continuing)"
-                )
-                # Print the full API error body (str(e) alone is often
-                # just a status code) so the real cause is visible.
-                detail = getattr(e, "response", None)
-                if detail is not None:
-                    try:
-                        print("API error body:", detail.text)
-                    except Exception:
-                        print("API error (raw):", repr(e))
-                else:
-                    print("API error (raw):", repr(e))
+    failed_charts = add_charts_robust(sh, chart_requests, chart_labels)
 
     print(
         f"\nScreener results written to "
         f"'{SCREENER_WORKSHEET}' tab: "
         f"{len(ranking_df)} ranked stocks, "
-        f"{len(stock_series_list)} charts."
+        f"{len(chart_requests) - len(failed_charts)}/"
+        f"{len(chart_requests)} charts added."
     )
+
+    if failed_charts:
+        print(
+            "NOTE: the charts above could not be added after retries "
+            "-- their data tables are still on the sheet, only the "
+            "chart objects are missing. Re-running the script will "
+            "attempt them again."
+        )
 
 
 # ============================================================
@@ -1370,6 +1450,10 @@ def main():
         -RS_LINE_WINDOW:
     ]
 
+    trading_days_window_1y = trading_days[
+        -EQUITY_1Y_WINDOW:
+    ]
+
     if len(trading_days_window) < RS_LINE_WINDOW:
         print(
             f"\nWARNING: only "
@@ -1378,11 +1462,19 @@ def main():
             "available; chart window shortened."
         )
 
+    if len(trading_days_window_1y) < EQUITY_1Y_WINDOW:
+        print(
+            f"\nWARNING: only "
+            f"{len(trading_days_window_1y)} "
+            "trading days of benchmark history "
+            "available; 1-year equity window shortened."
+        )
+
     print(
         f"\nComputing daily rank across "
         f"{len(trading_days)} days "
         "(drives price line coloring, audit column, "
-        "and the Top10 equity curve)..."
+        "and both Top10 equity curves)..."
     )
 
     rank_maps = compute_daily_rank_maps(
@@ -1397,23 +1489,42 @@ def main():
         TOP10_N
     )
 
-    equity_table = build_top10_equity_table(
+    equity_table_50d = build_top10_equity_table(
         equity_index,
         trading_days_window
     )
 
-    if equity_table is None:
+    equity_table_1y = build_top10_equity_table(
+        equity_index,
+        trading_days_window_1y
+    )
+
+    if equity_table_50d is None:
         print(
-            "\nTop10 equity curve: skipped -- not enough history yet "
-            f"for a full Top {TOP10_N} portfolio plus "
+            "\nTop10 equity curve (50-day): skipped -- not enough "
+            f"history yet for a full Top {TOP10_N} portfolio plus "
             f"{max(EQUITY_SMA_PERIODS)}-day SMA warmup. "
             "This resolves itself as more days of data accumulate."
         )
     else:
         print(
-            f"\nTop10 equity curve built: "
+            f"\nTop10 equity curve (50-day) built: "
             f"{len(equity_index)} days of history, "
-            f"{len(equity_table)} days displayed."
+            f"{len(equity_table_50d)} days displayed."
+        )
+
+    if equity_table_1y is None:
+        print(
+            "\nTop10 equity curve (1-year): skipped -- not enough "
+            f"history yet for a full Top {TOP10_N} portfolio plus "
+            f"{max(EQUITY_SMA_PERIODS)}-day SMA warmup over a "
+            f"{EQUITY_1Y_WINDOW}-day window. This resolves itself as "
+            "more days of data accumulate."
+        )
+    else:
+        print(
+            f"Top10 equity curve (1-year) built: "
+            f"{len(equity_table_1y)} days displayed."
         )
 
     stock_series_list = []
@@ -1459,7 +1570,8 @@ def main():
         stock_series_list,
         skipped_symbols,
         as_of_date.strftime("%Y-%m-%d"),
-        equity_table
+        equity_table_50d,
+        equity_table_1y
     )
 
     ranking_df.to_csv(
