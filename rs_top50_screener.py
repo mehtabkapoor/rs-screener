@@ -10,16 +10,21 @@ WHAT THIS DOES (single snapshot, not a backtest)
   4. Writes the full ranked table, Rank 1 downward.
   5. For EACH of the Top 50 stocks individually, builds its own
      small data table (last RS_LINE_WINDOW trading days: date, price
-     % change, RS Line % change) and its own two-line chart -- both
-     series rebased to 0% at day 1 of the window.
+     % change, RS Line value) and its own two-line chart. The PRICE
+     series is rebased to 0% at day 1 of the window and plotted on the
+     LEFT axis. The RS LINE is the standard (IBD/StockCharts-style)
+     relative-strength line -- (price / benchmark) x 100, NOT rebased
+     -- plotted on its own RIGHT axis, since its scale has nothing to
+     do with price %. Its slope and new highs/lows over the window are
+     the signal, not its absolute level.
   6. The PRICE line is split into two color-coded series so it renders
      GREEN on any day the stock was ranked in the Top 10 (by RS Score)
      and BLUE on any day it was outside the Top 10. The RS Line is a
-     single, constant RED series. Boundary days are duplicated across
-     both price color segments so the line stays visually continuous.
-     The actual daily numeric rank is also written out as a plain
-     (uncharted) column so the green/blue split can be audited against
-     real numbers.
+     single, constant RED series on the secondary axis. Boundary days
+     are duplicated across both price color segments so the line stays
+     visually continuous. The actual daily numeric rank is also
+     written out as a plain (uncharted) column so the green/blue split
+     can be audited against real numbers.
   7. TWO Top 10 RS equal-weight, daily-rebalanced cumulative-return
      equity curves (no costs/slippage modeled) are also built, with
      20/50/200-day SMA overlays: one over the last RS_LINE_WINDOW
@@ -457,32 +462,53 @@ def build_stock_series(
     trading_days_window,
     rank_maps
 ):
+    """
+    Returns (dataframe, note). note is None on a clean run, or a short
+    string on success noting how many no-trade/circuit days were
+    carried forward -- purely informational, not a skip. dataframe is
+    only None when the stock is genuinely unplottable (see below).
+
+    No completeness threshold: a stock in upper/lower circuit has
+    genuine no-trade days (it's still bought/sold at the circuit
+    price pre-open, it just doesn't print a new trade), and a listing
+    or data gap is handled the same way real trading desks handle a
+    frozen quote -- carry the last available price forward until a
+    new trade prints. Leading gaps (e.g. stock listed a few days into
+    the window) are back-filled from the first available price so day
+    1 of the window is never NaN.
+
+    A stock is only skipped if it has NO valid (positive) price
+    anywhere in the whole window -- i.e. there is nothing to carry
+    forward or back, so nothing meaningful can be charted.
+    """
     df = all_stocks[symbol]
 
-    prices = df["price"].reindex(trading_days_window)
+    prices_raw = df["price"].reindex(trading_days_window)
+    # Treat non-positive prices as missing too, so a bad tick (0 or
+    # negative) gets carried over the same way a no-trade day does,
+    # rather than corrupting the % change / RS Line math.
+    prices_raw = prices_raw.where(prices_raw > 0)
+
+    n_filled = int(prices_raw.isna().sum())
+    prices = prices_raw.ffill().bfill()
+
+    if prices.isna().all():
+        return None, "no valid (positive) price data anywhere in the window"
+
     bench = bench_close.reindex(trading_days_window)
 
-    if (
-        prices.isna().any()
-        or bench.isna().any()
-        or (bench <= 0).any()
-    ):
-        return None
+    if bench.isna().any() or (bench <= 0).any():
+        return None, "benchmark has a gap/non-positive value in this window"
 
     price_base = prices.iloc[0]
-
-    if price_base <= 0 or pd.isna(price_base):
-        return None
-
     price_pct = (prices / price_base - 1) * 100
 
-    ratio = prices / bench
-    rs_base = ratio.iloc[0]
-
-    if rs_base <= 0 or pd.isna(rs_base):
-        return None
-
-    rs_line_pct = (ratio / rs_base - 1) * 100
+    # RS Line = (price / benchmark) x 100 -- the standard IBD/StockCharts
+    # relative-strength line. Deliberately NOT rebased to 0% like the
+    # price series: an RS line's value is meant to trend and make new
+    # highs/lows over time. It renders on its own secondary axis (see
+    # make_stock_chart) since its scale has nothing to do with price %.
+    rs_line_x100 = (prices / bench) * 100
 
     # Daily rank (None = not eligible that day) and the Top-N flag
     # derived directly from it -- this is what drives the green/blue
@@ -505,16 +531,20 @@ def build_stock_series(
         for r in daily_ranks
     ]
 
-    return pd.DataFrame({
+    result = pd.DataFrame({
         "date": [
             d.strftime("%Y-%m-%d")
             for d in trading_days_window
         ],
         "price_pct_top10": np.round(np.array(top_vals, dtype=float), 3),
         "price_pct_other": np.round(np.array(other_vals, dtype=float), 3),
-        "rs_line_pct": rs_line_pct.round(3).values,
+        "rs_line_x100": rs_line_x100.round(4).values,
         "daily_rank": rank_col,
     })
+
+    fill_note = f"{n_filled} no-trade/bad-tick day(s) carried forward" if n_filled else None
+
+    return result, fill_note
 
 
 # ============================================================
@@ -592,7 +622,10 @@ def make_stock_chart(
     anchor_row,
     data_col_start,
     n_series,
-    colors
+    colors,
+    series_axes=None,
+    left_axis_title="% Change from Day 1 (Base = 0)",
+    right_axis_title=None
 ):
     """
     `header_row_0idx`/`n_rows` locate the chart's SOURCE DATA (which
@@ -601,10 +634,22 @@ def make_stock_chart(
     on-screen position and is independent of the data location -- this
     is what lets every chart be stacked together at the top of the
     sheet while each data table stays put further down.
+
+    `series_axes`, if given, is a list of "LEFT_AXIS"/"RIGHT_AXIS" the
+    same length as `colors`, letting a series with an unrelated scale
+    (e.g. a raw RS Line value vs. a price % change) get its own right
+    axis instead of being squashed flat against the left-axis series.
+    Defaults to all LEFT_AXIS (previous single-axis behavior) when
+    omitted, so existing callers (the equity curve chart) are unaffected.
     """
     data_end_row = header_row_0idx + 1 + n_rows
 
-    def series(col_index, color):
+    if series_axes is None:
+        series_axes = ["LEFT_AXIS"] * n_series
+
+    uses_right_axis = "RIGHT_AXIS" in series_axes
+
+    def series(col_index, color, target_axis):
         return {
             "series": {
                 "sourceRange": {
@@ -617,7 +662,7 @@ def make_stock_chart(
                     }]
                 }
             },
-            "targetAxis": "LEFT_AXIS",
+            "targetAxis": target_axis,
             "color": color,
             "colorStyle": {"rgbColor": color},
             "lineStyle": {
@@ -630,6 +675,23 @@ def make_stock_chart(
             },
         }
 
+    axis_defs = [
+        {
+            "position": "BOTTOM_AXIS",
+            "title": "Date"
+        },
+        {
+            "position": "LEFT_AXIS",
+            "title": left_axis_title
+        },
+    ]
+
+    if uses_right_axis:
+        axis_defs.append({
+            "position": "RIGHT_AXIS",
+            "title": right_axis_title or "Secondary axis"
+        })
+
     return {
         "addChart": {
             "chart": {
@@ -638,18 +700,7 @@ def make_stock_chart(
                     "basicChart": {
                         "chartType": "LINE",
                         "legendPosition": "BOTTOM_LEGEND",
-                        "axis": [
-                            {
-                                "position": "BOTTOM_AXIS",
-                                "title": "Date"
-                            },
-                            {
-                                "position": "LEFT_AXIS",
-                                "title":
-                                    "% Change from Day 1 "
-                                    "(Base = 0)"
-                            },
-                        ],
+                        "axis": axis_defs,
                         "domains": [{
                             "domain": {
                                 "sourceRange": {
@@ -670,7 +721,8 @@ def make_stock_chart(
                         "series": [
                             series(
                                 data_col_start + 1 + i,
-                                colors[i]
+                                colors[i],
+                                series_axes[i]
                             )
                             for i in range(n_series)
                         ],
@@ -846,7 +898,8 @@ def write_to_sheet(
     skipped_symbols,
     as_of_date,
     equity_table_50d=None,
-    equity_table_1y=None
+    equity_table_1y=None,
+    skip_reasons=None
 ):
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
@@ -928,7 +981,7 @@ def write_to_sheet(
     )
 
     # date column + 3 charted series (price_pct_top10, price_pct_other,
-    # rs_line_pct) + 1 audit column (daily_rank, not charted) + buffer
+    # rs_line_x100) + 1 audit column (daily_rank, not charted) + buffer
     n_cols_needed = DATA_COL_START + 5 + 2
 
     ws = call_with_quota_retry(
@@ -1006,10 +1059,10 @@ def write_to_sheet(
         f"RS Formula: 40% 3M + 20% 6M + "
         f"20% 9M + 20% 12M Price Rate-of-Change | "
         f"Charts: Price % (GREEN = in Top {TOP10_N} by RS Score that "
-        f"day, BLUE = outside Top {TOP10_N}) and RS Line % "
-        f"(price/benchmark, RED), all rebased to 0% "
-        f"at day 1 of the last "
-        f"{RS_LINE_WINDOW}-day window | "
+        f"day, BLUE = outside Top {TOP10_N}, LEFT axis, rebased to 0% "
+        f"at day 1) vs RS Line = Price/Benchmark x100 (RED, RIGHT axis, "
+        f"NOT rebased -- its own trend/highs/lows are the signal), "
+        f"last {RS_LINE_WINDOW}-day window | "
         f"All charts are grouped together at the top of this sheet; "
         f"each chart's own data table is still labeled below | "
         f"'daily_rank' column shows the actual rank each day "
@@ -1019,8 +1072,9 @@ def write_to_sheet(
         f"last {EQUITY_1Y_WINDOW} days (1 year), both with "
         f"20/50/200 SMA overlays for regime timing | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
-        f"({len(skipped_symbols)} skipped: incomplete "
-        f"{RS_LINE_WINDOW}-day history) | "
+        f"({len(skipped_symbols)} truly unplottable: no valid price "
+        f"data at all in window; circuit/no-trade days are carried "
+        f"forward from last price, not skipped) | "
         f"Price filter > Rs.{MIN_PRICE} | "
         f"Liquidity > {MIN_AVG_VOLUME:,} "
         f"({VOLUME_LOOKBACK}D avg vol)"
@@ -1043,11 +1097,16 @@ def write_to_sheet(
         add_row(left=r)
 
     if skipped_symbols:
+        skip_reasons = skip_reasons or {}
+        detail = "; ".join(
+            f"{sym} ({skip_reasons.get(sym, 'unknown reason')})"
+            for sym in skipped_symbols
+        )
         add_row(
             left=[
-                "Skipped (incomplete "
-                f"{RS_LINE_WINDOW}-day history): "
-                + ", ".join(skipped_symbols)
+                "Skipped (no valid price data at all in window -- "
+                "not a completeness/circuit issue, genuinely no data): "
+                + detail
             ]
         )
 
@@ -1155,9 +1214,9 @@ def write_to_sheet(
                 ws.id,
                 (
                     f"Rank {rank} - {symbol}: "
-                    f"Price % (green=Top{TOP10_N}/blue=outside) "
-                    f"vs RS Line % "
-                    f"(Last {RS_LINE_WINDOW} Days, Base=0)"
+                    f"Price % (green=Top{TOP10_N}/blue=outside, left axis) "
+                    f"vs RS Line = Price/Benchmark x100 (red, right axis) "
+                    f"(Last {RS_LINE_WINDOW} Days)"
                 ),
                 header_row_0idx,
                 len(df),
@@ -1165,6 +1224,9 @@ def write_to_sheet(
                 data_col_start=DATA_COL_START,
                 n_series=3,
                 colors=SERIES_COLORS,
+                series_axes=["LEFT_AXIS", "LEFT_AXIS", "RIGHT_AXIS"],
+                left_axis_title="Price % Change from Day 1 (Base = 0)",
+                right_axis_title="RS Line (Price / Benchmark x 100)",
             )
         )
         chart_labels.append(f"Rank {rank} - {symbol}")
@@ -1529,6 +1591,8 @@ def main():
 
     stock_series_list = []
     skipped_symbols = []
+    skip_reasons = {}
+    fill_notes = {}
 
     for i, (
         sym,
@@ -1539,7 +1603,7 @@ def main():
 
         rank = i + 1
 
-        series_df = build_stock_series(
+        series_df, note = build_stock_series(
             all_stocks,
             sym,
             bench_close,
@@ -1549,21 +1613,33 @@ def main():
 
         if series_df is None:
             skipped_symbols.append(sym)
+            skip_reasons[sym] = note
             continue
 
         stock_series_list.append(
             (rank, sym, series_df)
         )
 
+        if note:
+            fill_notes[sym] = note
+
     print(
         f"\nCharted "
         f"{len(stock_series_list)}/"
         f"{len(top_ranking)} stocks "
-        f"({len(skipped_symbols)} skipped "
-        f"for incomplete "
-        f"{RS_LINE_WINDOW}-day history): "
-        f"{skipped_symbols}"
+        f"({len(skipped_symbols)} truly unplottable -- "
+        f"no valid price data at all in the window):"
     )
+    for sym in skipped_symbols:
+        print(f"  {sym}: {skip_reasons.get(sym, 'unknown reason')}")
+
+    if fill_notes:
+        print(
+            f"\n{len(fill_notes)} stock(s) had no-trade/circuit days "
+            "carried forward from the last available price:"
+        )
+        for sym, note in fill_notes.items():
+            print(f"  {sym}: {note}")
 
     write_to_sheet(
         ranking_df,
@@ -1571,7 +1647,8 @@ def main():
         skipped_symbols,
         as_of_date.strftime("%Y-%m-%d"),
         equity_table_50d,
-        equity_table_1y
+        equity_table_1y,
+        skip_reasons
     )
 
     ranking_df.to_csv(
