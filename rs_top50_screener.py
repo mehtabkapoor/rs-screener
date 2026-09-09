@@ -90,6 +90,15 @@ GREEN_COLOR = {"red": 0.20, "green": 0.65, "blue": 0.33}   # in Top 10
 BLUE_COLOR = {"red": 0.26, "green": 0.52, "blue": 0.96}    # outside Top 10
 SERIES_COLORS = [GREEN_COLOR, BLUE_COLOR]
 
+# RS rank trend line, overlaid on the same per-stock chart as price on
+# a secondary (right) axis. Charted as NEGATIVE rank (-rank) so the
+# line's direction reads intuitively: RISING = strengthening RS rank
+# (moving toward Rank 1, i.e. less negative / closer to 0), FALLING =
+# weakening RS rank (dropping down the universe, more negative). The
+# true positive rank number is still written next to it (uncharted)
+# for audit.
+RANK_LINE_COLOR = {"red": 0.55, "green": 0.15, "blue": 0.75}  # purple
+
 # Top 10 RS equal-weight equity curve (regime/timing overlay)
 EQUITY_SMA_PERIODS = (20, 50, 200)
 EQUITY_1Y_WINDOW = 252  # second equity curve: last ~1 trading year, same metrics/SMAs
@@ -487,6 +496,12 @@ def build_stock_series(
     or back, so nothing meaningful can be charted.
 
     PRICE % is rebased to 0% at day 1 of trading_days_window.
+
+    The daily RS rank is also returned as two columns: `rank_line`
+    (the CHARTED value, plotted as -rank on the chart's right axis so
+    a rising line reads as a strengthening RS rank and a falling line
+    reads as a weakening one) and `daily_rank` (the raw, uncharted,
+    positive rank number for audit against the chart).
     """
     df = all_stocks[symbol]
 
@@ -526,6 +541,14 @@ def build_stock_series(
         for r in daily_ranks
     ]
 
+    # Charted rank trend line: -rank, so it shares the same "up is
+    # good" reading as the price line even though a numerically LOWER
+    # rank (closer to 1) is the stronger one.
+    rank_line_col = [
+        (-float(r) if r is not None else np.nan)
+        for r in daily_ranks
+    ]
+
     result = pd.DataFrame({
         "date": [
             d.strftime("%Y-%m-%d")
@@ -533,6 +556,7 @@ def build_stock_series(
         ],
         "price_pct_top10": np.round(np.array(top_vals, dtype=float), 3),
         "price_pct_other": np.round(np.array(other_vals, dtype=float), 3),
+        "rank_line": np.round(np.array(rank_line_col, dtype=float), 3),
         "daily_rank": rank_col,
     })
 
@@ -975,9 +999,9 @@ def write_to_sheet(
         + 20
     )
 
-    # date column + 2 charted series (price_pct_top10, price_pct_other)
-    # + 1 audit column (daily_rank, not charted) + buffer
-    n_cols_needed = DATA_COL_START + 5 + 2
+    # date column + 3 charted series (price_pct_top10, price_pct_other,
+    # rank_line) + 1 audit column (daily_rank, not charted) + buffer
+    n_cols_needed = DATA_COL_START + 6 + 2
 
     ws = call_with_quota_retry(
         lambda: get_or_create_worksheet(
@@ -1055,11 +1079,15 @@ def write_to_sheet(
         f"20% 9M + 20% 12M Price Rate-of-Change | "
         f"Charts: Price % (GREEN = in Top {TOP10_N} by RS Score that "
         f"day, BLUE = outside Top {TOP10_N}, rebased to 0% at day 1 "
-        f"of the {RS_LINE_WINDOW}-day window) | "
+        f"of the {RS_LINE_WINDOW}-day window), plus a PURPLE RS Rank "
+        f"trend line on the right axis, charted as -rank so RISING = "
+        f"strengthening RS rank (moving toward Rank 1) and FALLING = "
+        f"weakening RS rank | "
         f"All charts are grouped together at the top of this sheet; "
         f"each chart's own data table is still labeled below | "
-        f"'daily_rank' column shows the actual rank each day "
-        f"(not charted) to audit the green/blue split | "
+        f"'daily_rank' column shows the actual positive rank each day "
+        f"(not charted) to audit the rank line and the green/blue "
+        f"price split | "
         f"Top {TOP10_N} RS Equal-Weight Equity Curve included twice "
         f"(daily rebalance, no costs): last {RS_LINE_WINDOW} days and "
         f"last {EQUITY_1Y_WINDOW} days (1 year), both with "
@@ -1207,16 +1235,22 @@ def write_to_sheet(
                 ws.id,
                 (
                     f"Rank {rank} - {symbol}: "
-                    f"Price % (green=Top{TOP10_N}/blue=outside) "
+                    f"Price % (green=Top{TOP10_N}/blue=outside) + "
+                    f"RS Rank trend (purple, right axis) "
                     f"(Last {RS_LINE_WINDOW} Days)"
                 ),
                 header_row_0idx,
                 len(df),
                 anchor_row=next_chart_anchor_row,
                 data_col_start=DATA_COL_START,
-                n_series=2,
-                colors=SERIES_COLORS,
+                n_series=3,
+                colors=SERIES_COLORS + [RANK_LINE_COLOR],
+                series_axes=["LEFT_AXIS", "LEFT_AXIS", "RIGHT_AXIS"],
                 left_axis_title="Price % Change from Day 1 (Base = 0)",
+                right_axis_title=(
+                    "RS Rank (plotted as -rank: rising = strengthening, "
+                    "falling = weakening; see daily_rank col for actual rank)"
+                ),
             )
         )
         chart_labels.append(f"Rank {rank} - {symbol}")
@@ -1287,7 +1321,8 @@ def main():
 
     print(
         "Per-stock chart: Price % (green=Top"
-        f"{TOP10_N}/blue=outside), rebased to 0% at day 1, "
+        f"{TOP10_N}/blue=outside) + RS Rank trend (purple, right "
+        f"axis), rebased to 0% at day 1, "
         f"last {RS_LINE_WINDOW} trading days"
     )
 
