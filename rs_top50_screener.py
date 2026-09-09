@@ -131,14 +131,14 @@ SCREENER_WORKSHEET = "Screener - RS Top50"
 # If the most recent available bar is TODAY and the market is still live,
 # yfinance's "Close" for today is a moving intraday price, not a settled
 # close -- re-running the script minutes apart can return a different
-# live price each time, which silently reshuffles every stock's RS score
-# (and the liquidity filter's avg volume) and changes who's in the Top N.
-# With this on, that live/unsettled bar is excluded from ranking and the
-# script always ranks off the last fully settled close, so re-running the
-# same day gives an identical Top N list every time. Set False only if
-# you deliberately want a live intraday ranking snapshot (expect it to
-# shift run to run while the market is open).
-STRICT_SETTLED_CLOSE = True
+# live price each time, which reshuffles every stock's RS score (and the
+# liquidity filter's avg volume) and changes who's in the Top N.
+# STRICT_SETTLED_CLOSE = True would freeze ranking to yesterday's settled
+# close for run-to-run reproducibility. Set to False (default) to always
+# rank off the latest available price, including today's live intraday
+# tick -- you'll see today's move reflected immediately, at the cost of
+# the Top N list potentially shifting slightly if you re-run minutes apart.
+STRICT_SETTLED_CLOSE = False
 
 
 # ============================================================
