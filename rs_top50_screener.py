@@ -114,6 +114,16 @@ EQUITY_SERIES_COLORS = [
     EQUITY_COLOR, EQUITY_SMA20_COLOR, EQUITY_SMA50_COLOR, EQUITY_SMA200_COLOR
 ]
 
+# Avg RS Score of the Top 10 basket, overlaid on both equity curve
+# charts on a secondary (right) axis. Unlike the equity curve/SMAs
+# (which are all rebased to 0% at day 1 of their own window), this is
+# plotted as the RAW RS score (%) of that day's Top 10 basket -- it
+# answers a different question ("is the leading basket's momentum
+# strengthening or weakening?") from the equity curve ("is money
+# actually being made holding it?"), so rebasing it would blur that
+# distinction rather than clarify it.
+AVG_RS_COLOR = {"red": 0.0, "green": 0.55, "blue": 0.55}  # teal
+
 # All charts are stacked together at the top of the sheet, above every
 # text/data row. This is the vertical gap (in grid rows) between one
 # chart's anchor and the next, so consecutively-anchored charts (each
@@ -327,28 +337,46 @@ def build_ranking(all_stocks, date):
     return ranking
 
 
-def compute_daily_rank_maps(all_stocks, trading_days_window):
+def compute_daily_rank_maps(all_stocks, trading_days_window, top_n_for_avg_rs=TOP10_N):
     """
     For every date in the window, rank the full eligible universe and
     return {date: {symbol: rank}} (rank 1 = strongest that day). A
     symbol absent from a given day's map was not eligible that day
     (illiquid / below price floor / insufficient history).
 
-    This is the single source of truth used both to color-split each
-    stock's price line (green inside Top N, blue outside) and to
-    print the raw daily rank next to the data, so the coloring can be
-    visually audited against the actual numbers.
+    This is the single source of truth used to color-split each
+    stock's price line (green inside Top N, blue outside), print the
+    raw daily rank next to the data, drive the RS percentile line, and
+    drive the Top10 equity curve.
+
+    Also returns a second dict, {date: avg_rs_score}, the mean
+    RS Score of that day's Top `top_n_for_avg_rs` basket (NaN if fewer
+    than that many stocks were eligible that day) -- computed in the
+    same per-day ranking pass rather than re-ranking the universe a
+    second time.
     """
     rank_maps = {}
+    avg_rs_by_day = {}
 
     for d in trading_days_window:
         ranking = build_ranking(all_stocks, d)
+
         rank_maps[d] = {
             sym: i + 1
             for i, (sym, rs, price, vol) in enumerate(ranking)
         }
 
-    return rank_maps
+        top_slice = ranking[:top_n_for_avg_rs]
+        if len(top_slice) == top_n_for_avg_rs:
+            avg_rs_by_day[d] = float(
+                np.mean([rs for sym, rs, price, vol in top_slice])
+            )
+        else:
+            avg_rs_by_day[d] = np.nan
+
+    avg_rs_series = pd.Series(avg_rs_by_day, dtype=float).sort_index()
+
+    return rank_maps, avg_rs_series
 
 
 def compute_top10_equity_curve(all_stocks, rank_maps, full_calendar, top_n=10):
@@ -403,7 +431,7 @@ def compute_top10_equity_curve(all_stocks, rank_maps, full_calendar, top_n=10):
     return 100.0 * (1.0 + ret_series).cumprod()
 
 
-def build_top10_equity_table(equity_index, trading_days_window):
+def build_top10_equity_table(equity_index, trading_days_window, avg_rs_series=None):
     """
     Slice the Top N equity curve (and its 20/50/200 SMA, computed on
     the FULL curve so the SMAs are properly warmed up) down to the
@@ -411,6 +439,12 @@ def build_top10_equity_table(equity_index, trading_days_window):
     first day. Rebasing is a simple division by a positive constant,
     so it preserves exactly where the equity curve crosses each SMA
     -- it's purely a display transform.
+
+    If `avg_rs_series` is given, its values are sliced to the same
+    window and attached as `avg_rs_score_top10` -- the RAW (not
+    rebased) mean RS Score of that day's Top N basket, since it's a
+    momentum-strength reading, not a return, and rebasing it would
+    misrepresent it as one.
     """
     if equity_index.empty:
         return None
@@ -432,11 +466,18 @@ def build_top10_equity_table(equity_index, trading_days_window):
         sma = equity_index.rolling(period).mean().reindex(trading_days_window)
         sma_cols[f"sma{period}_pct"] = rebase(sma).round(3).values
 
-    return pd.DataFrame({
+    table = pd.DataFrame({
         "date": [d.strftime("%Y-%m-%d") for d in trading_days_window],
         "top10_equity_pct": rebase(window_equity).round(3).values,
         **sma_cols,
     })
+
+    if avg_rs_series is not None:
+        table["avg_rs_score_top10"] = (
+            avg_rs_series.reindex(trading_days_window).round(2).values
+        )
+
+    return table
 
 
 def split_by_rank(values, flags):
@@ -1115,7 +1156,10 @@ def write_to_sheet(
         f"Top {TOP10_N} RS Equal-Weight Equity Curve included twice "
         f"(daily rebalance, no costs): last {RS_LINE_WINDOW} days and "
         f"last {EQUITY_1Y_WINDOW} days (1 year), both with "
-        f"20/50/200 SMA overlays for regime timing | "
+        f"20/50/200 SMA overlays for regime timing, plus a TEAL Avg "
+        f"RS Score line (right axis, raw/not rebased) showing "
+        f"whether the Top {TOP10_N} basket's own momentum is "
+        f"strengthening or weakening | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} truly unplottable: no valid price "
         f"data at all in window; circuit/no-trade days are carried "
@@ -1179,7 +1223,12 @@ def write_to_sheet(
             f"({window_label}, Daily Rebalance, No Costs) | "
             "Black = equity curve, Blue = 20 SMA, Orange = 50 SMA, "
             "Red = 200 SMA -- equity below the red 200 SMA is the "
-            "classic cue to consider de-risking to cash"
+            "classic cue to consider de-risking to cash | "
+            "Teal (right axis) = Avg RS Score of that day's Top "
+            f"{TOP10_N} basket, RAW (not rebased) -- rising teal = "
+            "the leading basket's momentum is strengthening, falling "
+            "teal = it's weakening, independent of whether the "
+            "equity curve itself is up or down that day"
         ])
 
         eq_header_row = add_row(
@@ -1206,19 +1255,32 @@ def write_to_sheet(
         add_row()
         add_row()
 
+        has_avg_rs = "avg_rs_score_top10" in eq_table.columns
+
         chart_requests.append(
             make_stock_chart(
                 ws.id,
                 (
                     f"Top {TOP10_N} RS Equity Curve vs "
-                    f"20/50/200 SMA ({window_label})"
+                    f"20/50/200 SMA + Avg RS Score ({window_label})"
                 ),
                 eq_header_row_0idx,
                 len(eq_table),
                 anchor_row=next_chart_anchor_row,
                 data_col_start=DATA_COL_START,
-                n_series=4,
-                colors=EQUITY_SERIES_COLORS,
+                n_series=5 if has_avg_rs else 4,
+                colors=(
+                    EQUITY_SERIES_COLORS + [AVG_RS_COLOR]
+                    if has_avg_rs else EQUITY_SERIES_COLORS
+                ),
+                series_axes=(
+                    ["LEFT_AXIS"] * 4 + ["RIGHT_AXIS"]
+                    if has_avg_rs else None
+                ),
+                right_axis_title=(
+                    f"Avg RS Score of Top {TOP10_N} Basket (%, raw)"
+                    if has_avg_rs else None
+                ),
             )
         )
         chart_labels.append(f"Equity curve ({window_label})")
@@ -1611,13 +1673,14 @@ def main():
     print(
         f"\nComputing daily rank across "
         f"{len(trading_days)} days "
-        "(drives price line coloring, audit column, "
-        "and both Top10 equity curves)..."
+        "(drives price line coloring, RS percentile, audit column, "
+        "and both Top10 equity curves + avg RS overlay)..."
     )
 
-    rank_maps = compute_daily_rank_maps(
+    rank_maps, avg_rs_series = compute_daily_rank_maps(
         all_stocks,
-        trading_days
+        trading_days,
+        TOP10_N
     )
 
     equity_index = compute_top10_equity_curve(
@@ -1629,12 +1692,14 @@ def main():
 
     equity_table_50d = build_top10_equity_table(
         equity_index,
-        trading_days_window
+        trading_days_window,
+        avg_rs_series
     )
 
     equity_table_1y = build_top10_equity_table(
         equity_index,
-        trading_days_window_1y
+        trading_days_window_1y,
+        avg_rs_series
     )
 
     if equity_table_50d is None:
