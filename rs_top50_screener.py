@@ -128,6 +128,18 @@ SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
 SCREENER_WORKSHEET = "Screener - RS Top50"
 
+# If the most recent available bar is TODAY and the market is still live,
+# yfinance's "Close" for today is a moving intraday price, not a settled
+# close -- re-running the script minutes apart can return a different
+# live price each time, which silently reshuffles every stock's RS score
+# (and the liquidity filter's avg volume) and changes who's in the Top N.
+# With this on, that live/unsettled bar is excluded from ranking and the
+# script always ranks off the last fully settled close, so re-running the
+# same day gives an identical Top N list every time. Set False only if
+# you deliberately want a live intraday ranking snapshot (expect it to
+# shift run to run while the market is open).
+STRICT_SETTLED_CLOSE = True
+
 
 # ============================================================
 # DATE / SERIES HELPERS
@@ -1456,6 +1468,32 @@ def main():
             bench_close.index.max()
         ).normalize()
     )
+
+    if STRICT_SETTLED_CLOSE:
+        today = pd.Timestamp.today().normalize()
+
+        if as_of_date == today:
+            prior_days = bench_close.index[bench_close.index < today]
+
+            if len(prior_days) > 0:
+                settled_as_of_date = prior_days.max()
+                print(
+                    f"\nNOTE: today ({today:%Y-%m-%d}) is still live/"
+                    "intraday -- its Close is a moving price, not a "
+                    "settled one, so ranking off it would reshuffle "
+                    "between re-runs. Ranking off the last SETTLED "
+                    f"close instead: {settled_as_of_date:%Y-%m-%d}. "
+                    "Set STRICT_SETTLED_CLOSE = False to rank off "
+                    "today's live price anyway."
+                )
+                as_of_date = settled_as_of_date
+            else:
+                print(
+                    "\nWARNING: today is the only available trading "
+                    "day and STRICT_SETTLED_CLOSE is on, but there's "
+                    "no prior settled day to fall back to -- ranking "
+                    "off today's live price anyway."
+                )
 
     print(
         f"\nAs-of date: "
