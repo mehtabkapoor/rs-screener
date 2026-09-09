@@ -91,13 +91,16 @@ BLUE_COLOR = {"red": 0.26, "green": 0.52, "blue": 0.96}    # outside Top 10
 SERIES_COLORS = [GREEN_COLOR, BLUE_COLOR]
 
 # RS rank trend line, overlaid on the same per-stock chart as price on
-# a secondary (right) axis. Charted as NEGATIVE rank (-rank) so the
-# line's direction reads intuitively: RISING = strengthening RS rank
-# (moving toward Rank 1, i.e. less negative / closer to 0), FALLING =
-# weakening RS rank (dropping down the universe, more negative). The
-# true positive rank number is still written next to it (uncharted)
-# for audit.
+# a secondary (right) axis. Charted as an RS PERCENTILE (IBD-style):
+# each day's raw rank is rescaled against that day's full eligible
+# universe size so Rank 1 (strongest) = RS_PERCENTILE_BEST and the
+# weakest eligible stock that day = RS_PERCENTILE_WORST, linearly in
+# between. RISING = strengthening RS, FALLING = weakening RS -- no
+# sign-flip needed, unlike raw rank. The true positive rank number is
+# still written next to it (uncharted) for audit.
 RANK_LINE_COLOR = {"red": 0.55, "green": 0.15, "blue": 0.75}  # purple
+RS_PERCENTILE_BEST = 99   # Rank 1 (strongest) maps to this percentile
+RS_PERCENTILE_WORST = 1   # weakest eligible stock that day maps to this
 
 # Top 10 RS equal-weight equity curve (regime/timing overlay)
 EQUITY_SMA_PERIODS = (20, 50, 200)
@@ -497,11 +500,13 @@ def build_stock_series(
 
     PRICE % is rebased to 0% at day 1 of trading_days_window.
 
-    The daily RS rank is also returned as two columns: `rank_line`
-    (the CHARTED value, plotted as -rank on the chart's right axis so
-    a rising line reads as a strengthening RS rank and a falling line
-    reads as a weakening one) and `daily_rank` (the raw, uncharted,
-    positive rank number for audit against the chart).
+    The daily RS rank is also returned as two columns: `rank_percentile`
+    (the CHARTED value -- that day's rank rescaled against that day's
+    full eligible-universe size, RS_PERCENTILE_BEST for Rank 1 down to
+    RS_PERCENTILE_WORST for the weakest eligible stock that day, so a
+    rising line reads as strengthening RS and a falling line reads as
+    weakening RS) and `daily_rank` (the raw, uncharted, positive rank
+    number for audit against the chart).
     """
     df = all_stocks[symbol]
 
@@ -541,12 +546,29 @@ def build_stock_series(
         for r in daily_ranks
     ]
 
-    # Charted rank trend line: -rank, so it shares the same "up is
-    # good" reading as the price line even though a numerically LOWER
-    # rank (closer to 1) is the stronger one.
-    rank_line_col = [
-        (-float(r) if r is not None else np.nan)
-        for r in daily_ranks
+    # Charted RS percentile: that day's rank rescaled against that
+    # day's full eligible-universe size (len of that day's rank map),
+    # not the fixed TOP_N -- so the scale is honest about how big the
+    # actual eligible field was that day. Rank 1 -> RS_PERCENTILE_BEST,
+    # weakest eligible stock that day -> RS_PERCENTILE_WORST, linear
+    # in between. A universe of 1 (degenerate) maps to BEST.
+    universe_sizes = [
+        len(rank_maps.get(d, {}))
+        for d in trading_days_window
+    ]
+
+    def rank_to_percentile(r, n):
+        if r is None or n <= 0:
+            return np.nan
+        if n <= 1:
+            return float(RS_PERCENTILE_BEST)
+        return RS_PERCENTILE_WORST + (
+            RS_PERCENTILE_BEST - RS_PERCENTILE_WORST
+        ) * (n - r) / (n - 1)
+
+    pct_col = [
+        rank_to_percentile(r, n)
+        for r, n in zip(daily_ranks, universe_sizes)
     ]
 
     result = pd.DataFrame({
@@ -556,7 +578,7 @@ def build_stock_series(
         ],
         "price_pct_top10": np.round(np.array(top_vals, dtype=float), 3),
         "price_pct_other": np.round(np.array(other_vals, dtype=float), 3),
-        "rank_line": np.round(np.array(rank_line_col, dtype=float), 3),
+        "rank_percentile": np.round(np.array(pct_col, dtype=float), 2),
         "daily_rank": rank_col,
     })
 
@@ -1000,7 +1022,7 @@ def write_to_sheet(
     )
 
     # date column + 3 charted series (price_pct_top10, price_pct_other,
-    # rank_line) + 1 audit column (daily_rank, not charted) + buffer
+    # rank_percentile) + 1 audit column (daily_rank, not charted) + buffer
     n_cols_needed = DATA_COL_START + 6 + 2
 
     ws = call_with_quota_retry(
@@ -1079,15 +1101,17 @@ def write_to_sheet(
         f"20% 9M + 20% 12M Price Rate-of-Change | "
         f"Charts: Price % (GREEN = in Top {TOP10_N} by RS Score that "
         f"day, BLUE = outside Top {TOP10_N}, rebased to 0% at day 1 "
-        f"of the {RS_LINE_WINDOW}-day window), plus a PURPLE RS Rank "
-        f"trend line on the right axis, charted as -rank so RISING = "
-        f"strengthening RS rank (moving toward Rank 1) and FALLING = "
-        f"weakening RS rank | "
+        f"of the {RS_LINE_WINDOW}-day window), plus a PURPLE RS "
+        f"Percentile trend line on the right axis (Rank 1 -> "
+        f"{RS_PERCENTILE_BEST}th %ile, weakest eligible stock that "
+        f"day -> {RS_PERCENTILE_WORST}th %ile, scaled against that "
+        f"day's actual eligible-universe size) so RISING = "
+        f"strengthening RS and FALLING = weakening RS | "
         f"All charts are grouped together at the top of this sheet; "
         f"each chart's own data table is still labeled below | "
         f"'daily_rank' column shows the actual positive rank each day "
-        f"(not charted) to audit the rank line and the green/blue "
-        f"price split | "
+        f"(not charted) to audit the percentile line and the "
+        f"green/blue price split | "
         f"Top {TOP10_N} RS Equal-Weight Equity Curve included twice "
         f"(daily rebalance, no costs): last {RS_LINE_WINDOW} days and "
         f"last {EQUITY_1Y_WINDOW} days (1 year), both with "
@@ -1236,7 +1260,7 @@ def write_to_sheet(
                 (
                     f"Rank {rank} - {symbol}: "
                     f"Price % (green=Top{TOP10_N}/blue=outside) + "
-                    f"RS Rank trend (purple, right axis) "
+                    f"RS Percentile trend (purple, right axis) "
                     f"(Last {RS_LINE_WINDOW} Days)"
                 ),
                 header_row_0idx,
@@ -1248,8 +1272,9 @@ def write_to_sheet(
                 series_axes=["LEFT_AXIS", "LEFT_AXIS", "RIGHT_AXIS"],
                 left_axis_title="Price % Change from Day 1 (Base = 0)",
                 right_axis_title=(
-                    "RS Rank (plotted as -rank: rising = strengthening, "
-                    "falling = weakening; see daily_rank col for actual rank)"
+                    f"RS Percentile ({RS_PERCENTILE_BEST} = strongest / "
+                    f"Rank 1, {RS_PERCENTILE_WORST} = weakest eligible "
+                    "that day; see daily_rank col for actual rank)"
                 ),
             )
         )
@@ -1321,8 +1346,9 @@ def main():
 
     print(
         "Per-stock chart: Price % (green=Top"
-        f"{TOP10_N}/blue=outside) + RS Rank trend (purple, right "
-        f"axis), rebased to 0% at day 1, "
+        f"{TOP10_N}/blue=outside) + RS Percentile trend "
+        f"(purple, right axis, {RS_PERCENTILE_WORST}-"
+        f"{RS_PERCENTILE_BEST} scale), rebased to 0% at day 1, "
         f"last {RS_LINE_WINDOW} trading days"
     )
 
