@@ -10,13 +10,17 @@ WHAT THIS DOES (single snapshot, not a backtest)
   4. Writes the full ranked table, Rank 1 downward.
   5. For EACH of the Top 50 stocks individually, builds its own
      small data table (last RS_LINE_WINDOW trading days: date, price
-     % change, RS Line value) and its own two-line chart. The PRICE
-     series is rebased to 0% at day 1 of the window and plotted on the
-     LEFT axis. The RS LINE is the standard (IBD/StockCharts-style)
-     relative-strength line -- (price / benchmark) x 100, NOT rebased
-     -- plotted on its own RIGHT axis, since its scale has nothing to
-     do with price %. Its slope and new highs/lows over the window are
-     the signal, not its absolute level.
+     % change, RS Line % change) and its own two-line chart. The PRICE
+     series is rebased to 0% at day 1 of the RS_LINE_WINDOW display
+     window and plotted on the LEFT axis. The RS LINE (price/benchmark
+     ratio) is rebased to 0% at day 1 of a separate, longer
+     RS_LINE_REBASE_WINDOW (~1 trading year) so its baseline isn't tied
+     to the same short window as price -- otherwise the RS Line ends up
+     tracking price almost 1:1 (parallel, redundant) whenever the
+     benchmark itself barely moves over a short window. Only the most
+     recent RS_LINE_WINDOW days of that longer-rebased RS Line are
+     plotted, on its own RIGHT axis, since its typical range differs
+     from price %'s.
   6. The PRICE line is split into two color-coded series so it renders
      GREEN on any day the stock was ranked in the Top 10 (by RS Score)
      and BLUE on any day it was outside the Top 10. The RS Line is a
@@ -100,6 +104,19 @@ SERIES_COLORS = [GREEN_COLOR, BLUE_COLOR, RS_LINE_COLOR]
 # Top 10 RS equal-weight equity curve (regime/timing overlay)
 EQUITY_SMA_PERIODS = (20, 50, 200)
 EQUITY_1Y_WINDOW = 252  # second equity curve: last ~1 trading year, same metrics/SMAs
+
+# The per-stock RS Line is rebased to 0% at the start of THIS window, NOT
+# at day 1 of RS_LINE_WINDOW (the 50-day price display window). Anchoring
+# both to the same 50 days made the RS Line ~= price% - benchmark%, and
+# since the benchmark barely moves over 50 days relative to a Top-10 RS
+# stock, that correction term was tiny -- the RS line just tracked price,
+# parallel and redundant. Anchoring the RS Line ~1 year back instead means
+# its 0% baseline is a real point in time where the benchmark has usually
+# moved enough to matter, so the displayed 50-day slice shows genuine
+# multi-month out/underperformance level and trend, decoupled from the
+# price line's own short window. Only the last RS_LINE_WINDOW days of
+# this longer rebased series are ever plotted.
+RS_LINE_REBASE_WINDOW = 252
 EQUITY_COLOR = {"red": 0.15, "green": 0.15, "blue": 0.15}        # equity curve (near-black)
 EQUITY_SMA20_COLOR = {"red": 0.20, "green": 0.60, "blue": 0.86}  # 20 SMA (blue)
 EQUITY_SMA50_COLOR = {"red": 0.95, "green": 0.60, "blue": 0.10}  # 50 SMA (orange)
@@ -472,6 +489,7 @@ def build_stock_series(
     symbol,
     bench_close,
     trading_days_window,
+    trading_days_rs_rebase_window,
     rank_maps
 ):
     """
@@ -487,40 +505,60 @@ def build_stock_series(
     frozen quote -- carry the last available price forward until a
     new trade prints. Leading gaps (e.g. stock listed a few days into
     the window) are back-filled from the first available price so day
-    1 of the window is never NaN.
+    1 of each window is never NaN. If the stock's actual history is
+    shorter than trading_days_rs_rebase_window (e.g. a recent listing),
+    the back-fill means its RS Line base becomes its earliest real
+    price rather than a fabricated one -- the best available anchor,
+    not a skip.
 
     A stock is only skipped if it has NO valid (positive) price
-    anywhere in the whole window -- i.e. there is nothing to carry
-    forward or back, so nothing meaningful can be charted.
+    anywhere in trading_days_rs_rebase_window -- i.e. there is nothing
+    to carry forward or back, so nothing meaningful can be charted.
+
+    PRICE % is rebased to 0% at day 1 of trading_days_window (the
+    short display window) -- unchanged from before.
+
+    RS LINE % is rebased to 0% at day 1 of trading_days_rs_rebase_window
+    (a longer, ~1-year window) and then sliced down to just the display
+    window for plotting. This deliberately decouples the RS Line's
+    baseline from the price line's baseline -- see RS_LINE_REBASE_WINDOW
+    above for why.
     """
     df = all_stocks[symbol]
 
-    prices_raw = df["price"].reindex(trading_days_window)
+    # Fetch and fill over the LONGER rebase window once; the shorter
+    # display window's dates are a trailing subset of it, so both the
+    # price series and the RS Line's own rebase share one clean,
+    # carried-forward price series -- no separate fill logic needed.
+    prices_raw = df["price"].reindex(trading_days_rs_rebase_window)
     # Treat non-positive prices as missing too, so a bad tick (0 or
     # negative) gets carried over the same way a no-trade day does,
     # rather than corrupting the % change / RS Line math.
     prices_raw = prices_raw.where(prices_raw > 0)
 
-    n_filled = int(prices_raw.isna().sum())
-    prices = prices_raw.ffill().bfill()
+    prices_full = prices_raw.ffill().bfill()
 
-    if prices.isna().all():
+    if prices_full.isna().all():
         return None, "no valid (positive) price data anywhere in the window"
 
-    bench = bench_close.reindex(trading_days_window)
+    bench_full = bench_close.reindex(trading_days_rs_rebase_window)
 
-    if bench.isna().any() or (bench <= 0).any():
+    if bench_full.isna().any() or (bench_full <= 0).any():
         return None, "benchmark has a gap/non-positive value in this window"
 
+    # -- RS Line: rebase to 0% at day 1 of the LONG window --
+    ratio_full = prices_full / bench_full
+    rs_base = ratio_full.iloc[0]
+    rs_line_pct_full = (ratio_full / rs_base - 1) * 100
+    rs_line_pct = rs_line_pct_full.reindex(trading_days_window)
+
+    # -- Price %: rebase to 0% at day 1 of the SHORT display window --
+    prices = prices_full.reindex(trading_days_window)
+    n_filled = int(
+        prices_raw.reindex(trading_days_window).isna().sum()
+    )
     price_base = prices.iloc[0]
     price_pct = (prices / price_base - 1) * 100
-
-    # RS Line = (price / benchmark) x 100 -- the standard IBD/StockCharts
-    # relative-strength line. Deliberately NOT rebased to 0% like the
-    # price series: an RS line's value is meant to trend and make new
-    # highs/lows over time. It renders on its own secondary axis (see
-    # make_stock_chart) since its scale has nothing to do with price %.
-    rs_line_x100 = (prices / bench) * 100
 
     # Daily rank (None = not eligible that day) and the Top-N flag
     # derived directly from it -- this is what drives the green/blue
@@ -550,7 +588,7 @@ def build_stock_series(
         ],
         "price_pct_top10": np.round(np.array(top_vals, dtype=float), 3),
         "price_pct_other": np.round(np.array(other_vals, dtype=float), 3),
-        "rs_line_x100": rs_line_x100.round(4).values,
+        "rs_line_pct": rs_line_pct.round(3).values,
         "daily_rank": rank_col,
     })
 
@@ -649,7 +687,8 @@ def make_stock_chart(
 
     `series_axes`, if given, is a list of "LEFT_AXIS"/"RIGHT_AXIS" the
     same length as `colors`, letting a series with an unrelated scale
-    (e.g. a raw RS Line value vs. a price % change) get its own right
+    (e.g. a longer-rebased RS Line % vs. a short-rebased price %) get
+    its own right
     axis instead of being squashed flat against the left-axis series.
     Defaults to all LEFT_AXIS (previous single-axis behavior) when
     omitted, so existing callers (the equity curve chart) are unaffected.
@@ -993,7 +1032,7 @@ def write_to_sheet(
     )
 
     # date column + 3 charted series (price_pct_top10, price_pct_other,
-    # rs_line_x100) + 1 audit column (daily_rank, not charted) + buffer
+    # rs_line_pct) + 1 audit column (daily_rank, not charted) + buffer
     n_cols_needed = DATA_COL_START + 5 + 2
 
     ws = call_with_quota_retry(
@@ -1072,9 +1111,11 @@ def write_to_sheet(
         f"20% 9M + 20% 12M Price Rate-of-Change | "
         f"Charts: Price % (GREEN = in Top {TOP10_N} by RS Score that "
         f"day, BLUE = outside Top {TOP10_N}, LEFT axis, rebased to 0% "
-        f"at day 1) vs RS Line = Price/Benchmark x100 (RED, RIGHT axis, "
-        f"NOT rebased -- its own trend/highs/lows are the signal), "
-        f"last {RS_LINE_WINDOW}-day window | "
+        f"at day 1 of the {RS_LINE_WINDOW}-day window) vs RS Line % "
+        f"(price/benchmark ratio, RED, RIGHT axis, rebased to 0% "
+        f"{RS_LINE_REBASE_WINDOW} trading days ago -- a longer, "
+        f"independent anchor so it shows real multi-month out/under-"
+        f"performance instead of tracking price) | "
         f"All charts are grouped together at the top of this sheet; "
         f"each chart's own data table is still labeled below | "
         f"'daily_rank' column shows the actual rank each day "
@@ -1227,7 +1268,7 @@ def write_to_sheet(
                 (
                     f"Rank {rank} - {symbol}: "
                     f"Price % (green=Top{TOP10_N}/blue=outside, left axis) "
-                    f"vs RS Line = Price/Benchmark x100 (red, right axis) "
+                    f"vs RS Line % (red, right axis, rebased ~1yr ago) "
                     f"(Last {RS_LINE_WINDOW} Days)"
                 ),
                 header_row_0idx,
@@ -1238,7 +1279,10 @@ def write_to_sheet(
                 colors=SERIES_COLORS,
                 series_axes=["LEFT_AXIS", "LEFT_AXIS", "RIGHT_AXIS"],
                 left_axis_title="Price % Change from Day 1 (Base = 0)",
-                right_axis_title="RS Line (Price / Benchmark x 100)",
+                right_axis_title=(
+                    f"RS Line % (vs Benchmark, rebased to 0% "
+                    f"{RS_LINE_REBASE_WINDOW} trading days ago)"
+                ),
             )
         )
         chart_labels.append(f"Rank {rank} - {symbol}")
@@ -1554,6 +1598,10 @@ def main():
         -EQUITY_1Y_WINDOW:
     ]
 
+    trading_days_rs_rebase_window = trading_days[
+        -RS_LINE_REBASE_WINDOW:
+    ]
+
     if len(trading_days_window) < RS_LINE_WINDOW:
         print(
             f"\nWARNING: only "
@@ -1646,6 +1694,7 @@ def main():
             sym,
             bench_close,
             trading_days_window,
+            trading_days_rs_rebase_window,
             rank_maps
         )
 
