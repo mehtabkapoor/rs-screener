@@ -20,11 +20,13 @@ WHAT THIS DOES (single snapshot, not a backtest)
      written out as a plain (uncharted) column so the green/blue split
      can be audited against real numbers.
   7. TWO Top 10 RS equal-weight, daily-rebalanced cumulative-return
-     equity curves (no costs/slippage modeled) are also built, with
-     20/50/200-day SMA overlays: one over the last RS_LINE_WINDOW
-     (50) trading days, and a second over the last EQUITY_1Y_WINDOW
-     (252) trading days -- same metrics, same SMA overlays, just a
-     longer lookback so regime shifts are visible over a full year.
+     equity curves (no costs/slippage modeled) are also built:
+     one over the last RS_LINE_WINDOW (50) trading days -- shown as
+     the RAW equity curve with NO SMA overlays, since 20/50/200-day
+     SMAs barely fit (or don't fit at all) inside a 50-day window and
+     aren't meaningful there -- and a second over the last
+     EQUITY_1Y_WINDOW (252) trading days, which DOES carry the
+     20/50/200-day SMA overlays for regime timing over a full year.
      Both are rebased to 0% at day 1 of their own display window.
      The most recent day is labeled with the time of the run since it
      reflects the latest fetched price, not a settled close.
@@ -431,14 +433,25 @@ def compute_top10_equity_curve(all_stocks, rank_maps, full_calendar, top_n=10):
     return 100.0 * (1.0 + ret_series).cumprod()
 
 
-def build_top10_equity_table(equity_index, trading_days_window, avg_rs_series=None):
+def build_top10_equity_table(
+    equity_index,
+    trading_days_window,
+    avg_rs_series=None,
+    include_sma=True
+):
     """
-    Slice the Top N equity curve (and its 20/50/200 SMA, computed on
-    the FULL curve so the SMAs are properly warmed up) down to the
-    display window, then rebase everything to 0% at the window's
-    first day. Rebasing is a simple division by a positive constant,
-    so it preserves exactly where the equity curve crosses each SMA
-    -- it's purely a display transform.
+    Slice the Top N equity curve (and, when `include_sma` is True, its
+    20/50/200 SMA, computed on the FULL curve so the SMAs are properly
+    warmed up) down to the display window, then rebase everything to
+    0% at the window's first day. Rebasing is a simple division by a
+    positive constant, so it preserves exactly where the equity curve
+    crosses each SMA -- it's purely a display transform.
+
+    `include_sma=False` skips the SMA columns entirely and returns
+    just the raw equity curve (plus the avg RS overlay, if given) --
+    used for the 50-day window, where the 20/50/200-day SMAs barely
+    fit (or don't fit at all) inside the display window and aren't a
+    meaningful regime signal there.
 
     If `avg_rs_series` is given, its values are sliced to the same
     window and attached as `avg_rs_score_top10` -- the RAW (not
@@ -462,9 +475,10 @@ def build_top10_equity_table(equity_index, trading_days_window, avg_rs_series=No
         return (s / base - 1) * 100
 
     sma_cols = {}
-    for period in EQUITY_SMA_PERIODS:
-        sma = equity_index.rolling(period).mean().reindex(trading_days_window)
-        sma_cols[f"sma{period}_pct"] = rebase(sma).round(3).values
+    if include_sma:
+        for period in EQUITY_SMA_PERIODS:
+            sma = equity_index.rolling(period).mean().reindex(trading_days_window)
+            sma_cols[f"sma{period}_pct"] = rebase(sma).round(3).values
 
     table = pd.DataFrame({
         "date": [d.strftime("%Y-%m-%d") for d in trading_days_window],
@@ -1148,12 +1162,13 @@ def write_to_sheet(
         f"(not charted) to audit the percentile line and the "
         f"green/blue price split | "
         f"Top {TOP10_N} RS Equal-Weight Equity Curve included twice "
-        f"(daily rebalance, no costs): last {RS_LINE_WINDOW} days and "
-        f"last {EQUITY_1Y_WINDOW} days (1 year), both with "
-        f"20/50/200 SMA overlays for regime timing, plus a TEAL Avg "
-        f"RS Score line (right axis, raw/not rebased) showing "
-        f"whether the Top {TOP10_N} basket's own momentum is "
-        f"strengthening or weakening | "
+        f"(daily rebalance, no costs): last {RS_LINE_WINDOW} days "
+        f"(raw equity curve, no SMA overlays) and last "
+        f"{EQUITY_1Y_WINDOW} days / 1 year (with 20/50/200 SMA "
+        f"overlays for regime timing), plus a TEAL Avg RS Score line "
+        f"(right axis, raw/not rebased) on both showing whether the "
+        f"Top {TOP10_N} basket's own momentum is strengthening or "
+        f"weakening | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} truly unplottable: no valid price "
         f"data at all in window; circuit/no-trade days are carried "
@@ -1212,12 +1227,27 @@ def write_to_sheet(
             add_row()
             return
 
-        add_row(left=[
-            f"Top {TOP10_N} RS Equal-Weight Equity Curve "
-            f"({window_label}, Daily Rebalance, No Costs) | "
+        # SMA columns are only present when the table was built with
+        # include_sma=True (the 1-year window); the 50-day window is
+        # built with include_sma=False, so this simply detects which
+        # kind of table we were handed and adapts the legend/chart.
+        has_sma = any(
+            f"sma{period}_pct" in equity_table.columns
+            for period in EQUITY_SMA_PERIODS
+        )
+
+        sma_legend = (
             "Black = equity curve, Blue = 20 SMA, Orange = 50 SMA, "
             "Red = 200 SMA -- equity below the red 200 SMA is the "
             "classic cue to consider de-risking to cash | "
+            if has_sma
+            else "Black = equity curve (no SMA overlays on this window) | "
+        )
+
+        add_row(left=[
+            f"Top {TOP10_N} RS Equal-Weight Equity Curve "
+            f"({window_label}, Daily Rebalance, No Costs) | "
+            f"{sma_legend}"
             "Teal (right axis) = Avg RS Score of that day's Top "
             f"{TOP10_N} basket, RAW (not rebased) -- rising teal = "
             "the leading basket's momentum is strengthening, falling "
@@ -1249,24 +1279,33 @@ def write_to_sheet(
 
         has_avg_rs = "avg_rs_score_top10" in eq_table.columns
 
+        base_colors = EQUITY_SERIES_COLORS if has_sma else [EQUITY_COLOR]
+        n_base_series = 4 if has_sma else 1
+
+        chart_title = (
+            f"Top {TOP10_N} RS Equity Curve vs "
+            f"20/50/200 SMA + Avg RS Score ({window_label})"
+            if has_sma
+            else f"Top {TOP10_N} RS Equity Curve + Avg RS Score ({window_label})"
+        )
+
         chart_requests.append(
             make_stock_chart(
                 ws.id,
-                (
-                    f"Top {TOP10_N} RS Equity Curve vs "
-                    f"20/50/200 SMA + Avg RS Score ({window_label})"
-                ),
+                chart_title,
                 eq_header_row_0idx,
                 len(eq_table),
                 anchor_row=next_chart_anchor_row,
                 data_col_start=DATA_COL_START,
-                n_series=5 if has_avg_rs else 4,
+                n_series=(
+                    n_base_series + 1 if has_avg_rs else n_base_series
+                ),
                 colors=(
-                    EQUITY_SERIES_COLORS + [AVG_RS_COLOR]
-                    if has_avg_rs else EQUITY_SERIES_COLORS
+                    base_colors + [AVG_RS_COLOR]
+                    if has_avg_rs else base_colors
                 ),
                 series_axes=(
-                    ["LEFT_AXIS"] * 4 + ["RIGHT_AXIS"]
+                    ["LEFT_AXIS"] * n_base_series + ["RIGHT_AXIS"]
                     if has_avg_rs else None
                 ),
                 right_axis_title=(
@@ -1682,30 +1721,35 @@ def main():
         TOP10_N
     )
 
+    # 50-day window: raw equity curve only, no SMA overlays (the
+    # 20/50/200-day SMAs don't fit meaningfully inside a 50-day
+    # display window).
     equity_table_50d = build_top10_equity_table(
         equity_index,
         trading_days_window,
-        avg_rs_series
+        avg_rs_series,
+        include_sma=False
     )
 
+    # 1-year window: full 20/50/200 SMA overlays retained.
     equity_table_1y = build_top10_equity_table(
         equity_index,
         trading_days_window_1y,
-        avg_rs_series
+        avg_rs_series,
+        include_sma=True
     )
 
     if equity_table_50d is None:
         print(
             "\nTop10 equity curve (50-day): skipped -- not enough "
-            f"history yet for a full Top {TOP10_N} portfolio plus "
-            f"{max(EQUITY_SMA_PERIODS)}-day SMA warmup. "
+            f"history yet for a full Top {TOP10_N} portfolio. "
             "This resolves itself as more days of data accumulate."
         )
     else:
         print(
             f"\nTop10 equity curve (50-day) built: "
             f"{len(equity_index)} days of history, "
-            f"{len(equity_table_50d)} days displayed."
+            f"{len(equity_table_50d)} days displayed (no SMA overlays)."
         )
 
     if equity_table_1y is None:
