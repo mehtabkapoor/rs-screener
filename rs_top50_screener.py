@@ -19,15 +19,20 @@ WHAT THIS DOES (single snapshot, not a backtest)
      visually continuous. The actual daily numeric rank is also
      written out as a plain (uncharted) column so the green/blue split
      can be audited against real numbers.
-  7. TWO Top 10 RS equal-weight, daily-rebalanced cumulative-return
+  7. THREE Top 10 RS equal-weight, daily-rebalanced cumulative-return
      equity curves (no costs/slippage modeled) are also built:
-     one over the last RS_LINE_WINDOW (50) trading days -- shown as
-     the RAW equity curve with NO SMA overlays, since 20/50/200-day
-     SMAs barely fit (or don't fit at all) inside a 50-day window and
-     aren't meaningful there -- and a second over the last
-     EQUITY_1Y_WINDOW (252) trading days, which DOES carry the
-     20/50/200-day SMA overlays for regime timing over a full year.
-     Both are rebased to 0% at day 1 of their own display window.
+       a) last RS_LINE_WINDOW (50) trading days -- RAW equity curve,
+          NO SMA overlays, since 20/50/200-day SMAs barely fit (or
+          don't fit at all) inside a 50-day window and aren't
+          meaningful there;
+       b) last EQUITY_1Y_WINDOW (252) trading days -- WITH 20/50/200
+          SMA overlays for regime timing over a full year;
+       c) the FULL downloaded history (all available trading days,
+          naturally bounded by however far back the Top 10 portfolio
+          can actually be formed and by benchmark data availability
+          -- in practice close to DOWNLOAD_YEARS) -- also WITH
+          20/50/200 SMA overlays, for the longest-range regime view.
+     All three are rebased to 0% at day 1 of their own display window.
      The most recent day is labeled with the time of the run since it
      reflects the latest fetched price, not a settled close.
 
@@ -995,6 +1000,7 @@ def write_to_sheet(
     as_of_date,
     equity_table_50d=None,
     equity_table_1y=None,
+    equity_table_full=None,
     skip_reasons=None
 ):
     sheet_id = os.environ.get(SHEET_ID_ENV)
@@ -1020,6 +1026,12 @@ def write_to_sheet(
         if equity_table_1y is not None:
             equity_table_1y.to_csv(
                 "RS_Top10_Equity_Curve_1y.csv",
+                index=False
+            )
+
+        if equity_table_full is not None:
+            equity_table_full.to_csv(
+                "RS_Top10_Equity_Curve_full.csv",
                 index=False
             )
 
@@ -1049,15 +1061,24 @@ def write_to_sheet(
 
     block_height = RS_LINE_WINDOW + 4
     block_height_1y = EQUITY_1Y_WINDOW + 4
+    # The full-history curve's length isn't a fixed constant (it's
+    # bounded by however much data actually came back), so size its
+    # row budget off the real table instead of a config constant.
+    block_height_full = (
+        len(equity_table_full) + 4
+        if equity_table_full is not None else 0
+    )
 
     # Number of chart objects that will be stacked together at the top
-    # of the sheet: the two Top10 equity charts (if we have enough
+    # of the sheet: the three Top10 equity charts (if we have enough
     # history for each) plus one chart per charted stock.
     n_equity_chart_50d = 1 if equity_table_50d is not None else 0
     n_equity_chart_1y = 1 if equity_table_1y is not None else 0
+    n_equity_chart_full = 1 if equity_table_full is not None else 0
     total_charts = (
         n_equity_chart_50d
         + n_equity_chart_1y
+        + n_equity_chart_full
         + len(stock_series_list)
     )
     charts_zone_rows = (
@@ -1072,6 +1093,7 @@ def write_to_sheet(
         + 3
         + block_height
         + block_height_1y
+        + block_height_full
         + len(stock_series_list) * block_height
         + 20
     )
@@ -1161,14 +1183,16 @@ def write_to_sheet(
         f"'daily_rank' column shows the actual positive rank each day "
         f"(not charted) to audit the percentile line and the "
         f"green/blue price split | "
-        f"Top {TOP10_N} RS Equal-Weight Equity Curve included twice "
-        f"(daily rebalance, no costs): last {RS_LINE_WINDOW} days "
-        f"(raw equity curve, no SMA overlays) and last "
+        f"Top {TOP10_N} RS Equal-Weight Equity Curve included three "
+        f"times (daily rebalance, no costs): last {RS_LINE_WINDOW} "
+        f"days (raw equity curve, no SMA overlays), last "
         f"{EQUITY_1Y_WINDOW} days / 1 year (with 20/50/200 SMA "
-        f"overlays for regime timing), plus a TEAL Avg RS Score line "
-        f"(right axis, raw/not rebased) on both showing whether the "
-        f"Top {TOP10_N} basket's own momentum is strengthening or "
-        f"weakening | "
+        f"overlays for regime timing), and the full downloaded "
+        f"history / ~{DOWNLOAD_YEARS} years (also with 20/50/200 SMA "
+        f"overlays, for the longest-range regime view), plus a TEAL "
+        f"Avg RS Score line (right axis, raw/not rebased) on all "
+        f"three showing whether the Top {TOP10_N} basket's own "
+        f"momentum is strengthening or weakening | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} truly unplottable: no valid price "
         f"data at all in window; circuit/no-trade days are carried "
@@ -1326,6 +1350,11 @@ def write_to_sheet(
         equity_table_1y,
         f"Last {EQUITY_1Y_WINDOW} Days / 1 Year",
         EQUITY_1Y_WINDOW
+    )
+    add_equity_block(
+        equity_table_full,
+        f"Full History / ~{DOWNLOAD_YEARS} Years",
+        len(equity_table_full) if equity_table_full is not None else 0
     )
 
     for rank, symbol, df in stock_series_list:
@@ -1739,6 +1768,20 @@ def main():
         include_sma=True
     )
 
+    # Full-history window: every trading day the benchmark has, not a
+    # trailing slice -- naturally bounded by however far back the
+    # Top 10 portfolio can actually be formed (build_top10_equity_table
+    # returns None / truncates via equity_index.reindex if there's no
+    # data yet for early days), so this comes out close to
+    # DOWNLOAD_YEARS without needing a separate window constant.
+    # SMA overlays retained (same rationale as the 1-year curve).
+    equity_table_full = build_top10_equity_table(
+        equity_index,
+        trading_days,
+        avg_rs_series,
+        include_sma=True
+    )
+
     if equity_table_50d is None:
         print(
             "\nTop10 equity curve (50-day): skipped -- not enough "
@@ -1764,6 +1807,20 @@ def main():
         print(
             f"Top10 equity curve (1-year) built: "
             f"{len(equity_table_1y)} days displayed."
+        )
+
+    if equity_table_full is None:
+        print(
+            "\nTop10 equity curve (full history): skipped -- not "
+            f"enough history yet for a full Top {TOP10_N} portfolio "
+            f"plus {max(EQUITY_SMA_PERIODS)}-day SMA warmup. This "
+            "resolves itself as more days of data accumulate."
+        )
+    else:
+        print(
+            f"Top10 equity curve (full history) built: "
+            f"{len(equity_table_full)} days displayed "
+            f"(~{len(equity_table_full) / 252:.1f} years)."
         )
 
     stock_series_list = []
@@ -1824,6 +1881,7 @@ def main():
         as_of_date.strftime("%Y-%m-%d"),
         equity_table_50d,
         equity_table_1y,
+        equity_table_full,
         skip_reasons
     )
 
