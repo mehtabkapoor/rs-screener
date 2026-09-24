@@ -51,6 +51,27 @@ WHAT THIS DOES (single snapshot, not a backtest)
   run log at the end -- so "a few charts missing" is now always
   visible and diagnosable instead of a silent, unlabeled gap.
 
+  RS ACCELERATION OVERLAY (informational only -- does NOT affect
+  ranking, entry, or exit logic anywhere in this script):
+     Alongside the primary 3-12M blended RS Score (which alone drives
+     ranking/Top N selection), each stock also gets a short-window
+     RS_ACCEL_WINDOW (20 trading day, ~1 month) RS score and its
+     acceleration (today's 20d score minus the 20d score from
+     RS_ACCEL_WINDOW days ago). This is deliberately NOT used to rank
+     or select stocks: 20-day-only momentum falls inside the
+     well-documented short-term reversal window (Jegadeesh 1990), so
+     ranking on it directly would systematically chase overextended
+     names and shorten holding periods -- the opposite of what past
+     tradebook analysis showed works (15-day+ holds net positive,
+     sub-14-day holds net negative). Instead these two numbers are
+     written as extra, uncharted audit columns on the ranking table
+     and on each Top 50 stock's data block, purely so a name's
+     short-term thrust or decay can be eyeballed alongside its
+     long-term RS rank -- e.g. spotting early distribution in a
+     still-top-10 name before it actually falls out of the blended
+     rank. Nothing downstream (Top N cut, equity curve, charts'
+     series count) reacts to these values.
+
 This is a screener, not a trading system.
 """
 
@@ -85,6 +106,11 @@ VOLUME_LOOKBACK = 20
 
 RS_3M, RS_6M, RS_9M, RS_12M = 63, 126, 189, 252
 RS_WEIGHTS = (0.40, 0.20, 0.20, 0.20)
+
+# Short-window RS score + acceleration -- informational/audit only,
+# see module docstring. Deliberately NOT part of RS_WEIGHTS / the
+# ranking formula, and NOT read anywhere in build_ranking()'s sort.
+RS_ACCEL_WINDOW = 20
 
 TOP_N = 100
 RS_LINE_WINDOW = 50
@@ -288,11 +314,21 @@ def compute_stock_data(close, volume):
         + w12 * (close / close.shift(RS_12M) - 1)
     ) * 100
 
+    # Short-window (20d) RS score + its own acceleration, for audit
+    # only -- see module docstring. NOT part of rs_score, NOT used
+    # anywhere in build_ranking()'s sort key.
+    rs_score_20d = (
+        close / close.shift(RS_ACCEL_WINDOW) - 1
+    ) * 100
+    rs_accel_20d = rs_score_20d - rs_score_20d.shift(RS_ACCEL_WINDOW)
+
     result = pd.DataFrame({
         "price": close,
         "avg_volume": avg_volume,
         "liquid": liquid,
         "rs_score": rs_score,
+        "rs_score_20d": rs_score_20d,
+        "rs_accel_20d": rs_accel_20d,
     })
 
     result.index = normalize_dates(result.index)
@@ -332,13 +368,23 @@ def build_ranking(all_stocks, date):
 
         avg_vol = row["avg_volume"]
 
+        # Audit-only fields, not used for sorting/eligibility -- see
+        # module docstring.
+        rs_20d = row.get("rs_score_20d")
+        rs_accel = row.get("rs_accel_20d")
+
         ranking.append((
             symbol,
             float(rs),
             float(price),
-            float(avg_vol) if not pd.isna(avg_vol) else 0.0
+            float(avg_vol) if not pd.isna(avg_vol) else 0.0,
+            float(rs_20d) if rs_20d is not None and not pd.isna(rs_20d) else np.nan,
+            float(rs_accel) if rs_accel is not None and not pd.isna(rs_accel) else np.nan,
         ))
 
+    # Sort key is rs_score ONLY (index 1) -- the primary 3-12M blend.
+    # rs_20d / rs_accel ride along as extra columns and never touch
+    # ranking order.
     ranking.sort(key=lambda x: x[1], reverse=True)
 
     return ranking
@@ -370,13 +416,14 @@ def compute_daily_rank_maps(all_stocks, trading_days_window, top_n_for_avg_rs=TO
 
         rank_maps[d] = {
             sym: i + 1
-            for i, (sym, rs, price, vol) in enumerate(ranking)
+            for i, row in enumerate(ranking)
+            for sym in [row[0]]
         }
 
         top_slice = ranking[:top_n_for_avg_rs]
         if len(top_slice) == top_n_for_avg_rs:
             avg_rs_by_day[d] = float(
-                np.mean([rs for sym, rs, price, vol in top_slice])
+                np.mean([row[1] for row in top_slice])
             )
         else:
             avg_rs_by_day[d] = np.nan
@@ -567,6 +614,12 @@ def build_stock_series(
     rising line reads as strengthening RS and a falling line reads as
     weakening RS) and `daily_rank` (the raw, uncharted, positive rank
     number for audit against the chart).
+
+    Two further uncharted audit columns are appended: `rs_score_20d`
+    and `rs_accel_20d` (today's value only, not a daily series --
+    see module docstring). These are for eyeballing short-term
+    thrust/decay next to the long-term rank and do not affect the
+    chart, the price split, or any ranking/selection logic.
     """
     df = all_stocks[symbol]
 
@@ -641,6 +694,17 @@ def build_stock_series(
         "rank_percentile": np.round(np.array(pct_col, dtype=float), 2),
         "daily_rank": rank_col,
     })
+
+    # Audit-only, latest-value columns (not a daily series -- constant
+    # down the column) so the short-term thrust/decay reading sits
+    # next to the chart data without needing a second chart series.
+    latest_row = df.reindex(trading_days_window).iloc[-1]
+    result["rs_score_20d"] = round(
+        float(latest_row["rs_score_20d"]), 2
+    ) if not pd.isna(latest_row.get("rs_score_20d", np.nan)) else np.nan
+    result["rs_accel_20d"] = round(
+        float(latest_row["rs_accel_20d"]), 2
+    ) if not pd.isna(latest_row.get("rs_accel_20d", np.nan)) else np.nan
 
     fill_note = f"{n_filled} no-trade/bad-tick day(s) carried forward" if n_filled else None
 
@@ -1183,6 +1247,11 @@ def write_to_sheet(
         f"'daily_rank' column shows the actual positive rank each day "
         f"(not charted) to audit the percentile line and the "
         f"green/blue price split | "
+        f"'rs_score_20d'/'rs_accel_20d' columns (ranking table + "
+        f"each stock block) are a {RS_ACCEL_WINDOW}-day short-term "
+        f"RS reading + its own acceleration, for audit/early-warning "
+        f"only -- NOT charted, NOT used anywhere in ranking, Top N "
+        f"selection, or entry/exit | "
         f"Top {TOP10_N} RS Equal-Weight Equity Curve included three "
         f"times (daily rebalance, no costs): last {RS_LINE_WINDOW} "
         f"days (raw equity curve, no SMA overlays), last "
@@ -1684,12 +1753,16 @@ def main():
             "rs_score_pct": round(rs, 2),
             "price": round(price, 2),
             "avg_volume_20d": round(avg_vol, 0),
+            "rs_score_20d": round(rs_20d, 2) if not pd.isna(rs_20d) else "",
+            "rs_accel_20d": round(rs_accel, 2) if not pd.isna(rs_accel) else "",
         }
         for i, (
             sym,
             rs,
             price,
-            avg_vol
+            avg_vol,
+            rs_20d,
+            rs_accel,
         ) in enumerate(top_ranking)
     ])
 
@@ -1832,7 +1905,9 @@ def main():
         sym,
         rs,
         price,
-        avg_vol
+        avg_vol,
+        rs_20d,
+        rs_accel,
     ) in enumerate(top_ranking):
 
         rank = i + 1
