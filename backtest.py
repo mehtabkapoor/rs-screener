@@ -1,44 +1,9 @@
 """
-TOP 10 RS-20D-ACCEL ROTATION BACKTEST
+TOP 10 RS ROTATION BACKTEST
 
-VARIANT OF top10_rs_backtest.py -- SAME execution/cost/tax engine,
-DIFFERENT ranking rule. Kept as a separate script/worksheet/CSV set
-so the two can be compared side by side rather than one overwriting
-the other.
-
-RANKING RULE (every trading day) -- this is the ONLY thing that
-differs from the original Top10 RS rotation backtest:
-  1. Compute a 20-trading-day (~1 month) RS score for every eligible
-     stock: rs_score_20d = (close / close.shift(20) - 1) * 100.
-  2. Compute that score's own 20-day rate of change (its
-     "acceleration"): rs_accel_20d = rs_score_20d - rs_score_20d
-     shifted back 20 more days. Positive = the 1-month thrust is
-     itself speeding up; negative = decelerating.
-  3. FILTER the eligible universe to stocks with rs_accel_20d > 0
-     only (accelerating short-term momentum).
-  4. RANK the filtered survivors by rs_score_20d, descending.
-  5. Target portfolio = today's Top 10 from that filtered/ranked list.
-
-Everything downstream of the daily ranking -- buy/sell rules, exact
-Top-10 membership invariant, cash sizing across missing slots, NSE
-transaction costs, STCG tax, equity curve, drawdown, Sharpe/Sortino
-etc. -- is IDENTICAL to top10_rs_backtest.py. Only build_daily_ranking()
-and the constants/labels around it changed.
-
-WHY THIS VARIANT EXISTS (context, not a recommendation either way):
-20-day-only momentum falls inside the well-documented short-term
-reversal window (Jegadeesh 1990) -- ranking on it directly risks
-chasing names that already ran hard and are due to give some back,
-and the accel filter plus a likely-volatile eligible pool will tend
-to produce much higher turnover than the 3-12M blended version. This
-script exists to measure that empirically (net of the same realistic
-NSE cost/tax model) rather than deciding it on priors. Compare this
-worksheet's Sharpe/Calmar/turnover/average-days-held/total-costs
-directly against "Backtest - RS Top10" before drawing any conclusion.
-
-PORTFOLIO RULE (every trading day) -- unchanged from the original:
-  1. Rank eligible (accel-filtered) stocks by 20D RS score.
-  2. Target portfolio = today's Top 10.
+PORTFOLIO RULE (every trading day)
+  1. Rank all eligible stocks by RS.
+  2. Target portfolio = today's Top 10 RS stocks.
   3. Existing holdings that remain Top 10 are NEVER resized.
   4. Sell holdings that leave Top 10 or disappear from ranking.
   5. Buy ALL missing names from today's Top 10.
@@ -48,9 +13,9 @@ PORTFOLIO RULE (every trading day) -- unchanged from the original:
   9. If >=10 eligible stocks exist and all required stocks are
      affordable, the portfolio MUST finish with exactly 10 holdings.
 
-There is NO daily sell/rebuy of retained names, NO continuous equal
-weighting, NO rank-11 substitution, NO trend template, NO sector/
-regime/breadth filter.
+There is NO daily sell/rebuy, NO continuous equal weighting,
+NO rank-11 substitution, NO trend template, NO RS line,
+NO sector/regime/breadth filter.
 """
 
 import os
@@ -83,23 +48,15 @@ MIN_PRICE = 20
 MIN_AVG_VOLUME = 100_000
 VOLUME_LOOKBACK = 20
 
-# Original 3-12M blended RS score is still computed (harmless, cheap)
-# but is NOT used for ranking in this variant -- kept only so this
-# file stays a true superset/drop-in comparison of the original and
-# nothing about MIN_HISTORY_DAYS needs to shrink.
 RS_3M, RS_6M, RS_9M, RS_12M = 63, 126, 189, 252
 RS_WEIGHTS = (0.40, 0.20, 0.20, 0.20)  # 3M / 6M / 9M / 12M
 
-# The ranking basis for THIS variant: 20-trading-day RS score, plus
-# its own 20-day rate of change (acceleration), used as a filter.
-RS_ACCEL_WINDOW = 20
-
 # Minimum price-history length for a stock to be eligible at all.
-# Kept identical to the original backtest (RS_12M lookback + 20-day
-# volume-average buffer) even though this variant's ranking basis
-# only needs ~40 days -- this keeps the two backtests' eligible
-# universes directly comparable (same stocks enter/exit the pool
-# at the same time in both), which matters for a fair side-by-side.
+# Matches the screener's bar exactly (RS_12M lookback + 20-day
+# volume-average buffer) rather than an arbitrary round number --
+# a mismatch here silently drops/adds borderline-history stocks
+# between the two scripts and can flip Top-10 membership near the
+# rank cutoff even though the RS formula itself is identical.
 MIN_HISTORY_DAYS = RS_12M + 20
 
 TOP_N = 10
@@ -111,7 +68,7 @@ MAX_PLAUSIBLE_DAILY_MOVE = 0.30
 CHART_WINDOWS = (50, 100, 365)
 
 # ============================================================
-# TRANSACTION COSTS (India: NSE equity delivery) -- unchanged
+# TRANSACTION COSTS (India: NSE equity delivery)
 # ============================================================
 
 STT_RATE = 0.001
@@ -131,9 +88,7 @@ STCG_EFFECTIVE_RATE = STCG_RATE * (1 + STCG_CESS)  # 20.8%
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
-# Separate worksheet from the original so both live side by side in
-# the same spreadsheet for direct comparison.
-BACKTEST_WORKSHEET = "Backtest - RS20D Accel Top10"
+BACKTEST_WORKSHEET = "Backtest - RS Top10"
 
 
 # ============================================================
@@ -201,7 +156,7 @@ def clean_price_series(close):
 
 
 # ============================================================
-# TRANSACTION COST FUNCTIONS -- unchanged
+# TRANSACTION COST FUNCTIONS
 # ============================================================
 
 def buy_side_cost(trade_value):
@@ -249,7 +204,7 @@ def minimum_cash_for_one_share(price):
 
 
 # ============================================================
-# BENCHMARK (calendar only -- not part of the ranking) -- unchanged
+# BENCHMARK (calendar only -- not part of the RS calculation)
 # ============================================================
 
 def download_benchmark():
@@ -296,8 +251,6 @@ def compute_stock_data(close, volume):
     avg_volume = volume.rolling(VOLUME_LOOKBACK).mean()
     liquid = (close > MIN_PRICE) & (avg_volume > MIN_AVG_VOLUME)
 
-    # Original blended RS score -- computed but not used for ranking
-    # in this variant (see module docstring).
     w3, w6, w9, w12 = RS_WEIGHTS
     rs_score = (
         w3 * (close / close.shift(RS_3M) - 1)
@@ -306,18 +259,11 @@ def compute_stock_data(close, volume):
         + w12 * (close / close.shift(RS_12M) - 1)
     ) * 100
 
-    # THIS variant's actual ranking basis: 20-day RS score + its own
-    # 20-day acceleration.
-    rs_score_20d = (close / close.shift(RS_ACCEL_WINDOW) - 1) * 100
-    rs_accel_20d = rs_score_20d - rs_score_20d.shift(RS_ACCEL_WINDOW)
-
     result = pd.DataFrame({
         "price": close,
         "avg_volume": avg_volume,
         "liquid": liquid,
         "rs_score": rs_score,
-        "rs_score_20d": rs_score_20d,
-        "rs_accel_20d": rs_accel_20d,
     })
     result.index = normalize_dates(result.index)
     return result
@@ -332,46 +278,27 @@ def get_row(df, date):
 
 
 def build_daily_ranking(all_stocks, date):
-    """
-    THIS is the only ranking-logic change from top10_rs_backtest.py:
-      - eligibility = liquid AND rs_accel_20d > 0 (accelerating
-        20-day momentum only; both rs_score_20d and rs_accel_20d
-        must be present/finite)
-      - sort key = rs_score_20d, descending (NOT the 3-12M blend)
-
-    Returns the same (symbol, score, price) tuple shape as the
-    original so every downstream function (execution, invariants,
-    equity curve) works unmodified.
-    """
+    """Rank all eligible stocks by RS, descending. Rule 1."""
 
     ranking = []
     for symbol, df in all_stocks.items():
         row = get_row(df, date)
         if row is None:
             continue
-
-        rs20 = row["rs_score_20d"]
-        accel = row["rs_accel_20d"]
-
-        if pd.isna(rs20) or pd.isna(accel):
+        rs = row["rs_score"]
+        if pd.isna(rs) or not bool(row["liquid"]):
             continue
-        if not bool(row["liquid"]):
-            continue
-        if accel <= 0:
-            continue
-
         price = row["price"]
         if pd.isna(price) or float(price) <= 0:
             continue
-
-        ranking.append((symbol, float(rs20), float(price)))
+        ranking.append((symbol, float(rs), float(price)))
 
     ranking.sort(key=lambda x: x[1], reverse=True)
     return ranking
 
 
 # ============================================================
-# TRADE EXECUTION -- unchanged
+# TRADE EXECUTION
 # ============================================================
 
 def execute_buy(symbol, price, qty, date, cash, holdings, trade_log):
@@ -458,9 +385,7 @@ def buy_missing_top10(missing_symbols, price_lookup, date, cash, holdings, trade
 
 
 # ============================================================
-# BACKTEST ENGINE -- unchanged (operates on whatever
-# build_daily_ranking() returns, so the accel/20D rule above is the
-# only thing that actually changes portfolio membership)
+# BACKTEST ENGINE
 # ============================================================
 
 def run_backtest(all_stocks, trading_days):
@@ -596,7 +521,7 @@ def run_backtest(all_stocks, trading_days):
 
         if day_number % 100 == 0:
             print(f"Processed {day_number}/{n_days} | {date:%Y-%m-%d} | "
-                  f"EligiblePool(accel>0)={eligible_pool_size} | Holdings={len(holdings)} | "
+                  f"EligiblePool={eligible_pool_size} | Holdings={len(holdings)} | "
                   f"Cash=Rs.{cash:,.0f} | Equity=Rs.{total_value:,.0f}")
 
     equity_df = pd.DataFrame(equity_curve)
@@ -617,7 +542,14 @@ def run_backtest(all_stocks, trading_days):
 
 def _add_equity_analytics_columns(equity_df):
     """Adds drawdown and normalised-to-zero equity-curve columns.
-    Identical to the original backtest -- see that file for details."""
+
+    equity_curve_pct_norm is the cumulative % move of the total
+    portfolio value since day 1 of the whole backtest (same
+    information as equity_multiple, expressed as % starting at 0
+    instead of a multiple starting at 1). One additional column is
+    added per entry in CHART_WINDOWS, each rebased to 0% at the
+    start of its own rolling window (blank before that window).
+    """
 
     running_max = equity_df["equity_multiple"].cummax()
     equity_df["drawdown_pct"] = ((equity_df["equity_multiple"] / running_max - 1)
@@ -632,6 +564,11 @@ def _add_equity_analytics_columns(equity_df):
         window_start = max(len(equity_df) - window_days, 0)
         base_value = float(equity_df["portfolio_value_rs"].iloc[window_start])
 
+        # NaN (not "") keeps the column numeric end-to-end; newer
+        # pandas can infer a strict string dtype for a column first
+        # populated with "", which then rejects numeric values
+        # written into it afterwards. sanitize_for_sheets() blanks
+        # any remaining NaN to "" at write time.
         series = pd.Series(np.nan, index=equity_df.index, dtype=float)
         series.iloc[window_start:] = (
             (equity_df["portfolio_value_rs"].iloc[window_start:] / base_value - 1) * 100
@@ -761,29 +698,32 @@ def summarize(equity_df, trade_df, final_marked_value, final_liquidation_value):
         "Average Days Held": round(avg_days, 1),
         "Total Transaction Costs (Rs)": round(total_costs, 0),
         "Total STCG Tax (Rs)": round(total_tax, 0),
-        "RS Formula": f"{RS_ACCEL_WINDOW}D price ROC, filtered to "
-                       f"{RS_ACCEL_WINDOW}D-accel > 0, ranked by "
-                       f"{RS_ACCEL_WINDOW}D RS score",
-        "Portfolio": "Exact daily Top 10 of (accel_20d > 0) stocks, ranked by RS_20d",
+        "RS Formula": "40% 3M + 20% 6M + 20% 9M + 20% 12M",
+        "Portfolio": "Exact daily Top 10 RS membership",
         "Weight": "Available replacement cash divided across missing Top-10 "
                   "names; retained positions untouched",
         "Entry": "Initial Top 10; subsequently every missing Top-10 stock",
-        "Exit": "Rank 11+ (within accel>0 pool), accel_20d turns non-positive, "
-                "or missing from eligible ranking",
+        "Exit": "Rank 11+ or missing from eligible ranking",
         "Execution": "Same-day close (T+0)",
         "Rebalance Frequency": "Daily membership check; no resizing of "
                                 "retained positions",
         "Price Filter": f"> Rs.{MIN_PRICE}",
         "Liquidity Filter": f"{VOLUME_LOOKBACK}D average volume > {MIN_AVG_VOLUME:,}",
-        "Other Filters": f"{RS_ACCEL_WINDOW}D RS acceleration must be positive",
+        "Other Filters": "NONE",
     }
 
 
 # ============================================================
-# GOOGLE SHEETS -- unchanged except worksheet name / CSV filenames
+# GOOGLE SHEETS
 # ============================================================
 
 def sanitize_for_sheets(df):
+    """NaN/+-Infinity are not valid JSON, and gspread's ws.update()
+    will raise InvalidJSONError if either reaches it. Blanks such
+    cells to "" rather than letting one bad value fail the whole
+    upload -- protects any numeric column, present now or added
+    later, that could end up with NaN/inf before enough data exists."""
+
     if df.empty:
         return df
     clean = df.replace([np.inf, -np.inf], np.nan)
@@ -852,6 +792,12 @@ def remove_existing_charts(sh, sheet_id):
 
 
 def add_charts(sh, sheet_id, equity_header_row_0idx, n_equity_rows, equity_columns):
+    """All series are addressed by COLUMN NAME (via equity_columns,
+    the equity_df.columns actually written to the sheet) rather than
+    hardcoded integer positions -- if a column is ever added, removed,
+    or reordered upstream, a chart will raise KeyError instead of
+    silently plotting the wrong series."""
+
     col_idx = {name: i for i, name in enumerate(equity_columns)}
     data_end_row = equity_header_row_0idx + 1 + n_equity_rows
 
@@ -874,6 +820,12 @@ def add_charts(sh, sheet_id, equity_header_row_0idx, n_equity_rows, equity_colum
         }
 
         if show_points:
+            # Dot on every end-of-day point plus that point's own
+            # value printed below it. The Sheets Charts API has no
+            # rotate/vertical-text property for data labels --
+            # "placement" only accepts ABOVE/BELOW/LEFT/RIGHT/
+            # CENTER/INSIDE_END -- so BELOW + a small font is the
+            # closest available fix for reducing label overlap.
             series_entry["pointStyle"] = {"size": 5, "shape": "CIRCLE"}
             series_entry["dataLabel"] = {
                 "type": "DATA", "placement": "BELOW",
@@ -911,13 +863,16 @@ def add_charts(sh, sheet_id, equity_header_row_0idx, n_equity_rows, equity_colum
         make_chart("Drawdown (%)", "drawdown_pct", "Drawdown %",
                     equity_header_row_0idx + 22),
 
-        make_chart("Eligible Pool Size (accel_20d > 0)", "eligible_pool_size",
-                    "Stock Count", equity_header_row_0idx + 44),
+        make_chart("Eligible Pool Size", "eligible_pool_size", "Stock Count",
+                    equity_header_row_0idx + 44),
 
+        # Since inception -- same start row as the equity curve
+        # itself, so it is never truncated.
         make_chart("Equity Curve - Normalised to Zero (%, Since Inception)",
                     "equity_curve_pct_norm", "Cumulative Change %",
                     equity_header_row_0idx + 66),
 
+        # Last 50 days -- dot + label per point, widened for room.
         make_chart("Equity Curve - Normalised to Zero (%, Last 50 Days)",
                     "equity_curve_pct_norm_last50", "Cumulative Change %",
                     equity_header_row_0idx + 88,
@@ -949,10 +904,10 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, effective_end_str):
 
     if not sheet_id or not creds_json:
         print("Missing SHEET_ID/GOOGLE_CREDENTIALS -- saving to CSV instead.")
-        trade_df.to_csv("RS20D_Accel_Trade_Log.csv", index=False)
-        equity_df.to_csv("RS20D_Accel_Equity_Curve.csv", index=False)
+        trade_df.to_csv("RS_Trade_Log.csv", index=False)
+        equity_df.to_csv("RS_Equity_Curve.csv", index=False)
         if not open_df.empty:
-            open_df.to_csv("RS20D_Accel_Open_Positions.csv", index=False)
+            open_df.to_csv("RS_Open_Positions.csv", index=False)
         return
 
     creds = Credentials.from_service_account_info(
@@ -962,11 +917,15 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, effective_end_str):
     sh = gc.open_by_key(sheet_id)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
 
+    # Sheet must be wide enough for the widest section actually
+    # being written -- not a fixed guess. Previously hardcoded to
+    # 16, which happened to be enough today but would silently
+    # truncate/error the moment any section grew past it.
     n_cols_needed = max(
         len(trade_df.columns) if not trade_df.empty else 0,
         len(equity_df.columns) if not equity_df.empty else 0,
         len(open_df.columns) if not open_df.empty else 0,
-        2,
+        2,  # summary is always 2 columns (key, value)
     )
     n_rows_needed = len(trade_df) + len(equity_df) + len(open_df) + len(summary) + 60
 
@@ -980,18 +939,13 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, effective_end_str):
     ws.clear()
 
     ws.update([[
-        "TOP 10 RS-20D-ACCEL ROTATION BACKTEST | "
+        "TOP 10 RS ROTATION BACKTEST | "
         f"run {timestamp} | NET of costs+STCG | "
         f"Capital: Rs.{STARTING_CAPITAL:,.0f} | "
-        f"Universe: liquid stocks with {RS_ACCEL_WINDOW}D RS acceleration > 0 | "
-        f"Rank: {RS_ACCEL_WINDOW}D RS score, descending | "
-        "Target: exact Top 10 of that filtered/ranked list | "
-        "Retained Top-10 holdings NOT resized | "
-        "Sell rank 11+ / accel turns non-positive / missing | "
+        "Target: exact Top 10 RS membership | "
+        "Retained Top-10 holdings NOT resized | Sell rank 11+ / missing | "
         "Available exit cash funds all missing Top-10 names | Same EOD bar | "
-        f"Window: {BACKTEST_START} to {effective_end_str} | "
-        "Compare against 'Backtest - RS Top10' (original 3-12M blend) "
-        "for a direct apples-to-apples read on this ranking rule."
+        f"Window: {BACKTEST_START} to {effective_end_str}"
     ]], "A1")
 
     summary_rows = [["Summary", ""]] + [[k, sanitize_scalar(v)] for k, v in summary.items()]
@@ -1039,23 +993,22 @@ def write_to_sheet(trade_df, equity_df, open_df, summary, effective_end_str):
 def main():
     print()
     print("=" * 70)
-    print("TOP 10 RS-20D-ACCEL ROTATION BACKTEST")
+    print("TOP 10 RS ROTATION BACKTEST")
     print("=" * 70)
     print(f"Backtest start : {BACKTEST_START}")
     print(f"Backtest end   : {BACKTEST_END if BACKTEST_END else 'LATEST'}")
-    print(f"Universe       : liquid AND {RS_ACCEL_WINDOW}D RS acceleration > 0")
-    print(f"Ranking        : {RS_ACCEL_WINDOW}D RS SCORE ONLY (not the 3-12M blend)")
-    print("Portfolio      : EXACT TOP 10 OF FILTERED/RANKED LIST")
+    print("Ranking        : DAILY RS SCORE ONLY")
+    print("Portfolio      : EXACT TOP 10 RS MEMBERSHIP")
     print("Initial        : BUY ALL TOP 10")
-    print("Rotation       : SELL ONLY STOCKS LEAVING TOP 10 (rank OR accel flips non-positive)")
+    print("Rotation       : SELL ONLY STOCKS LEAVING TOP 10")
     print("New entries    : BUY EVERY MISSING TOP-10 STOCK")
     print("Existing names : HOLD / NO RESIZING")
     print("Sizing         : AVAILABLE CASH / MISSING SLOTS")
     print("Execution      : SAME EOD BAR (T+0)")
     print(f"Price filter   : > Rs.{MIN_PRICE}")
     print(f"Liquidity      : {VOLUME_LOOKBACK}D average volume > {MIN_AVG_VOLUME:,}")
-    print(f"Min. history   : {MIN_HISTORY_DAYS} trading days (matches original backtest)")
-    print("Other filters  : 20D RS acceleration must be positive")
+    print(f"Min. history   : {MIN_HISTORY_DAYS} trading days (matches screener)")
+    print("Other filters  : NONE")
     print("=" * 70)
 
     tickers = load_tickers()
@@ -1169,11 +1122,10 @@ def main():
             print()
             print(non_ten.to_string())
             raise RuntimeError("TOP-10 AUDIT FAILED: at least one trading day had "
-                                "10+ eligible (accel>0) stocks but did not hold exactly 10.")
+                                "10+ eligible stocks but did not hold exactly 10.")
 
         print("\nPORTFOLIO AUDIT PASSED.")
-        print("Every day held exactly the required Top-10 target count "
-              "(or fewer, on days with fewer than 10 accel>0-eligible stocks).")
+        print("Every day held exactly the required Top-10 target count.")
 
     summary = summarize(equity_df, trade_df, final_marked, final_liq)
 
@@ -1187,10 +1139,10 @@ def main():
 
     write_to_sheet(trade_df, equity_df, open_df, summary, effective_end.strftime("%Y-%m-%d"))
 
-    equity_df.to_csv("RS20D_Accel_Equity_Curve.csv", index=False)
-    trade_df.to_csv("RS20D_Accel_Trade_Log.csv", index=False)
+    equity_df.to_csv("RS_Equity_Curve.csv", index=False)
+    trade_df.to_csv("RS_Trade_Log.csv", index=False)
     if not open_df.empty:
-        open_df.to_csv("RS20D_Accel_Open_Positions.csv", index=False)
+        open_df.to_csv("RS_Open_Positions.csv", index=False)
 
     print("\nCSV files also saved.")
     print("\nBACKTEST COMPLETED SUCCESSFULLY.")
