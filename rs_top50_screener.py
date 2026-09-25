@@ -32,7 +32,24 @@ WHAT THIS DOES (single snapshot, not a backtest)
           can actually be formed and by benchmark data availability
           -- in practice close to DOWNLOAD_YEARS) -- also WITH
           20/50/200 SMA overlays, for the longest-range regime view.
-     All three are rebased to 0% at day 1 of their own display window.
+     The 50-day and 1-year curves are rebased to 0% at day 1 of their
+     own display window (can go negative on drawdowns). The FULL
+     history curve is deliberately NOT rebased to % -- it is plotted
+     as the RAW equity index level (base=100, strictly positive by
+     construction, since it's a cumprod of (1+return)) so it is safe
+     to view on a log axis. Google Sheets' "Log scale" option is a
+     Chart Editor UI-only toggle (Customize > Vertical axis > Log
+     scale) -- the Sheets API's BasicChartAxis object has no
+     scale-type field at all, so it cannot be set programmatically,
+     and since this script deletes + rebuilds every chart on each
+     run, any manual toggle would be wiped on the next run anyway.
+     A rebased % series would also break under log scale outright
+     (log is undefined at/below zero, and rebased % goes negative on
+     any drawdown), which is the other reason the full-history curve
+     uses the raw index instead. The 50-day and 1-year windows are
+     left as rebased %: neither typically spans enough orders of
+     magnitude for log scale to add anything over linear, so forcing
+     it there would be a manual-toggle chore for no analytical gain.
      The most recent day is labeled with the time of the run since it
      reflects the latest fetched price, not a settled close.
 
@@ -149,12 +166,12 @@ EQUITY_SERIES_COLORS = [
 
 # Avg RS Score of the Top 10 basket, overlaid on both equity curve
 # charts on a secondary (right) axis. Unlike the equity curve/SMAs
-# (which are all rebased to 0% at day 1 of their own window), this is
-# plotted as the RAW RS score (%) of that day's Top 10 basket -- it
-# answers a different question ("is the leading basket's momentum
-# strengthening or weakening?") from the equity curve ("is money
-# actually being made holding it?"), so rebasing it would blur that
-# distinction rather than clarify it.
+# (which are all rebased to 0% at day 1 of their own window on the
+# 50-day/1-year charts), this is plotted as the RAW RS score (%) of
+# that day's Top 10 basket -- it answers a different question ("is
+# the leading basket's momentum strengthening or weakening?") from
+# the equity curve ("is money actually being made holding it?"), so
+# rebasing it would blur that distinction rather than clarify it.
 AVG_RS_COLOR = {"red": 0.0, "green": 0.55, "blue": 0.55}  # teal
 
 # All charts are stacked together at the top of the sheet, above every
@@ -489,15 +506,32 @@ def build_top10_equity_table(
     equity_index,
     trading_days_window,
     avg_rs_series=None,
-    include_sma=True
+    include_sma=True,
+    rebase_pct=True
 ):
     """
     Slice the Top N equity curve (and, when `include_sma` is True, its
     20/50/200 SMA, computed on the FULL curve so the SMAs are properly
-    warmed up) down to the display window, then rebase everything to
-    0% at the window's first day. Rebasing is a simple division by a
-    positive constant, so it preserves exactly where the equity curve
-    crosses each SMA -- it's purely a display transform.
+    warmed up) down to the display window.
+
+    `rebase_pct=True` (default -- used for the 50-day and 1-year
+    windows) rebases everything to 0% at the window's first day.
+    Rebasing is a simple division by a positive constant, so it
+    preserves exactly where the equity curve crosses each SMA -- it's
+    purely a display transform. The resulting series can go negative
+    on a drawdown.
+
+    `rebase_pct=False` (used for the full-history window) skips that
+    transform entirely and returns the RAW equity index level (and
+    raw SMA levels) instead -- strictly positive by construction
+    (equity_index is a cumprod of (1+return), so it never hits zero
+    short of a -100% day), which makes it safe to view on a log axis.
+    Google Sheets' log-scale option is a manual Chart Editor toggle
+    that can't be set via the API and doesn't survive this script
+    deleting/rebuilding the chart on each run -- see module docstring.
+    A rebased % series is NOT log-safe (log is undefined at/below
+    zero, and rebased % dips negative on any drawdown), which is why
+    the two modes aren't just a cosmetic choice.
 
     `include_sma=False` skips the SMA columns entirely and returns
     just the raw equity curve (plus the avg RS overlay, if given) --
@@ -509,7 +543,8 @@ def build_top10_equity_table(
     window and attached as `avg_rs_score_top10` -- the RAW (not
     rebased) mean RS Score of that day's Top N basket, since it's a
     momentum-strength reading, not a return, and rebasing it would
-    misrepresent it as one.
+    misrepresent it as one. This column is never affected by
+    `rebase_pct`.
     """
     if equity_index.empty:
         return None
@@ -523,18 +558,21 @@ def build_top10_equity_table(
     if pd.isna(base) or base <= 0:
         return None
 
-    def rebase(s):
-        return (s / base - 1) * 100
+    def transform(s):
+        return (s / base - 1) * 100 if rebase_pct else s
+
+    equity_col_name = "top10_equity_pct" if rebase_pct else "top10_equity_index"
 
     sma_cols = {}
     if include_sma:
         for period in EQUITY_SMA_PERIODS:
             sma = equity_index.rolling(period).mean().reindex(trading_days_window)
-            sma_cols[f"sma{period}_pct"] = rebase(sma).round(3).values
+            col_name = f"sma{period}_pct" if rebase_pct else f"sma{period}_index"
+            sma_cols[col_name] = transform(sma).round(3).values
 
     table = pd.DataFrame({
         "date": [d.strftime("%Y-%m-%d") for d in trading_days_window],
-        "top10_equity_pct": rebase(window_equity).round(3).values,
+        equity_col_name: transform(window_equity).round(3).values,
         **sma_cols,
     })
 
@@ -1254,14 +1292,17 @@ def write_to_sheet(
         f"selection, or entry/exit | "
         f"Top {TOP10_N} RS Equal-Weight Equity Curve included three "
         f"times (daily rebalance, no costs): last {RS_LINE_WINDOW} "
-        f"days (raw equity curve, no SMA overlays), last "
-        f"{EQUITY_1Y_WINDOW} days / 1 year (with 20/50/200 SMA "
-        f"overlays for regime timing), and the full downloaded "
-        f"history / ~{DOWNLOAD_YEARS} years (also with 20/50/200 SMA "
-        f"overlays, for the longest-range regime view), plus a TEAL "
-        f"Avg RS Score line (right axis, raw/not rebased) on all "
-        f"three showing whether the Top {TOP10_N} basket's own "
-        f"momentum is strengthening or weakening | "
+        f"days (raw equity curve, rebased %, no SMA overlays), last "
+        f"{EQUITY_1Y_WINDOW} days / 1 year (rebased %, with 20/50/200 "
+        f"SMA overlays for regime timing), and the full downloaded "
+        f"history / ~{DOWNLOAD_YEARS} years (RAW equity index level, "
+        f"NOT rebased -- log-scale-safe; enable Log scale manually in "
+        f"Customize > Vertical axis if you want it, since the API "
+        f"can't set that and this chart is rebuilt every run -- also "
+        f"with 20/50/200 SMA overlays, for the longest-range regime "
+        f"view), plus a TEAL Avg RS Score line (right axis, raw/not "
+        f"rebased) on all three showing whether the Top {TOP10_N} "
+        f"basket's own momentum is strengthening or weakening | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} truly unplottable: no valid price "
         f"data at all in window; circuit/no-trade days are carried "
@@ -1307,7 +1348,7 @@ def write_to_sheet(
     chart_requests = []
     chart_labels = []
 
-    def add_equity_block(equity_table, window_label, window_days):
+    def add_equity_block(equity_table, window_label, window_days, log_scale_hint=False):
         nonlocal next_chart_anchor_row
 
         if equity_table is None:
@@ -1321,11 +1362,14 @@ def write_to_sheet(
             return
 
         # SMA columns are only present when the table was built with
-        # include_sma=True (the 1-year window); the 50-day window is
-        # built with include_sma=False, so this simply detects which
-        # kind of table we were handed and adapts the legend/chart.
+        # include_sma=True (the 1-year and full-history windows); the
+        # 50-day window is built with include_sma=False, so this
+        # simply detects which kind of table we were handed and
+        # adapts the legend/chart. Column names differ by whether the
+        # table is rebased-% (sma{p}_pct) or raw-index (sma{p}_index).
         has_sma = any(
             f"sma{period}_pct" in equity_table.columns
+            or f"sma{period}_index" in equity_table.columns
             for period in EQUITY_SMA_PERIODS
         )
 
@@ -1337,9 +1381,20 @@ def write_to_sheet(
             else "Black = equity curve (no SMA overlays on this window) | "
         )
 
+        log_note = (
+            "Plotted as RAW equity index (base=100, always positive) "
+            "instead of rebased %% change, so it's safe to view on a "
+            "log axis -- Sheets' Log scale toggle is UI-only (can't "
+            "be set via the API) and this chart is rebuilt every run, "
+            "so manually check Customize > Vertical axis > Log scale "
+            "after each run if you want it. | "
+            if log_scale_hint else ""
+        )
+
         add_row(left=[
             f"Top {TOP10_N} RS Equal-Weight Equity Curve "
             f"({window_label}, Daily Rebalance, No Costs) | "
+            f"{log_note}"
             f"{sma_legend}"
             "Teal (right axis) = Avg RS Score of that day's Top "
             f"{TOP10_N} basket, RAW (not rebased) -- rising teal = "
@@ -1382,6 +1437,11 @@ def write_to_sheet(
             else f"Top {TOP10_N} RS Equity Curve + Avg RS Score ({window_label})"
         )
 
+        left_axis_title = (
+            "Equity Index Level (Base = 100) -- enable Log scale manually"
+            if log_scale_hint else "% Change from Day 1 (Base = 0)"
+        )
+
         chart_requests.append(
             make_stock_chart(
                 ws.id,
@@ -1401,6 +1461,7 @@ def write_to_sheet(
                     ["LEFT_AXIS"] * n_base_series + ["RIGHT_AXIS"]
                     if has_avg_rs else None
                 ),
+                left_axis_title=left_axis_title,
                 right_axis_title=(
                     f"Avg RS Score of Top {TOP10_N} Basket (%, raw)"
                     if has_avg_rs else None
@@ -1423,7 +1484,8 @@ def write_to_sheet(
     add_equity_block(
         equity_table_full,
         f"Full History / ~{DOWNLOAD_YEARS} Years",
-        len(equity_table_full) if equity_table_full is not None else 0
+        len(equity_table_full) if equity_table_full is not None else 0,
+        log_scale_hint=True
     )
 
     for rank, symbol, df in stock_series_list:
@@ -1823,22 +1885,28 @@ def main():
         TOP10_N
     )
 
-    # 50-day window: raw equity curve only, no SMA overlays (the
-    # 20/50/200-day SMAs don't fit meaningfully inside a 50-day
-    # display window).
+    # 50-day window: raw equity curve only, rebased %, no SMA overlays
+    # (the 20/50/200-day SMAs don't fit meaningfully inside a 50-day
+    # display window, and this window is too short for log scale to
+    # add anything over linear).
     equity_table_50d = build_top10_equity_table(
         equity_index,
         trading_days_window,
         avg_rs_series,
-        include_sma=False
+        include_sma=False,
+        rebase_pct=True
     )
 
-    # 1-year window: full 20/50/200 SMA overlays retained.
+    # 1-year window: rebased %, full 20/50/200 SMA overlays retained.
+    # Left as rebased % (not log-safe) deliberately -- 252 days rarely
+    # spans enough orders of magnitude for log scale to matter, so
+    # forcing it here would be a manual-toggle chore for no real gain.
     equity_table_1y = build_top10_equity_table(
         equity_index,
         trading_days_window_1y,
         avg_rs_series,
-        include_sma=True
+        include_sma=True,
+        rebase_pct=True
     )
 
     # Full-history window: every trading day the benchmark has, not a
@@ -1847,12 +1915,17 @@ def main():
     # returns None / truncates via equity_index.reindex if there's no
     # data yet for early days), so this comes out close to
     # DOWNLOAD_YEARS without needing a separate window constant.
-    # SMA overlays retained (same rationale as the 1-year curve).
+    # SMA overlays retained. rebase_pct=False: multi-year compounding
+    # is exactly where log scale earns its keep (equal % moves get
+    # equal visual weight regardless of era), and log scale requires
+    # a strictly positive series -- the raw equity index (cumprod
+    # base=100) satisfies that where the rebased % series would not.
     equity_table_full = build_top10_equity_table(
         equity_index,
         trading_days,
         avg_rs_series,
-        include_sma=True
+        include_sma=True,
+        rebase_pct=False
     )
 
     if equity_table_50d is None:
@@ -1893,7 +1966,11 @@ def main():
         print(
             f"Top10 equity curve (full history) built: "
             f"{len(equity_table_full)} days displayed "
-            f"(~{len(equity_table_full) / 252:.1f} years)."
+            f"(~{len(equity_table_full) / 252:.1f} years). Plotted as "
+            "a raw equity index (base=100), not rebased % -- check "
+            "Customize > Vertical axis > Log scale on that chart in "
+            "Sheets after this run if you want the log view; the API "
+            "can't set it and the chart is rebuilt every run."
         )
 
     stock_series_list = []
