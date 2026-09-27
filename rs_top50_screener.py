@@ -156,13 +156,29 @@ RS_PERCENTILE_WORST = 1   # weakest eligible stock that day maps to this
 EQUITY_SMA_PERIODS = (20, 50, 200)
 EQUITY_1Y_WINDOW = 252  # second equity curve: last ~1 trading year, same metrics/SMAs
 
-EQUITY_COLOR = {"red": 0.15, "green": 0.15, "blue": 0.15}        # equity curve (near-black)
+# Equity curve is now a bold, highly-saturated color plotted at a much
+# heavier line width (see EQUITY_LINE_WIDTH / EQUITY_SERIES_WIDTHS
+# below) than the SMAs/RS overlay, and the SMAs + Avg RS line are
+# switched to a dashed style -- so the actual "is money being made"
+# line reads instantly instead of blending into the regime/overlay
+# lines around it.
+EQUITY_COLOR = {"red": 0.05, "green": 0.05, "blue": 0.05}        # equity curve (bold black)
 EQUITY_SMA20_COLOR = {"red": 0.20, "green": 0.60, "blue": 0.86}  # 20 SMA (blue)
 EQUITY_SMA50_COLOR = {"red": 0.95, "green": 0.60, "blue": 0.10}  # 50 SMA (orange)
 EQUITY_SMA200_COLOR = {"red": 0.80, "green": 0.10, "blue": 0.10}  # 200 SMA (red - de-risk trigger)
 EQUITY_SERIES_COLORS = [
     EQUITY_COLOR, EQUITY_SMA20_COLOR, EQUITY_SMA50_COLOR, EQUITY_SMA200_COLOR
 ]
+
+# Line widths + styles: the equity curve gets a thick solid line so it
+# visually dominates; SMAs get a thinner dashed line so they read as
+# "reference/overlay" rather than competing with the equity curve for
+# attention. Order matches EQUITY_SERIES_COLORS (equity, sma20, sma50,
+# sma200).
+EQUITY_LINE_WIDTH = 5
+SMA_LINE_WIDTH = 1.5
+EQUITY_SERIES_WIDTHS = [EQUITY_LINE_WIDTH, SMA_LINE_WIDTH, SMA_LINE_WIDTH, SMA_LINE_WIDTH]
+EQUITY_SERIES_STYLES = ["SOLID", "MEDIUM_DASH", "MEDIUM_DASH", "MEDIUM_DASH"]
 
 # Avg RS Score of the Top 10 basket, overlaid on both equity curve
 # charts on a secondary (right) axis. Unlike the equity curve/SMAs
@@ -172,7 +188,11 @@ EQUITY_SERIES_COLORS = [
 # the leading basket's momentum strengthening or weakening?") from
 # the equity curve ("is money actually being made holding it?"), so
 # rebasing it would blur that distinction rather than clarify it.
+# Kept thin + dashed like the SMAs so it reads as a secondary overlay,
+# never competing visually with the bold solid equity curve.
 AVG_RS_COLOR = {"red": 0.0, "green": 0.55, "blue": 0.55}  # teal
+AVG_RS_LINE_WIDTH = 1.5
+AVG_RS_LINE_STYLE = "MEDIUM_DASH"
 
 # All charts are stacked together at the top of the sheet, above every
 # text/data row. This is the vertical gap (in grid rows) between one
@@ -826,6 +846,8 @@ def make_stock_chart(
     n_series,
     colors,
     series_axes=None,
+    series_widths=None,
+    series_line_styles=None,
     left_axis_title="% Change from Day 1 (Base = 0)",
     right_axis_title=None
 ):
@@ -844,15 +866,30 @@ def make_stock_chart(
     axis instead of being squashed flat against the left-axis series.
     Defaults to all LEFT_AXIS (previous single-axis behavior) when
     omitted, so existing callers (the equity curve chart) are unaffected.
+
+    `series_widths` / `series_line_styles`, if given, are lists (same
+    length as `colors`) of per-series pixel width and Sheets line-style
+    string ("SOLID", "MEDIUM_DASH", etc). Used so a primary series
+    (e.g. the equity curve) can be drawn bold/solid while secondary
+    overlay series (SMAs, RS trend lines) are drawn thin/dashed and
+    don't visually compete with it. Defaults to width=2/SOLID for every
+    series when omitted, preserving previous behavior for existing
+    callers.
     """
     data_end_row = header_row_0idx + 1 + n_rows
 
     if series_axes is None:
         series_axes = ["LEFT_AXIS"] * n_series
 
+    if series_widths is None:
+        series_widths = [2] * n_series
+
+    if series_line_styles is None:
+        series_line_styles = ["SOLID"] * n_series
+
     uses_right_axis = "RIGHT_AXIS" in series_axes
 
-    def series(col_index, color, target_axis):
+    def series(col_index, color, target_axis, width, line_style):
         return {
             "series": {
                 "sourceRange": {
@@ -869,11 +906,11 @@ def make_stock_chart(
             "color": color,
             "colorStyle": {"rgbColor": color},
             "lineStyle": {
-                "width": 2,
-                "type": "SOLID"
+                "width": width,
+                "type": line_style
             },
             "pointStyle": {
-                "size": 3,
+                "size": 3 if line_style == "SOLID" else 0,
                 "shape": "CIRCLE"
             },
         }
@@ -925,7 +962,9 @@ def make_stock_chart(
                             series(
                                 data_col_start + 1 + i,
                                 colors[i],
-                                series_axes[i]
+                                series_axes[i],
+                                series_widths[i],
+                                series_line_styles[i]
                             )
                             for i in range(n_series)
                         ],
@@ -1302,7 +1341,11 @@ def write_to_sheet(
         f"with 20/50/200 SMA overlays, for the longest-range regime "
         f"view), plus a TEAL Avg RS Score line (right axis, raw/not "
         f"rebased) on all three showing whether the Top {TOP10_N} "
-        f"basket's own momentum is strengthening or weakening | "
+        f"basket's own momentum is strengthening or weakening. The "
+        f"equity curve itself is drawn BOLD/SOLID (width "
+        f"{EQUITY_LINE_WIDTH}); the SMAs and the teal Avg RS line are "
+        f"drawn thin/DASHED so the actual return line never blends "
+        f"into the overlays | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} truly unplottable: no valid price "
         f"data at all in window; circuit/no-trade days are carried "
@@ -1374,11 +1417,12 @@ def write_to_sheet(
         )
 
         sma_legend = (
-            "Black = equity curve, Blue = 20 SMA, Orange = 50 SMA, "
-            "Red = 200 SMA -- equity below the red 200 SMA is the "
-            "classic cue to consider de-risking to cash | "
+            "Black (BOLD) = equity curve, Blue (dashed) = 20 SMA, "
+            "Orange (dashed) = 50 SMA, Red (dashed) = 200 SMA -- "
+            "equity below the red 200 SMA is the classic cue to "
+            "consider de-risking to cash | "
             if has_sma
-            else "Black = equity curve (no SMA overlays on this window) | "
+            else "Black (BOLD) = equity curve (no SMA overlays on this window) | "
         )
 
         log_note = (
@@ -1396,11 +1440,11 @@ def write_to_sheet(
             f"({window_label}, Daily Rebalance, No Costs) | "
             f"{log_note}"
             f"{sma_legend}"
-            "Teal (right axis) = Avg RS Score of that day's Top "
-            f"{TOP10_N} basket, RAW (not rebased) -- rising teal = "
-            "the leading basket's momentum is strengthening, falling "
-            "teal = it's weakening, independent of whether the "
-            "equity curve itself is up or down that day"
+            "Teal (dashed, right axis) = Avg RS Score of that day's "
+            f"Top {TOP10_N} basket, RAW (not rebased) -- rising teal "
+            "= the leading basket's momentum is strengthening, "
+            "falling teal = it's weakening, independent of whether "
+            "the equity curve itself is up or down that day"
         ])
 
         eq_header_row = add_row(
@@ -1427,8 +1471,16 @@ def write_to_sheet(
 
         has_avg_rs = "avg_rs_score_top10" in eq_table.columns
 
-        base_colors = EQUITY_SERIES_COLORS if has_sma else [EQUITY_COLOR]
-        n_base_series = 4 if has_sma else 1
+        if has_sma:
+            base_colors = EQUITY_SERIES_COLORS
+            base_widths = EQUITY_SERIES_WIDTHS
+            base_styles = EQUITY_SERIES_STYLES
+            n_base_series = 4
+        else:
+            base_colors = [EQUITY_COLOR]
+            base_widths = [EQUITY_LINE_WIDTH]
+            base_styles = ["SOLID"]
+            n_base_series = 1
 
         chart_title = (
             f"Top {TOP10_N} RS Equity Curve vs "
@@ -1460,6 +1512,14 @@ def write_to_sheet(
                 series_axes=(
                     ["LEFT_AXIS"] * n_base_series + ["RIGHT_AXIS"]
                     if has_avg_rs else None
+                ),
+                series_widths=(
+                    base_widths + [AVG_RS_LINE_WIDTH]
+                    if has_avg_rs else base_widths
+                ),
+                series_line_styles=(
+                    base_styles + [AVG_RS_LINE_STYLE]
+                    if has_avg_rs else base_styles
                 ),
                 left_axis_title=left_axis_title,
                 right_axis_title=(
