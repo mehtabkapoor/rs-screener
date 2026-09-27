@@ -176,9 +176,9 @@ EQUITY_SERIES_COLORS = [
 # attention. Order matches EQUITY_SERIES_COLORS (equity, sma20, sma50,
 # sma200).
 EQUITY_LINE_WIDTH = 5
-SMA_LINE_WIDTH = 1.5
+SMA_LINE_WIDTH = 2
 EQUITY_SERIES_WIDTHS = [EQUITY_LINE_WIDTH, SMA_LINE_WIDTH, SMA_LINE_WIDTH, SMA_LINE_WIDTH]
-EQUITY_SERIES_STYLES = ["SOLID", "MEDIUM_DASH", "MEDIUM_DASH", "MEDIUM_DASH"]
+EQUITY_SERIES_STYLES = ["SOLID", "MEDIUM_DASHED", "MEDIUM_DASHED", "MEDIUM_DASHED"]
 
 # Avg RS Score of the Top 10 basket, overlaid on both equity curve
 # charts on a secondary (right) axis. Unlike the equity curve/SMAs
@@ -191,8 +191,8 @@ EQUITY_SERIES_STYLES = ["SOLID", "MEDIUM_DASH", "MEDIUM_DASH", "MEDIUM_DASH"]
 # Kept thin + dashed like the SMAs so it reads as a secondary overlay,
 # never competing visually with the bold solid equity curve.
 AVG_RS_COLOR = {"red": 0.0, "green": 0.55, "blue": 0.55}  # teal
-AVG_RS_LINE_WIDTH = 1.5
-AVG_RS_LINE_STYLE = "MEDIUM_DASH"
+AVG_RS_LINE_WIDTH = 2
+AVG_RS_LINE_STYLE = "MEDIUM_DASHED"
 
 # All charts are stacked together at the top of the sheet, above every
 # text/data row. This is the vertical gap (in grid rows) between one
@@ -869,7 +869,7 @@ def make_stock_chart(
 
     `series_widths` / `series_line_styles`, if given, are lists (same
     length as `colors`) of per-series pixel width and Sheets line-style
-    string ("SOLID", "MEDIUM_DASH", etc). Used so a primary series
+    string ("SOLID", "MEDIUM_DASHED", etc). Used so a primary series
     (e.g. the equity curve) can be drawn bold/solid while secondary
     overlay series (SMAs, RS trend lines) are drawn thin/dashed and
     don't visually compete with it. Defaults to width=2/SOLID for every
