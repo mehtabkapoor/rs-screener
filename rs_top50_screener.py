@@ -1,93 +1,62 @@
 """
-RS TOP 50 SCREENER -- INDIVIDUAL RS LINE + PRICE CHARTS
+RS TOP 50 SCREENER + COMPOSITE TOP 50 SCREENER
+-- INDIVIDUAL SCORE LINE + PRICE CHARTS
 
 WHAT THIS DOES (single snapshot, not a backtest)
-  1. Downloads price/volume history for the stock universe + benchmark.
-  2. Computes a weighted multi-timeframe RS Score (40% 3M + 20% 6M +
-     20% 9M + 20% 12M price momentum) for every eligible stock as of
-     the latest available trading day.
-  3. Ranks all eligible stocks by RS Score, descending (Rank 1 = strongest).
-  4. Writes the full ranked table, Rank 1 downward.
-  5. For EACH of the Top 50 stocks individually, builds its own
-     small data table (last RS_LINE_WINDOW trading days: date, price
-     % change) and its own chart. The PRICE series is rebased to 0%
-     at day 1 of the RS_LINE_WINDOW display window.
-  6. The PRICE line is split into two color-coded series so it renders
-     GREEN on any day the stock was ranked in the Top 10 (by RS Score)
-     and BLUE on any day it was outside the Top 10. Boundary days
-     are duplicated across both price color segments so the line stays
-     visually continuous. The actual daily numeric rank is also
-     written out as a plain (uncharted) column so the green/blue split
-     can be audited against real numbers.
-  7. THREE Top 10 RS equal-weight, daily-rebalanced cumulative-return
-     equity curves (no costs/slippage modeled) are also built:
-       a) last RS_LINE_WINDOW (50) trading days -- RAW equity curve,
-          NO SMA overlays, since 20/50/200-day SMAs barely fit (or
-          don't fit at all) inside a 50-day window and aren't
-          meaningful there;
-       b) last EQUITY_1Y_WINDOW (252) trading days -- WITH 20/50/200
-          SMA overlays for regime timing over a full year;
-       c) the FULL downloaded history (all available trading days,
-          naturally bounded by however far back the Top 10 portfolio
-          can actually be formed and by benchmark data availability
-          -- in practice close to DOWNLOAD_YEARS) -- also WITH
-          20/50/200 SMA overlays, for the longest-range regime view.
-     The 50-day and 1-year curves are rebased to 0% at day 1 of their
-     own display window (can go negative on drawdowns). The FULL
-     history curve is deliberately NOT rebased to % -- it is plotted
-     as the RAW equity index level (base=100, strictly positive by
-     construction, since it's a cumprod of (1+return)) so it is safe
-     to view on a log axis. Google Sheets' "Log scale" option is a
-     Chart Editor UI-only toggle (Customize > Vertical axis > Log
-     scale) -- the Sheets API's BasicChartAxis object has no
-     scale-type field at all, so it cannot be set programmatically,
-     and since this script deletes + rebuilds every chart on each
-     run, any manual toggle would be wiped on the next run anyway.
-     A rebased % series would also break under log scale outright
-     (log is undefined at/below zero, and rebased % goes negative on
-     any drawdown), which is the other reason the full-history curve
-     uses the raw index instead. The 50-day and 1-year windows are
-     left as rebased %: neither typically spans enough orders of
-     magnitude for log scale to add anything over linear, so forcing
-     it there would be a manual-toggle chore for no analytical gain.
-     The most recent day is labeled with the time of the run since it
-     reflects the latest fetched price, not a settled close.
+  1. Downloads price/volume history for the stock universe + benchmark
+     ONCE (shared by both sheets).
+  2. SHEET 1 -- "Screener - RS Top50" (UNCHANGED): weighted
+     multi-timeframe RS Score (40% 3M + 20% 6M + 20% 9M + 20% 12M
+     price momentum), ranked descending (Rank 1 = strongest).
+  3. SHEET 2 -- "Screener - Composite Top50" (NEW): a MarketSmith-style
+     COMPOSITE SCORE (0-100) that replaces the RS Score as the ranking
+     key. Everything else (filters, layout, charts, equity curves,
+     green/blue Top-10 split, rank-percentile line, audit columns) is
+     identical to Sheet 1.
+  4. For EACH of the Top N stocks (both sheets) individually: its own
+     data table (last RS_LINE_WINDOW trading days) and its own chart.
+     PRICE is rebased to 0% at day 1; GREEN on any day the stock was
+     in the Top 10 by that sheet's score, BLUE otherwise; boundary
+     days duplicated so the line stays continuous. The actual daily
+     rank is written as a plain (uncharted) audit column.
+  5. THREE Top 10 equal-weight, daily-rebalanced equity curves per
+     sheet (no costs/slippage): last 50 days (raw, no SMAs), last 252
+     days (with 20/50/200 SMAs), and FULL history (RAW index level,
+     base=100, log-scale-safe, with SMAs). Google Sheets' Log scale is
+     a UI-only toggle (not settable via API, and charts are rebuilt on
+     every run), so toggle it manually if wanted. Each is overlaid with
+     the Top 10 basket's average score (teal, right axis).
+  6. All charts are stacked at the top of each sheet; each chart's data
+     table stays below. Chart creation is batched with quota-aware
+     retries and per-chart fallback; failures are named in the log.
 
-  CHART LAYOUT: all charts (both Top10 equity curve charts + every
-  per-stock chart) are anchored together in a single stacked block at
-  the very top of the sheet, above all text and data tables. Each
-  chart's underlying DATA TABLE stays exactly where it always was
-  (equity tables, then each ranked stock's own labeled data block) --
-  only the floating chart objects themselves are grouped together.
+COMPOSITE SCORE (price/volume proxy of MarketSmith's Composite Rating)
+  MarketSmith blends EPS Rating, RS Rating, SMR Rating, Acc/Dis Rating
+  and Industry Group RS. Weights are proprietary. EPS/SMR are NOT
+  point-in-time in yfinance (backtesting them = lookahead bias), so the
+  honest, backtestable proxy uses only price/volume:
 
-  CHART RELIABILITY: chart-creation requests are sent to the Sheets
-  API in small batches with quota-aware retries. If a batch still
-  fails after retries, each chart in that batch is retried
-  individually (rather than the whole batch being silently dropped),
-  and anything that still can't be added is named explicitly in the
-  run log at the end -- so "a few charts missing" is now always
-  visible and diagnosable instead of a silent, unlabeled gap.
+    With an `industry` (or `sector`) column in stocks.csv:
+        Composite = 50% RS percentile + 30% Acc/Dis percentile
+                  + 20% Industry Group RS percentile
+    Without it (or too little coverage):
+        Composite = 60% RS percentile + 40% Acc/Dis percentile
 
-  RS ACCELERATION OVERLAY (informational only -- does NOT affect
-  ranking, entry, or exit logic anywhere in this script):
-     Alongside the primary 3-12M blended RS Score (which alone drives
-     ranking/Top N selection), each stock also gets a short-window
-     RS_ACCEL_WINDOW (20 trading day, ~1 month) RS score and its
-     acceleration (today's 20d score minus the 20d score from
-     RS_ACCEL_WINDOW days ago). This is deliberately NOT used to rank
-     or select stocks: 20-day-only momentum falls inside the
-     well-documented short-term reversal window (Jegadeesh 1990), so
-     ranking on it directly would systematically chase overextended
-     names and shorten holding periods -- the opposite of what past
-     tradebook analysis showed works (15-day+ holds net positive,
-     sub-14-day holds net negative). Instead these two numbers are
-     written as extra, uncharted audit columns on the ranking table
-     and on each Top 50 stock's data block, purely so a name's
-     short-term thrust or decay can be eyeballed alongside its
-     long-term RS rank -- e.g. spotting early distribution in a
-     still-top-10 name before it actually falls out of the blended
-     rank. Nothing downstream (Top N cut, equity curve, charts'
-     series count) reacts to these values.
+  - RS percentile  : the existing 3-12M blended RS Score, percentile-
+                     ranked across that day's eligible universe.
+  - Acc/Dis        : (up-day volume - down-day volume) / total volume
+                     over ACCDIS_WINDOW (65) days, percentile-ranked.
+  - Group RS       : mean RS percentile of the stock's industry (groups
+                     with < MIN_GROUP_SIZE eligible names -> neutral 50),
+                     percentile-ranked across groups.
+  Every input is computed per day from data available that day, so the
+  daily rank history that drives equity curves / colour split /
+  percentile line has no lookahead.
+
+RS ACCELERATION OVERLAY (informational only -- not used for ranking):
+  rs_score_20d / rs_accel_20d audit columns are kept on both sheets.
+  Short-window momentum sits in the short-term reversal window
+  (Jegadeesh 1990), so it is never used to rank/select.
 
 This is a screener, not a trading system.
 """
@@ -113,9 +82,8 @@ BENCHMARK_FALLBACK = "^NSEI"
 
 STOCKS_FILE = "stocks.csv"
 
-DOWNLOAD_YEARS = 3  # bumped from 2: RS_12M lookback (252d) + 200-day SMA
-                     # warmup + 50-day display window needs ~500+ trading
-                     # days of buffer before the equity curve is stable
+DOWNLOAD_YEARS = 3  # RS_12M lookback (252d) + 200-day SMA warmup +
+                    # 50-day display window needs ~500+ trading days
 
 MIN_PRICE = 20
 MIN_AVG_VOLUME = 100_000
@@ -124,9 +92,7 @@ VOLUME_LOOKBACK = 20
 RS_3M, RS_6M, RS_9M, RS_12M = 63, 126, 189, 252
 RS_WEIGHTS = (0.40, 0.20, 0.20, 0.20)
 
-# Short-window RS score + acceleration -- informational/audit only,
-# see module docstring. Deliberately NOT part of RS_WEIGHTS / the
-# ranking formula, and NOT read anywhere in build_ranking()'s sort.
+# Short-window RS score + acceleration -- audit only, never ranks.
 RS_ACCEL_WINDOW = 20
 
 TOP_N = 100
@@ -135,95 +101,67 @@ RS_LINE_WINDOW = 50
 # Rank threshold used to color the price line (green inside, blue outside)
 TOP10_N = 10
 
+# ---------------- Composite score config ----------------
+ENABLE_COMPOSITE = True
+ACCDIS_WINDOW = 65                       # ~13 weeks, as in MarketSmith
+COMPOSITE_WEIGHTS_WITH_GROUP = (0.50, 0.30, 0.20)   # RS, Acc/Dis, Group
+COMPOSITE_WEIGHTS_NO_GROUP = (0.60, 0.40, 0.00)
+MIN_GROUP_SIZE = 3                       # eligible names needed for a group score
+MIN_INDUSTRY_COVERAGE = 0.50             # share of universe needing an industry tag
+INDUSTRY_COLUMN_CANDIDATES = ("industry", "sector")
+NEUTRAL_GROUP_PERCENTILE = 50.0
+
 # Chart colors (Google Sheets Color proto: 0-1 floats)
 GREEN_COLOR = {"red": 0.20, "green": 0.65, "blue": 0.33}   # in Top 10
 BLUE_COLOR = {"red": 0.26, "green": 0.52, "blue": 0.96}    # outside Top 10
 SERIES_COLORS = [GREEN_COLOR, BLUE_COLOR]
 
-# RS rank trend line, overlaid on the same per-stock chart as price on
-# a secondary (right) axis. Charted as an RS PERCENTILE (IBD-style):
-# each day's raw rank is rescaled against that day's full eligible
-# universe size so Rank 1 (strongest) = RS_PERCENTILE_BEST and the
-# weakest eligible stock that day = RS_PERCENTILE_WORST, linearly in
-# between. RISING = strengthening RS, FALLING = weakening RS -- no
-# sign-flip needed, unlike raw rank. The true positive rank number is
-# still written next to it (uncharted) for audit.
+# Rank trend line (percentile of daily rank vs that day's eligible
+# universe): Rank 1 = BEST, weakest eligible = WORST. Rising = stronger.
 RANK_LINE_COLOR = {"red": 0.55, "green": 0.15, "blue": 0.75}  # purple
-RS_PERCENTILE_BEST = 99   # Rank 1 (strongest) maps to this percentile
-RS_PERCENTILE_WORST = 1   # weakest eligible stock that day maps to this
+RS_PERCENTILE_BEST = 99
+RS_PERCENTILE_WORST = 1
 
-# Top 10 RS equal-weight equity curve (regime/timing overlay)
+# Top 10 equal-weight equity curve (regime/timing overlay)
 EQUITY_SMA_PERIODS = (20, 50, 200)
-EQUITY_1Y_WINDOW = 252  # second equity curve: last ~1 trading year, same metrics/SMAs
+EQUITY_1Y_WINDOW = 252
 
-# Equity curve is now a bold, highly-saturated color plotted at a much
-# heavier line width (see EQUITY_LINE_WIDTH / EQUITY_SERIES_WIDTHS
-# below) than the SMAs/RS overlay, and the SMAs + Avg RS line are
-# switched to a dashed style -- so the actual "is money being made"
-# line reads instantly instead of blending into the regime/overlay
-# lines around it.
-EQUITY_COLOR = {"red": 0.05, "green": 0.05, "blue": 0.05}        # equity curve (bold black)
-EQUITY_SMA20_COLOR = {"red": 0.20, "green": 0.60, "blue": 0.86}  # 20 SMA (blue)
-EQUITY_SMA50_COLOR = {"red": 0.95, "green": 0.60, "blue": 0.10}  # 50 SMA (orange)
-EQUITY_SMA200_COLOR = {"red": 0.80, "green": 0.10, "blue": 0.10}  # 200 SMA (red - de-risk trigger)
+EQUITY_COLOR = {"red": 0.05, "green": 0.05, "blue": 0.05}        # bold black
+EQUITY_SMA20_COLOR = {"red": 0.20, "green": 0.60, "blue": 0.86}  # blue
+EQUITY_SMA50_COLOR = {"red": 0.95, "green": 0.60, "blue": 0.10}  # orange
+EQUITY_SMA200_COLOR = {"red": 0.80, "green": 0.10, "blue": 0.10}  # red
 EQUITY_SERIES_COLORS = [
     EQUITY_COLOR, EQUITY_SMA20_COLOR, EQUITY_SMA50_COLOR, EQUITY_SMA200_COLOR
 ]
 
-# Line widths + styles: the equity curve gets a thick solid line so it
-# visually dominates; SMAs get a thinner dashed line so they read as
-# "reference/overlay" rather than competing with the equity curve for
-# attention. Order matches EQUITY_SERIES_COLORS (equity, sma20, sma50,
-# sma200).
 EQUITY_LINE_WIDTH = 5
 SMA_LINE_WIDTH = 2
 EQUITY_SERIES_WIDTHS = [EQUITY_LINE_WIDTH, SMA_LINE_WIDTH, SMA_LINE_WIDTH, SMA_LINE_WIDTH]
 EQUITY_SERIES_STYLES = ["SOLID", "MEDIUM_DASHED", "MEDIUM_DASHED", "MEDIUM_DASHED"]
 
-# Avg RS Score of the Top 10 basket, overlaid on both equity curve
-# charts on a secondary (right) axis. Unlike the equity curve/SMAs
-# (which are all rebased to 0% at day 1 of their own window on the
-# 50-day/1-year charts), this is plotted as the RAW RS score (%) of
-# that day's Top 10 basket -- it answers a different question ("is
-# the leading basket's momentum strengthening or weakening?") from
-# the equity curve ("is money actually being made holding it?"), so
-# rebasing it would blur that distinction rather than clarify it.
-# Kept thin + dashed like the SMAs so it reads as a secondary overlay,
-# never competing visually with the bold solid equity curve.
+# Avg score of the Top 10 basket, overlaid on a secondary (right) axis,
+# RAW (not rebased). Thin + dashed so it never competes with equity.
 AVG_RS_COLOR = {"red": 0.0, "green": 0.55, "blue": 0.55}  # teal
 AVG_RS_LINE_WIDTH = 2
 AVG_RS_LINE_STYLE = "MEDIUM_DASHED"
 
-# All charts are stacked together at the top of the sheet, above every
-# text/data row. This is the vertical gap (in grid rows) between one
-# chart's anchor and the next, so consecutively-anchored charts (each
-# rendered at a fixed 400px height) don't visually overlap each other
-# at default Google Sheets row height (~21px). 20 rows * ~21px =~ 420px,
-# comfortably clearing a 400px-tall chart.
+# Charts stacked at top of sheet; vertical gap between anchors (rows).
 CHART_ROW_SPACING = 20
-CHART_ZONE_BUFFER_ROWS = 2  # small gap after the last chart before text starts
+CHART_ZONE_BUFFER_ROWS = 2
 
-# Chart batch-creation tuning. Smaller batches + a pause between them
-# reduce the odds of hitting a burst rate limit that kills an entire
-# batch of charts at once; batches that still fail get retried chart
-# by chart so one bad request can't take a whole batch down with it.
 CHART_BATCH_SIZE = 5
 CHART_BATCH_PAUSE_SECONDS = 2
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
 SCREENER_WORKSHEET = "Screener - RS Top50"
+COMPOSITE_WORKSHEET = "Screener - Composite Top50"
 
-# If the most recent available bar is TODAY and the market is still live,
-# yfinance's "Close" for today is a moving intraday price, not a settled
-# close -- re-running the script minutes apart can return a different
-# live price each time, which reshuffles every stock's RS score (and the
-# liquidity filter's avg volume) and changes who's in the Top N.
-# STRICT_SETTLED_CLOSE = True would freeze ranking to yesterday's settled
-# close for run-to-run reproducibility. Set to False (default) to always
-# rank off the latest available price, including today's live intraday
-# tick -- you'll see today's move reflected immediately, at the cost of
-# the Top N list potentially shifting slightly if you re-run minutes apart.
+# Pause between finishing sheet 1 and starting sheet 2 (Sheets API quota)
+BETWEEN_SHEETS_PAUSE_SECONDS = 10
+
+# If True, freeze ranking to yesterday's settled close when the latest
+# bar is today's live intraday tick (run-to-run reproducibility).
 STRICT_SETTLED_CLOSE = False
 
 
@@ -257,6 +195,38 @@ def load_tickers():
 
     output = [s if s.endswith(".NS") else s + ".NS" for s in symbols]
     return list(dict.fromkeys(output))
+
+
+def load_industry_map():
+    """
+    {symbol_without_.NS: industry} from an optional `industry` (or
+    `sector`) column in stocks.csv. Returns {} if absent -- the
+    composite then falls back to RS + Acc/Dis only.
+    """
+    if not os.path.exists(STOCKS_FILE):
+        return {}
+
+    df = pd.read_csv(STOCKS_FILE)
+    if "symbol" not in df.columns:
+        return {}
+
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    ind_col = next(
+        (cols[k] for k in INDUSTRY_COLUMN_CANDIDATES if k in cols),
+        None
+    )
+    if ind_col is None:
+        return {}
+
+    out = {}
+    for sym, ind in zip(df["symbol"], df[ind_col]):
+        if pd.isna(sym) or pd.isna(ind):
+            continue
+        sym = str(sym).strip().replace(".NS", "")
+        ind = str(ind).strip()
+        if sym and ind:
+            out[sym] = ind
+    return out
 
 
 def clean_price_series(close, max_move=0.30):
@@ -351,13 +321,22 @@ def compute_stock_data(close, volume):
         + w12 * (close / close.shift(RS_12M) - 1)
     ) * 100
 
-    # Short-window (20d) RS score + its own acceleration, for audit
-    # only -- see module docstring. NOT part of rs_score, NOT used
-    # anywhere in build_ranking()'s sort key.
+    # Audit-only short-window RS + acceleration (never ranks)
     rs_score_20d = (
         close / close.shift(RS_ACCEL_WINDOW) - 1
     ) * 100
     rs_accel_20d = rs_score_20d - rs_score_20d.shift(RS_ACCEL_WINDOW)
+
+    # Accumulation/Distribution proxy: volume on up days minus volume on
+    # down days, over ACCDIS_WINDOW days, as a share of total volume.
+    # Range -1 (all distribution) to +1 (all accumulation). Used ONLY by
+    # the composite sheet.
+    signed_vol = np.sign(close.diff()) * volume
+    total_vol = volume.rolling(ACCDIS_WINDOW).sum()
+    accdis = (
+        signed_vol.rolling(ACCDIS_WINDOW).sum()
+        / total_vol.where(total_vol > 0)
+    )
 
     result = pd.DataFrame({
         "price": close,
@@ -366,11 +345,113 @@ def compute_stock_data(close, volume):
         "rs_score": rs_score,
         "rs_score_20d": rs_score_20d,
         "rs_accel_20d": rs_accel_20d,
+        "accdis": accdis,
     })
 
     result.index = normalize_dates(result.index)
 
     return result
+
+
+def build_composite_stocks(all_stocks, industry_map):
+    """
+    Returns (composite_stocks, info). composite_stocks has the same
+    structure as all_stocks, but each stock's `rs_score` column is
+    REPLACED by the 0-100 composite score (NaN on any day the stock is
+    not eligible), so every downstream function (ranking, daily rank
+    maps, equity curves, charts) works unchanged. The original RS score
+    and the three component percentiles ride along as audit columns.
+
+    Eligibility each day = liquid AND RS score available AND Acc/Dis
+    available AND price > 0. All percentiles are cross-sectional within
+    that day's eligible set -- no future data is used.
+    """
+    syms = list(all_stocks.keys())
+
+    def panel(col):
+        return pd.DataFrame(
+            {s: all_stocks[s][col] for s in syms}
+        ).sort_index()
+
+    rs = panel("rs_score")
+    acc = panel("accdis")
+    price = panel("price")
+    liquid = panel("liquid").astype(float).fillna(0.0).astype(bool)
+
+    elig = liquid & rs.notna() & acc.notna() & (price > 0)
+
+    rs_pct = rs.where(elig).rank(axis=1, pct=True) * 100
+    acc_pct = acc.where(elig).rank(axis=1, pct=True) * 100
+
+    # ---- Industry group RS ----
+    ind = pd.Series({s: industry_map.get(s) for s in syms}, dtype=object)
+    ind_valid = ind.dropna()
+    n_groups = ind_valid.nunique()
+    coverage = len(ind_valid) / max(len(syms), 1)
+    has_group = (
+        coverage >= MIN_INDUSTRY_COVERAGE and n_groups >= 3
+    )
+
+    grp_pct = pd.DataFrame(
+        NEUTRAL_GROUP_PERCENTILE,
+        index=rs.index,
+        columns=syms,
+        dtype=float
+    )
+
+    if has_group:
+        v_syms = list(ind_valid.index)
+        grp_mean = rs_pct[v_syms].T.groupby(ind_valid).mean().T
+        grp_cnt = elig[v_syms].T.groupby(ind_valid).sum().T
+        grp_mean = grp_mean.where(grp_cnt >= MIN_GROUP_SIZE)
+        grp_rank = grp_mean.rank(axis=1, pct=True) * 100
+
+        mapped = grp_rank[ind_valid.values]
+        mapped.columns = v_syms
+        grp_pct[v_syms] = mapped.fillna(NEUTRAL_GROUP_PERCENTILE)
+
+        w_rs, w_acc, w_grp = COMPOSITE_WEIGHTS_WITH_GROUP
+    else:
+        w_rs, w_acc, w_grp = COMPOSITE_WEIGHTS_NO_GROUP
+
+    composite = (
+        w_rs * rs_pct + w_acc * acc_pct + w_grp * grp_pct
+    ).where(elig)
+
+    comp_stocks = {}
+    for s in syms:
+        d = all_stocks[s].copy()
+        idx = d.index
+        d["rs_score_raw"] = d["rs_score"]
+        d["rs_score"] = composite[s].reindex(idx)
+        d["rs_pctile"] = rs_pct[s].reindex(idx)
+        d["accdis_pctile"] = acc_pct[s].reindex(idx)
+        d["group_pctile"] = (
+            grp_pct[s].reindex(idx) if has_group
+            else pd.Series(np.nan, index=idx)
+        )
+        comp_stocks[s] = d
+
+    if has_group:
+        formula = (
+            f"{w_rs:.0%} RS percentile + {w_acc:.0%} Acc/Dis "
+            f"({ACCDIS_WINDOW}d) percentile + {w_grp:.0%} Industry "
+            f"Group RS percentile"
+        )
+    else:
+        formula = (
+            f"{w_rs:.0%} RS percentile + {w_acc:.0%} Acc/Dis "
+            f"({ACCDIS_WINDOW}d) percentile (no usable industry column "
+            f"in stocks.csv -> Group RS factor dropped)"
+        )
+
+    info = {
+        "has_group": has_group,
+        "formula": formula,
+        "n_groups": int(n_groups),
+        "coverage": coverage,
+    }
+    return comp_stocks, info
 
 
 def get_row(df, date):
@@ -405,8 +486,6 @@ def build_ranking(all_stocks, date):
 
         avg_vol = row["avg_volume"]
 
-        # Audit-only fields, not used for sorting/eligibility -- see
-        # module docstring.
         rs_20d = row.get("rs_score_20d")
         rs_accel = row.get("rs_accel_20d")
 
@@ -419,9 +498,8 @@ def build_ranking(all_stocks, date):
             float(rs_accel) if rs_accel is not None and not pd.isna(rs_accel) else np.nan,
         ))
 
-    # Sort key is rs_score ONLY (index 1) -- the primary 3-12M blend.
-    # rs_20d / rs_accel ride along as extra columns and never touch
-    # ranking order.
+    # Sort key is the score ONLY (index 1): RS blend on the RS sheet,
+    # composite on the composite sheet.
     ranking.sort(key=lambda x: x[1], reverse=True)
 
     return ranking
@@ -430,20 +508,9 @@ def build_ranking(all_stocks, date):
 def compute_daily_rank_maps(all_stocks, trading_days_window, top_n_for_avg_rs=TOP10_N):
     """
     For every date in the window, rank the full eligible universe and
-    return {date: {symbol: rank}} (rank 1 = strongest that day). A
-    symbol absent from a given day's map was not eligible that day
-    (illiquid / below price floor / insufficient history).
-
-    This is the single source of truth used to color-split each
-    stock's price line (green inside Top N, blue outside), print the
-    raw daily rank next to the data, drive the RS percentile line, and
-    drive the Top10 equity curve.
-
-    Also returns a second dict, {date: avg_rs_score}, the mean
-    RS Score of that day's Top `top_n_for_avg_rs` basket (NaN if fewer
-    than that many stocks were eligible that day) -- computed in the
-    same per-day ranking pass rather than re-ranking the universe a
-    second time.
+    return {date: {symbol: rank}} (rank 1 = strongest that day), plus
+    {date: avg_score} of that day's Top `top_n_for_avg_rs` basket (NaN
+    if fewer were eligible).
     """
     rank_maps = {}
     avg_rs_by_day = {}
@@ -473,14 +540,9 @@ def compute_daily_rank_maps(all_stocks, trading_days_window, top_n_for_avg_rs=TO
 def compute_top10_equity_curve(all_stocks, rank_maps, full_calendar, top_n=10):
     """
     Equal-weight, daily-rebalanced cumulative return index for the
-    Top N RS-ranked stocks, using each day's rank as of the PRIOR
-    trading day (no lookahead). Base = 100 on the first day a full
-    Top N portfolio can be formed.
-
-    This is a regime/timing overlay, not a real backtest: no
-    transaction costs, slippage, or entry/exit buffers are modeled,
-    and a day only counts if a full Top N can be formed from the
-    previous day's ranking.
+    Top N stocks, using each day's rank as of the PRIOR trading day
+    (no lookahead). Base = 100 on the first day a full Top N exists.
+    Regime/timing overlay, not a real backtest: no costs or slippage.
     """
     daily_returns = {}
 
@@ -527,44 +589,16 @@ def build_top10_equity_table(
     trading_days_window,
     avg_rs_series=None,
     include_sma=True,
-    rebase_pct=True
+    rebase_pct=True,
+    avg_col_name="avg_rs_score_top10"
 ):
     """
-    Slice the Top N equity curve (and, when `include_sma` is True, its
-    20/50/200 SMA, computed on the FULL curve so the SMAs are properly
-    warmed up) down to the display window.
-
-    `rebase_pct=True` (default -- used for the 50-day and 1-year
-    windows) rebases everything to 0% at the window's first day.
-    Rebasing is a simple division by a positive constant, so it
-    preserves exactly where the equity curve crosses each SMA -- it's
-    purely a display transform. The resulting series can go negative
-    on a drawdown.
-
-    `rebase_pct=False` (used for the full-history window) skips that
-    transform entirely and returns the RAW equity index level (and
-    raw SMA levels) instead -- strictly positive by construction
-    (equity_index is a cumprod of (1+return), so it never hits zero
-    short of a -100% day), which makes it safe to view on a log axis.
-    Google Sheets' log-scale option is a manual Chart Editor toggle
-    that can't be set via the API and doesn't survive this script
-    deleting/rebuilding the chart on each run -- see module docstring.
-    A rebased % series is NOT log-safe (log is undefined at/below
-    zero, and rebased % dips negative on any drawdown), which is why
-    the two modes aren't just a cosmetic choice.
-
-    `include_sma=False` skips the SMA columns entirely and returns
-    just the raw equity curve (plus the avg RS overlay, if given) --
-    used for the 50-day window, where the 20/50/200-day SMAs barely
-    fit (or don't fit at all) inside the display window and aren't a
-    meaningful regime signal there.
-
-    If `avg_rs_series` is given, its values are sliced to the same
-    window and attached as `avg_rs_score_top10` -- the RAW (not
-    rebased) mean RS Score of that day's Top N basket, since it's a
-    momentum-strength reading, not a return, and rebasing it would
-    misrepresent it as one. This column is never affected by
-    `rebase_pct`.
+    Slice the Top N equity curve (and, if `include_sma`, its 20/50/200
+    SMA computed on the FULL curve so they're warmed up) to the display
+    window. `rebase_pct=True` rebases to 0% at the window's first day
+    (display-only transform, preserves equity/SMA crossovers);
+    `rebase_pct=False` returns the RAW index level (strictly positive,
+    log-scale-safe). The avg-score column is always RAW (never rebased).
     """
     if equity_index.empty:
         return None
@@ -597,7 +631,7 @@ def build_top10_equity_table(
     })
 
     if avg_rs_series is not None:
-        table["avg_rs_score_top10"] = (
+        table[avg_col_name] = (
             avg_rs_series.reindex(trading_days_window).round(2).values
         )
 
@@ -606,11 +640,10 @@ def build_top10_equity_table(
 
 def split_by_rank(values, flags):
     """
-    Split a single series into two parallel series based on a boolean
-    flag per point: `in_flag` values go to `top`, everything else goes
-    to `other`. At every day the flag flips, the boundary point is
-    duplicated into both arrays so the two color segments meet at the
-    same x-position instead of leaving a visual gap in the line.
+    Split one series into two parallel series by a boolean flag per
+    point (`top` where flag, `other` elsewhere). At every flip, the
+    boundary point is duplicated into both arrays so the colour
+    segments meet without a visual gap.
     """
     n = len(values)
     top = [np.nan] * n
@@ -625,10 +658,8 @@ def split_by_rank(values, flags):
     for i in range(1, n):
         if flags[i] != flags[i - 1]:
             if flags[i]:
-                # entering Top N at i -> extend the green segment back to i-1
                 top[i - 1] = values[i - 1]
             else:
-                # exiting Top N at i -> extend the blue segment back to i-1
                 other[i - 1] = values[i - 1]
 
     return top, other
@@ -642,49 +673,26 @@ def build_stock_series(
     all_stocks,
     symbol,
     trading_days_window,
-    rank_maps
+    rank_maps,
+    extra_audit_cols=()
 ):
     """
     Returns (dataframe, note). note is None on a clean run, or a short
-    string on success noting how many no-trade/circuit days were
-    carried forward -- purely informational, not a skip. dataframe is
-    only None when the stock is genuinely unplottable (see below).
+    string saying how many no-trade/circuit days were carried forward.
+    dataframe is None only if the stock has NO valid positive price in
+    the window.
 
-    No completeness threshold: a stock in upper/lower circuit has
-    genuine no-trade days (it's still bought/sold at the circuit
-    price pre-open, it just doesn't print a new trade), and a listing
-    or data gap is handled the same way real trading desks handle a
-    frozen quote -- carry the last available price forward until a
-    new trade prints. Leading gaps (e.g. stock listed a few days into
-    the window) are back-filled from the first available price so day
-    1 of the window is never NaN.
-
-    A stock is only skipped if it has NO valid (positive) price
-    anywhere in the window -- i.e. there is nothing to carry forward
-    or back, so nothing meaningful can be charted.
-
-    PRICE % is rebased to 0% at day 1 of trading_days_window.
-
-    The daily RS rank is also returned as two columns: `rank_percentile`
-    (the CHARTED value -- that day's rank rescaled against that day's
-    full eligible-universe size, RS_PERCENTILE_BEST for Rank 1 down to
-    RS_PERCENTILE_WORST for the weakest eligible stock that day, so a
-    rising line reads as strengthening RS and a falling line reads as
-    weakening RS) and `daily_rank` (the raw, uncharted, positive rank
-    number for audit against the chart).
-
-    Two further uncharted audit columns are appended: `rs_score_20d`
-    and `rs_accel_20d` (today's value only, not a daily series --
-    see module docstring). These are for eyeballing short-term
-    thrust/decay next to the long-term rank and do not affect the
-    chart, the price split, or any ranking/selection logic.
+    PRICE % is rebased to 0% at day 1 of the window. Columns:
+    `rank_percentile` (CHARTED, that day's rank rescaled against that
+    day's eligible-universe size: Rank 1 -> BEST, weakest -> WORST) and
+    `daily_rank` (raw positive rank, uncharted, for audit).
+    Latest-value audit columns (uncharted): rs_score_20d, rs_accel_20d,
+    plus any `extra_audit_cols` (composite sheet: raw RS score and the
+    three component percentiles).
     """
     df = all_stocks[symbol]
 
     prices_raw = df["price"].reindex(trading_days_window)
-    # Treat non-positive prices as missing too, so a bad tick (0 or
-    # negative) gets carried over the same way a no-trade day does,
-    # rather than corrupting the % change math.
     prices_raw = prices_raw.where(prices_raw > 0)
 
     n_filled = int(prices_raw.isna().sum())
@@ -696,10 +704,6 @@ def build_stock_series(
     price_base = prices.iloc[0]
     price_pct = (prices / price_base - 1) * 100
 
-    # Daily rank (None = not eligible that day) and the Top-N flag
-    # derived directly from it -- this is what drives the green/blue
-    # split, and the raw rank is also written out as its own column
-    # so the split can be visually checked against real numbers.
     daily_ranks = [
         rank_maps.get(d, {}).get(symbol)
         for d in trading_days_window
@@ -717,12 +721,6 @@ def build_stock_series(
         for r in daily_ranks
     ]
 
-    # Charted RS percentile: that day's rank rescaled against that
-    # day's full eligible-universe size (len of that day's rank map),
-    # not the fixed TOP_N -- so the scale is honest about how big the
-    # actual eligible field was that day. Rank 1 -> RS_PERCENTILE_BEST,
-    # weakest eligible stock that day -> RS_PERCENTILE_WORST, linear
-    # in between. A universe of 1 (degenerate) maps to BEST.
     universe_sizes = [
         len(rank_maps.get(d, {}))
         for d in trading_days_window
@@ -753,9 +751,6 @@ def build_stock_series(
         "daily_rank": rank_col,
     })
 
-    # Audit-only, latest-value columns (not a daily series -- constant
-    # down the column) so the short-term thrust/decay reading sits
-    # next to the chart data without needing a second chart series.
     latest_row = df.reindex(trading_days_window).iloc[-1]
     result["rs_score_20d"] = round(
         float(latest_row["rs_score_20d"]), 2
@@ -763,6 +758,10 @@ def build_stock_series(
     result["rs_accel_20d"] = round(
         float(latest_row["rs_accel_20d"]), 2
     ) if not pd.isna(latest_row.get("rs_accel_20d", np.nan)) else np.nan
+
+    for col in extra_audit_cols:
+        v = latest_row.get(col, np.nan)
+        result[col] = round(float(v), 2) if not pd.isna(v) else np.nan
 
     fill_note = f"{n_filled} no-trade/bad-tick day(s) carried forward" if n_filled else None
 
@@ -852,29 +851,12 @@ def make_stock_chart(
     right_axis_title=None
 ):
     """
-    `header_row_0idx`/`n_rows` locate the chart's SOURCE DATA (which
-    stays wherever that stock's/equity's labeled data block lives in
-    the sheet). `anchor_row` is purely the floating chart object's
-    on-screen position and is independent of the data location -- this
-    is what lets every chart be stacked together at the top of the
-    sheet while each data table stays put further down.
-
-    `series_axes`, if given, is a list of "LEFT_AXIS"/"RIGHT_AXIS" the
-    same length as `colors`, letting a series with an unrelated scale
-    (e.g. a series with a very different range from the others) get
-    its own right
-    axis instead of being squashed flat against the left-axis series.
-    Defaults to all LEFT_AXIS (previous single-axis behavior) when
-    omitted, so existing callers (the equity curve chart) are unaffected.
-
-    `series_widths` / `series_line_styles`, if given, are lists (same
-    length as `colors`) of per-series pixel width and Sheets line-style
-    string ("SOLID", "MEDIUM_DASHED", etc). Used so a primary series
-    (e.g. the equity curve) can be drawn bold/solid while secondary
-    overlay series (SMAs, RS trend lines) are drawn thin/dashed and
-    don't visually compete with it. Defaults to width=2/SOLID for every
-    series when omitted, preserving previous behavior for existing
-    callers.
+    `header_row_0idx`/`n_rows` locate the chart's SOURCE DATA;
+    `anchor_row` is purely the floating chart's on-screen position, so
+    all charts can be stacked at the top while data tables stay put.
+    `series_axes` / `series_widths` / `series_line_styles` are optional
+    per-series lists (same length as `colors`); defaults are all
+    LEFT_AXIS / width 2 / SOLID.
     """
     data_end_row = header_row_0idx + 1 + n_rows
 
@@ -1019,12 +1001,8 @@ def call_with_quota_retry(
 def add_charts_robust(sh, chart_requests, chart_labels, chunk=CHART_BATCH_SIZE):
     """
     Sends addChart requests in small batches with quota-aware retries.
-    A batch that still fails after retries is NOT just skipped: each
-    chart inside it is retried individually, so one bad/rate-limited
-    request can't silently take a whole batch of charts down with it.
-    Anything that still can't be added after that is returned by name
-    so the run log tells you exactly which charts are missing and why,
-    instead of leaving you to notice a gap on the sheet.
+    A batch that still fails is retried chart-by-chart; anything that
+    still can't be added is returned by name for the run log.
     """
     total = len(chart_requests)
     if total == 0:
@@ -1135,6 +1113,7 @@ def write_rows_in_chunks(
 
 
 def write_to_sheet(
+    cfg,
     ranking_df,
     stock_series_list,
     skipped_symbols,
@@ -1144,6 +1123,10 @@ def write_to_sheet(
     equity_table_full=None,
     skip_reasons=None
 ):
+    nm = cfg["name"]            # "RS" or "Composite"
+    sc = cfg["score_label"]     # "RS Score" or "Composite Score"
+    worksheet_name = cfg["worksheet"]
+
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
 
@@ -1154,31 +1137,24 @@ def write_to_sheet(
         )
 
         ranking_df.to_csv(
-            "RS_Top50_Ranking.csv",
+            f"{cfg['csv_prefix']}_Ranking.csv",
             index=False
         )
 
-        if equity_table_50d is not None:
-            equity_table_50d.to_csv(
-                "RS_Top10_Equity_Curve_50d.csv",
-                index=False
-            )
-
-        if equity_table_1y is not None:
-            equity_table_1y.to_csv(
-                "RS_Top10_Equity_Curve_1y.csv",
-                index=False
-            )
-
-        if equity_table_full is not None:
-            equity_table_full.to_csv(
-                "RS_Top10_Equity_Curve_full.csv",
-                index=False
-            )
+        for tbl, suffix in (
+            (equity_table_50d, "50d"),
+            (equity_table_1y, "1y"),
+            (equity_table_full, "full"),
+        ):
+            if tbl is not None:
+                tbl.to_csv(
+                    f"{cfg['eq_prefix']}_{suffix}.csv",
+                    index=False
+                )
 
         for rank, symbol, df in stock_series_list:
             df.to_csv(
-                f"RS_Top50_Stock_{rank:02d}_{symbol}.csv",
+                f"{cfg['csv_prefix']}_Stock_{rank:02d}_{symbol}.csv",
                 index=False
             )
 
@@ -1202,17 +1178,11 @@ def write_to_sheet(
 
     block_height = RS_LINE_WINDOW + 4
     block_height_1y = EQUITY_1Y_WINDOW + 4
-    # The full-history curve's length isn't a fixed constant (it's
-    # bounded by however much data actually came back), so size its
-    # row budget off the real table instead of a config constant.
     block_height_full = (
         len(equity_table_full) + 4
         if equity_table_full is not None else 0
     )
 
-    # Number of chart objects that will be stacked together at the top
-    # of the sheet: the three Top10 equity charts (if we have enough
-    # history for each) plus one chart per charted stock.
     n_equity_chart_50d = 1 if equity_table_50d is not None else 0
     n_equity_chart_1y = 1 if equity_table_1y is not None else 0
     n_equity_chart_full = 1 if equity_table_full is not None else 0
@@ -1239,12 +1209,19 @@ def write_to_sheet(
         + 20
     )
 
-    n_cols_needed = DATA_COL_START + 6 + 2
+    max_stock_cols = (
+        len(stock_series_list[0][2].columns)
+        if stock_series_list else 8
+    )
+    n_cols_needed = max(
+        DATA_COL_START + max_stock_cols,
+        len(ranking_df.columns)
+    ) + 2
 
     ws = call_with_quota_retry(
         lambda: get_or_create_worksheet(
             sh,
-            SCREENER_WORKSHEET,
+            worksheet_name,
             rows=n_rows_needed,
             cols=n_cols_needed
         ),
@@ -1296,56 +1273,48 @@ def write_to_sheet(
 
         return len(rows_left)
 
-    # Reserve a blank zone at the very top of the sheet for the
-    # stacked charts. All text/data content below is unchanged in
-    # relative order -- it's simply pushed down by this many rows so
-    # every chart can float above it as one grouped block.
+    # Blank zone at the very top for the stacked charts.
     for _ in range(charts_zone_rows):
         add_row()
 
     next_chart_anchor_row = 0
 
     add_row(left=[
-        f"RS TOP {TOP_N} SCREENER | "
+        f"{cfg['title']} | "
         f"run {timestamp} | "
         f"As of: {as_of_date} | "
-        f"RS Formula: 40% 3M + 20% 6M + "
-        f"20% 9M + 20% 12M Price Rate-of-Change | "
-        f"Charts: Price % (GREEN = in Top {TOP10_N} by RS Score that "
+        f"{cfg['formula_line']} | "
+        f"Charts: Price % (GREEN = in Top {TOP10_N} by {sc} that "
         f"day, BLUE = outside Top {TOP10_N}, rebased to 0% at day 1 "
-        f"of the {RS_LINE_WINDOW}-day window), plus a PURPLE RS "
-        f"Percentile trend line on the right axis (Rank 1 -> "
+        f"of the {RS_LINE_WINDOW}-day window), plus a PURPLE {nm} "
+        f"Rank Percentile trend line on the right axis (Rank 1 -> "
         f"{RS_PERCENTILE_BEST}th %ile, weakest eligible stock that "
         f"day -> {RS_PERCENTILE_WORST}th %ile, scaled against that "
         f"day's actual eligible-universe size) so RISING = "
-        f"strengthening RS and FALLING = weakening RS | "
+        f"strengthening and FALLING = weakening | "
         f"All charts are grouped together at the top of this sheet; "
         f"each chart's own data table is still labeled below | "
         f"'daily_rank' column shows the actual positive rank each day "
         f"(not charted) to audit the percentile line and the "
         f"green/blue price split | "
-        f"'rs_score_20d'/'rs_accel_20d' columns (ranking table + "
-        f"each stock block) are a {RS_ACCEL_WINDOW}-day short-term "
-        f"RS reading + its own acceleration, for audit/early-warning "
-        f"only -- NOT charted, NOT used anywhere in ranking, Top N "
-        f"selection, or entry/exit | "
-        f"Top {TOP10_N} RS Equal-Weight Equity Curve included three "
+        f"'rs_score_20d'/'rs_accel_20d' columns are a "
+        f"{RS_ACCEL_WINDOW}-day short-term RS reading + its own "
+        f"acceleration, audit/early-warning only -- NOT charted, NOT "
+        f"used anywhere in ranking or Top N selection | "
+        f"{cfg['extra_note']}"
+        f"Top {TOP10_N} {nm} Equal-Weight Equity Curve included three "
         f"times (daily rebalance, no costs): last {RS_LINE_WINDOW} "
-        f"days (raw equity curve, rebased %, no SMA overlays), last "
+        f"days (rebased %, no SMA overlays), last "
         f"{EQUITY_1Y_WINDOW} days / 1 year (rebased %, with 20/50/200 "
-        f"SMA overlays for regime timing), and the full downloaded "
-        f"history / ~{DOWNLOAD_YEARS} years (RAW equity index level, "
-        f"NOT rebased -- log-scale-safe; enable Log scale manually in "
-        f"Customize > Vertical axis if you want it, since the API "
-        f"can't set that and this chart is rebuilt every run -- also "
-        f"with 20/50/200 SMA overlays, for the longest-range regime "
-        f"view), plus a TEAL Avg RS Score line (right axis, raw/not "
-        f"rebased) on all three showing whether the Top {TOP10_N} "
-        f"basket's own momentum is strengthening or weakening. The "
-        f"equity curve itself is drawn BOLD/SOLID (width "
-        f"{EQUITY_LINE_WIDTH}); the SMAs and the teal Avg RS line are "
-        f"drawn thin/DASHED so the actual return line never blends "
-        f"into the overlays | "
+        f"SMA overlays), and the full downloaded history / "
+        f"~{DOWNLOAD_YEARS} years (RAW equity index level, NOT "
+        f"rebased -- log-scale-safe; enable Log scale manually in "
+        f"Customize > Vertical axis if wanted, since the API can't "
+        f"set it and charts are rebuilt every run -- also with "
+        f"20/50/200 SMA overlays), plus a TEAL Avg {sc} line (right "
+        f"axis, raw/not rebased) on all three. The equity curve is "
+        f"drawn BOLD/SOLID (width {EQUITY_LINE_WIDTH}); SMAs and the "
+        f"teal line are thin/DASHED | "
         f"{len(stock_series_list)}/{TOP_N} stocks charted "
         f"({len(skipped_symbols)} truly unplottable: no valid price "
         f"data at all in window; circuit/no-trade days are carried "
@@ -1357,7 +1326,7 @@ def write_to_sheet(
 
     add_row()
     add_row(
-        left=["Ranked Stocks (Rank 1 = Strongest RS)"]
+        left=[f"Ranked Stocks (Rank 1 = Strongest {sc})"]
     )
 
     ranking_clean = sanitize_for_sheets(
@@ -1396,7 +1365,7 @@ def write_to_sheet(
 
         if equity_table is None:
             add_row(left=[
-                f"Top {TOP10_N} RS Equity Curve ({window_label}): "
+                f"Top {TOP10_N} {nm} Equity Curve ({window_label}): "
                 f"skipped -- not enough history yet for a full "
                 f"Top {TOP10_N} portfolio plus "
                 f"{max(EQUITY_SMA_PERIODS)}-day SMA warmup."
@@ -1404,12 +1373,6 @@ def write_to_sheet(
             add_row()
             return
 
-        # SMA columns are only present when the table was built with
-        # include_sma=True (the 1-year and full-history windows); the
-        # 50-day window is built with include_sma=False, so this
-        # simply detects which kind of table we were handed and
-        # adapts the legend/chart. Column names differ by whether the
-        # table is rebased-% (sma{p}_pct) or raw-index (sma{p}_index).
         has_sma = any(
             f"sma{period}_pct" in equity_table.columns
             or f"sma{period}_index" in equity_table.columns
@@ -1427,7 +1390,7 @@ def write_to_sheet(
 
         log_note = (
             "Plotted as RAW equity index (base=100, always positive) "
-            "instead of rebased %% change, so it's safe to view on a "
+            "instead of rebased % change, so it's safe to view on a "
             "log axis -- Sheets' Log scale toggle is UI-only (can't "
             "be set via the API) and this chart is rebuilt every run, "
             "so manually check Customize > Vertical axis > Log scale "
@@ -1436,13 +1399,13 @@ def write_to_sheet(
         )
 
         add_row(left=[
-            f"Top {TOP10_N} RS Equal-Weight Equity Curve "
+            f"Top {TOP10_N} {nm} Equal-Weight Equity Curve "
             f"({window_label}, Daily Rebalance, No Costs) | "
             f"{log_note}"
             f"{sma_legend}"
-            "Teal (dashed, right axis) = Avg RS Score of that day's "
+            f"Teal (dashed, right axis) = Avg {sc} of that day's "
             f"Top {TOP10_N} basket, RAW (not rebased) -- rising teal "
-            "= the leading basket's momentum is strengthening, "
+            "= the leading basket's strength is increasing, "
             "falling teal = it's weakening, independent of whether "
             "the equity curve itself is up or down that day"
         ])
@@ -1469,7 +1432,7 @@ def write_to_sheet(
         add_row()
         add_row()
 
-        has_avg_rs = "avg_rs_score_top10" in eq_table.columns
+        has_avg_rs = cfg["avg_col"] in eq_table.columns
 
         if has_sma:
             base_colors = EQUITY_SERIES_COLORS
@@ -1483,10 +1446,10 @@ def write_to_sheet(
             n_base_series = 1
 
         chart_title = (
-            f"Top {TOP10_N} RS Equity Curve vs "
-            f"20/50/200 SMA + Avg RS Score ({window_label})"
+            f"Top {TOP10_N} {nm} Equity Curve vs "
+            f"20/50/200 SMA + Avg {sc} ({window_label})"
             if has_sma
-            else f"Top {TOP10_N} RS Equity Curve + Avg RS Score ({window_label})"
+            else f"Top {TOP10_N} {nm} Equity Curve + Avg {sc} ({window_label})"
         )
 
         left_axis_title = (
@@ -1523,7 +1486,7 @@ def write_to_sheet(
                 ),
                 left_axis_title=left_axis_title,
                 right_axis_title=(
-                    f"Avg RS Score of Top {TOP10_N} Basket (%, raw)"
+                    f"Avg {sc} of Top {TOP10_N} Basket (raw)"
                     if has_avg_rs else None
                 ),
             )
@@ -1573,7 +1536,7 @@ def write_to_sheet(
                 (
                     f"Rank {rank} - {symbol}: "
                     f"Price % (green=Top{TOP10_N}/blue=outside) + "
-                    f"RS Percentile trend (purple, right axis) "
+                    f"{nm} Rank Percentile trend (purple, right axis) "
                     f"(Last {RS_LINE_WINDOW} Days)"
                 ),
                 header_row_0idx,
@@ -1585,9 +1548,10 @@ def write_to_sheet(
                 series_axes=["LEFT_AXIS", "LEFT_AXIS", "RIGHT_AXIS"],
                 left_axis_title="Price % Change from Day 1 (Base = 0)",
                 right_axis_title=(
-                    f"RS Percentile ({RS_PERCENTILE_BEST} = strongest / "
-                    f"Rank 1, {RS_PERCENTILE_WORST} = weakest eligible "
-                    "that day; see daily_rank col for actual rank)"
+                    f"{nm} Rank Percentile ({RS_PERCENTILE_BEST} = "
+                    f"strongest / Rank 1, {RS_PERCENTILE_WORST} = "
+                    "weakest eligible that day; see daily_rank col "
+                    "for actual rank)"
                 ),
             )
         )
@@ -1598,7 +1562,7 @@ def write_to_sheet(
         ws,
         rows_left,
         chunk_size=1500,
-        label="screener sheet (left)",
+        label=f"{nm} sheet (left)",
         start_col="A"
     )
 
@@ -1606,15 +1570,15 @@ def write_to_sheet(
         ws,
         rows_right,
         chunk_size=1500,
-        label="screener sheet (data, right)",
+        label=f"{nm} sheet (data, right)",
         start_col=col_letter(DATA_COL_START)
     )
 
     failed_charts = add_charts_robust(sh, chart_requests, chart_labels)
 
     print(
-        f"\nScreener results written to "
-        f"'{SCREENER_WORKSHEET}' tab: "
+        f"\n{nm} screener results written to "
+        f"'{worksheet_name}' tab: "
         f"{len(ranking_df)} ranked stocks, "
         f"{len(chart_requests) - len(failed_charts)}/"
         f"{len(chart_requests)} charts added."
@@ -1630,56 +1594,370 @@ def write_to_sheet(
 
 
 # ============================================================
-# MAIN
+# PIPELINE (runs once per sheet: RS, then Composite)
 # ============================================================
 
-def main():
+RS_CFG = {
+    "name": "RS",
+    "score_label": "RS Score",
+    "score_col": "rs_score_pct",
+    "avg_col": "avg_rs_score_top10",
+    "worksheet": SCREENER_WORKSHEET,
+    "csv_prefix": "RS_Top50",
+    "eq_prefix": "RS_Top10_Equity_Curve",
+    "title": f"RS TOP {TOP_N} SCREENER",
+    "formula_line": (
+        "RS Formula: 40% 3M + 20% 6M + 20% 9M + 20% 12M "
+        "Price Rate-of-Change"
+    ),
+    "extra_cols": (),
+    "extra_note": "",
+}
+
+
+def make_composite_cfg(info):
+    if info["has_group"]:
+        extra = (
+            "COMPOSITE audit columns (latest day, uncharted): "
+            "rs_score_raw = original 3-12M RS score, rs_pctile / "
+            "accdis_pctile / group_pctile = the three component "
+            f"percentiles (Industry Group RS from {info['n_groups']} "
+            f"groups, {info['coverage']:.0%} of universe tagged) | "
+        )
+    else:
+        extra = (
+            "COMPOSITE audit columns (latest day, uncharted): "
+            "rs_score_raw = original 3-12M RS score, rs_pctile / "
+            "accdis_pctile = component percentiles (group_pctile is "
+            "blank -- no usable industry column in stocks.csv) | "
+        )
+
+    return {
+        "name": "Composite",
+        "score_label": "Composite Score",
+        "score_col": "composite_score",
+        "avg_col": "avg_composite_score_top10",
+        "worksheet": COMPOSITE_WORKSHEET,
+        "csv_prefix": "Composite_Top50",
+        "eq_prefix": "Composite_Top10_Equity_Curve",
+        "title": f"COMPOSITE TOP {TOP_N} SCREENER (MarketSmith-style proxy)",
+        "formula_line": (
+            f"Composite Score (0-100): {info['formula']} -- price/volume "
+            "proxy; EPS/SMR omitted (no point-in-time fundamentals, "
+            "would be lookahead bias)"
+        ),
+        "extra_cols": (
+            "rs_score_raw", "rs_pctile", "accdis_pctile", "group_pctile"
+        ),
+        "extra_note": extra,
+    }
+
+
+def determine_as_of_date(all_stocks, bench_close):
+    latest_stock_date = max(
+        df.index.max()
+        for df in all_stocks.values()
+    )
+
+    as_of_date = min(
+        pd.Timestamp(
+            latest_stock_date
+        ).normalize(),
+        pd.Timestamp(
+            bench_close.index.max()
+        ).normalize()
+    )
+
+    if STRICT_SETTLED_CLOSE:
+        today = pd.Timestamp.today().normalize()
+
+        if as_of_date == today:
+            prior_days = bench_close.index[bench_close.index < today]
+
+            if len(prior_days) > 0:
+                settled_as_of_date = prior_days.max()
+                print(
+                    f"\nNOTE: today ({today:%Y-%m-%d}) is still live/"
+                    "intraday -- its Close is a moving price, not a "
+                    "settled one, so ranking off it would reshuffle "
+                    "between re-runs. Ranking off the last SETTLED "
+                    f"close instead: {settled_as_of_date:%Y-%m-%d}. "
+                    "Set STRICT_SETTLED_CLOSE = False to rank off "
+                    "today's live price anyway."
+                )
+                as_of_date = settled_as_of_date
+            else:
+                print(
+                    "\nWARNING: today is the only available trading "
+                    "day and STRICT_SETTLED_CLOSE is on, but there's "
+                    "no prior settled day to fall back to -- ranking "
+                    "off today's live price anyway."
+                )
+
+    return as_of_date
+
+
+def run_screener(all_stocks, bench_close, as_of_date, cfg):
+    nm = cfg["name"]
+    score_col = cfg["score_col"]
+
     print()
     print("=" * 70)
-    print(
-        f"RS TOP {TOP_N} SCREENER -- "
-        "INDIVIDUAL RS LINE + PRICE CHARTS"
-    )
+    print(f"{cfg['title']} -- INDIVIDUAL SCORE LINE + PRICE CHARTS")
     print("=" * 70)
-
-    print(
-        "RS Formula     : "
-        "40% 3M + 20% 6M + 20% 9M + 20% 12M "
-        "Price Rate-of-Change"
-    )
-
-    print(
-        "Ranking        : "
-        "Full eligible universe, descending RS Score"
-    )
-
-    print(
-        f"Output         : Top {TOP_N}, Rank 1 downward"
-    )
-
+    print(f"Score          : {cfg['formula_line']}")
+    print("Ranking        : Full eligible universe, descending score")
+    print(f"Output         : Top {TOP_N}, Rank 1 downward -> '{cfg['worksheet']}'")
     print(
         "Per-stock chart: Price % (green=Top"
-        f"{TOP10_N}/blue=outside) + RS Percentile trend "
+        f"{TOP10_N}/blue=outside) + {nm} Rank Percentile trend "
         f"(purple, right axis, {RS_PERCENTILE_WORST}-"
         f"{RS_PERCENTILE_BEST} scale), rebased to 0% at day 1, "
         f"last {RS_LINE_WINDOW} trading days"
     )
-
+    print(f"Price filter   : > Rs.{MIN_PRICE}")
     print(
-        f"Price filter   : > Rs.{MIN_PRICE}"
-    )
-
-    print(
-        f"Liquidity      : "
-        f"{VOLUME_LOOKBACK}D average volume "
+        f"Liquidity      : {VOLUME_LOOKBACK}D average volume "
         f"> {MIN_AVG_VOLUME:,}"
     )
-
     print("=" * 70)
 
+    print(f"\nAs-of date: {as_of_date:%Y-%m-%d}")
+
+    ranking = build_ranking(all_stocks, as_of_date)
+
+    print(f"Eligible universe: {len(ranking)} stocks")
+
+    if not ranking:
+        raise RuntimeError(
+            "No eligible stocks on the as-of date."
+        )
+
+    top_ranking = ranking[:TOP_N]
+
+    ranking_df = pd.DataFrame([
+        {
+            "rank": i + 1,
+            "symbol": sym,
+            score_col: round(rs, 2),
+            "price": round(price, 2),
+            "avg_volume_20d": round(avg_vol, 0),
+            "rs_score_20d": round(rs_20d, 2) if not pd.isna(rs_20d) else "",
+            "rs_accel_20d": round(rs_accel, 2) if not pd.isna(rs_accel) else "",
+        }
+        for i, (
+            sym,
+            rs,
+            price,
+            avg_vol,
+            rs_20d,
+            rs_accel,
+        ) in enumerate(top_ranking)
+    ])
+
+    # Composite sheet: component audit columns on the ranking table
+    for col in cfg["extra_cols"]:
+        vals = []
+        for sym in ranking_df["symbol"]:
+            r = get_row(all_stocks[sym], as_of_date)
+            v = r.get(col, np.nan) if r is not None else np.nan
+            vals.append(round(float(v), 2) if not pd.isna(v) else "")
+        ranking_df[col] = vals
+
+    print(
+        f"\nTop {len(ranking_df)} {nm} Stocks "
+        "(Rank 1 = Strongest):"
+    )
+
+    print(ranking_df.to_string(index=False))
+
+    trading_days = bench_close.index[
+        bench_close.index <= as_of_date
+    ]
+
+    trading_days_window = trading_days[-RS_LINE_WINDOW:]
+    trading_days_window_1y = trading_days[-EQUITY_1Y_WINDOW:]
+
+    if len(trading_days_window) < RS_LINE_WINDOW:
+        print(
+            f"\nWARNING: only "
+            f"{len(trading_days_window)} "
+            "trading days of benchmark history "
+            "available; chart window shortened."
+        )
+
+    if len(trading_days_window_1y) < EQUITY_1Y_WINDOW:
+        print(
+            f"\nWARNING: only "
+            f"{len(trading_days_window_1y)} "
+            "trading days of benchmark history "
+            "available; 1-year equity window shortened."
+        )
+
+    print(
+        f"\nComputing daily rank across "
+        f"{len(trading_days)} days "
+        "(drives price line coloring, rank percentile, audit column, "
+        "and all Top10 equity curves + avg score overlay)..."
+    )
+
+    rank_maps, avg_rs_series = compute_daily_rank_maps(
+        all_stocks,
+        trading_days,
+        TOP10_N
+    )
+
+    equity_index = compute_top10_equity_curve(
+        all_stocks,
+        rank_maps,
+        trading_days,
+        TOP10_N
+    )
+
+    avg_col = cfg["avg_col"]
+
+    # 50-day: raw equity curve, rebased %, no SMA overlays.
+    equity_table_50d = build_top10_equity_table(
+        equity_index,
+        trading_days_window,
+        avg_rs_series,
+        include_sma=False,
+        rebase_pct=True,
+        avg_col_name=avg_col
+    )
+
+    # 1-year: rebased %, full 20/50/200 SMA overlays.
+    equity_table_1y = build_top10_equity_table(
+        equity_index,
+        trading_days_window_1y,
+        avg_rs_series,
+        include_sma=True,
+        rebase_pct=True,
+        avg_col_name=avg_col
+    )
+
+    # Full history: RAW equity index (log-scale-safe), SMAs retained.
+    equity_table_full = build_top10_equity_table(
+        equity_index,
+        trading_days,
+        avg_rs_series,
+        include_sma=True,
+        rebase_pct=False,
+        avg_col_name=avg_col
+    )
+
+    for tbl, label in (
+        (equity_table_50d, "50-day"),
+        (equity_table_1y, "1-year"),
+        (equity_table_full, "full history"),
+    ):
+        if tbl is None:
+            print(
+                f"\nTop10 equity curve ({label}): skipped -- not enough "
+                f"history yet for a full Top {TOP10_N} portfolio "
+                f"(plus {max(EQUITY_SMA_PERIODS)}-day SMA warmup where "
+                "applicable). Resolves itself as data accumulates."
+            )
+        else:
+            print(
+                f"Top10 equity curve ({label}) built: "
+                f"{len(tbl)} days displayed."
+            )
+
+    stock_series_list = []
+    skipped_symbols = []
+    skip_reasons = {}
+    fill_notes = {}
+
+    for i, (
+        sym,
+        rs,
+        price,
+        avg_vol,
+        rs_20d,
+        rs_accel,
+    ) in enumerate(top_ranking):
+
+        rank = i + 1
+
+        series_df, note = build_stock_series(
+            all_stocks,
+            sym,
+            trading_days_window,
+            rank_maps,
+            extra_audit_cols=cfg["extra_cols"]
+        )
+
+        if series_df is None:
+            skipped_symbols.append(sym)
+            skip_reasons[sym] = note
+            continue
+
+        stock_series_list.append(
+            (rank, sym, series_df)
+        )
+
+        if note:
+            fill_notes[sym] = note
+
+    print(
+        f"\nCharted "
+        f"{len(stock_series_list)}/"
+        f"{len(top_ranking)} stocks "
+        f"({len(skipped_symbols)} truly unplottable -- "
+        f"no valid price data at all in the window):"
+    )
+    for sym in skipped_symbols:
+        print(f"  {sym}: {skip_reasons.get(sym, 'unknown reason')}")
+
+    if fill_notes:
+        print(
+            f"\n{len(fill_notes)} stock(s) had no-trade/circuit days "
+            "carried forward from the last available price:"
+        )
+        for sym, note in fill_notes.items():
+            print(f"  {sym}: {note}")
+
+    write_to_sheet(
+        cfg,
+        ranking_df,
+        stock_series_list,
+        skipped_symbols,
+        as_of_date.strftime("%Y-%m-%d"),
+        equity_table_50d,
+        equity_table_1y,
+        equity_table_full,
+        skip_reasons
+    )
+
+    ranking_df.to_csv(
+        f"{cfg['csv_prefix']}_Ranking.csv",
+        index=False
+    )
+
+    for rank, symbol, df in stock_series_list:
+        df.to_csv(
+            f"{cfg['csv_prefix']}_Stock_{rank:02d}_{symbol}.csv",
+            index=False
+        )
+
+    print(f"\n{nm} CSV files also saved.")
+    print(f"\n{nm} SCREENER COMPLETED SUCCESSFULLY.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
     tickers = load_tickers()
+    industry_map = load_industry_map()
 
     print(f"\nLoaded {len(tickers)} tickers.")
+    print(
+        f"Industry tags loaded: {len(industry_map)} "
+        "(used by Composite sheet only)"
+    )
 
     bench_close = download_benchmark()
     bench_close.index = normalize_dates(
@@ -1806,310 +2084,42 @@ def main():
             "No usable stock data."
         )
 
-    latest_stock_date = max(
-        df.index.max()
-        for df in all_stocks.values()
-    )
+    as_of_date = determine_as_of_date(all_stocks, bench_close)
 
-    as_of_date = min(
-        pd.Timestamp(
-            latest_stock_date
-        ).normalize(),
-        pd.Timestamp(
-            bench_close.index.max()
-        ).normalize()
-    )
+    # ---- Sheet 1: RS Top 50 (unchanged logic) ----
+    run_screener(all_stocks, bench_close, as_of_date, RS_CFG)
 
-    if STRICT_SETTLED_CLOSE:
-        today = pd.Timestamp.today().normalize()
+    # ---- Sheet 2: Composite Top 50 ----
+    # Isolated so a composite failure can never undo/skip the RS sheet.
+    if ENABLE_COMPOSITE:
+        composite_error = None
+        try:
+            time.sleep(BETWEEN_SHEETS_PAUSE_SECONDS)
 
-        if as_of_date == today:
-            prior_days = bench_close.index[bench_close.index < today]
+            print("\nBuilding composite scores (RS + Acc/Dis + Group)...")
+            comp_stocks, info = build_composite_stocks(
+                all_stocks,
+                industry_map
+            )
+            print(f"Composite formula: {info['formula']}")
 
-            if len(prior_days) > 0:
-                settled_as_of_date = prior_days.max()
-                print(
-                    f"\nNOTE: today ({today:%Y-%m-%d}) is still live/"
-                    "intraday -- its Close is a moving price, not a "
-                    "settled one, so ranking off it would reshuffle "
-                    "between re-runs. Ranking off the last SETTLED "
-                    f"close instead: {settled_as_of_date:%Y-%m-%d}. "
-                    "Set STRICT_SETTLED_CLOSE = False to rank off "
-                    "today's live price anyway."
-                )
-                as_of_date = settled_as_of_date
-            else:
-                print(
-                    "\nWARNING: today is the only available trading "
-                    "day and STRICT_SETTLED_CLOSE is on, but there's "
-                    "no prior settled day to fall back to -- ranking "
-                    "off today's live price anyway."
-                )
+            run_screener(
+                comp_stocks,
+                bench_close,
+                as_of_date,
+                make_composite_cfg(info)
+            )
 
-    print(
-        f"\nAs-of date: "
-        f"{as_of_date:%Y-%m-%d}"
-    )
+        except Exception as e:
+            composite_error = e
+            print()
+            print("=" * 70)
+            print("COMPOSITE SCREENER FAILED (RS sheet already written)")
+            print("=" * 70)
+            print(f"{type(e).__name__}: {e}")
 
-    ranking = build_ranking(
-        all_stocks,
-        as_of_date
-    )
-
-    print(
-        f"Eligible universe: "
-        f"{len(ranking)} stocks"
-    )
-
-    if not ranking:
-        raise RuntimeError(
-            "No eligible stocks on the as-of date."
-        )
-
-    top_ranking = ranking[:TOP_N]
-
-    ranking_df = pd.DataFrame([
-        {
-            "rank": i + 1,
-            "symbol": sym,
-            "rs_score_pct": round(rs, 2),
-            "price": round(price, 2),
-            "avg_volume_20d": round(avg_vol, 0),
-            "rs_score_20d": round(rs_20d, 2) if not pd.isna(rs_20d) else "",
-            "rs_accel_20d": round(rs_accel, 2) if not pd.isna(rs_accel) else "",
-        }
-        for i, (
-            sym,
-            rs,
-            price,
-            avg_vol,
-            rs_20d,
-            rs_accel,
-        ) in enumerate(top_ranking)
-    ])
-
-    print(
-        f"\nTop {len(ranking_df)} RS Stocks "
-        "(Rank 1 = Strongest):"
-    )
-
-    print(
-        ranking_df.to_string(index=False)
-    )
-
-    trading_days = bench_close.index[
-        bench_close.index <= as_of_date
-    ]
-
-    trading_days_window = trading_days[
-        -RS_LINE_WINDOW:
-    ]
-
-    trading_days_window_1y = trading_days[
-        -EQUITY_1Y_WINDOW:
-    ]
-
-    if len(trading_days_window) < RS_LINE_WINDOW:
-        print(
-            f"\nWARNING: only "
-            f"{len(trading_days_window)} "
-            "trading days of benchmark history "
-            "available; chart window shortened."
-        )
-
-    if len(trading_days_window_1y) < EQUITY_1Y_WINDOW:
-        print(
-            f"\nWARNING: only "
-            f"{len(trading_days_window_1y)} "
-            "trading days of benchmark history "
-            "available; 1-year equity window shortened."
-        )
-
-    print(
-        f"\nComputing daily rank across "
-        f"{len(trading_days)} days "
-        "(drives price line coloring, RS percentile, audit column, "
-        "and both Top10 equity curves + avg RS overlay)..."
-    )
-
-    rank_maps, avg_rs_series = compute_daily_rank_maps(
-        all_stocks,
-        trading_days,
-        TOP10_N
-    )
-
-    equity_index = compute_top10_equity_curve(
-        all_stocks,
-        rank_maps,
-        trading_days,
-        TOP10_N
-    )
-
-    # 50-day window: raw equity curve only, rebased %, no SMA overlays
-    # (the 20/50/200-day SMAs don't fit meaningfully inside a 50-day
-    # display window, and this window is too short for log scale to
-    # add anything over linear).
-    equity_table_50d = build_top10_equity_table(
-        equity_index,
-        trading_days_window,
-        avg_rs_series,
-        include_sma=False,
-        rebase_pct=True
-    )
-
-    # 1-year window: rebased %, full 20/50/200 SMA overlays retained.
-    # Left as rebased % (not log-safe) deliberately -- 252 days rarely
-    # spans enough orders of magnitude for log scale to matter, so
-    # forcing it here would be a manual-toggle chore for no real gain.
-    equity_table_1y = build_top10_equity_table(
-        equity_index,
-        trading_days_window_1y,
-        avg_rs_series,
-        include_sma=True,
-        rebase_pct=True
-    )
-
-    # Full-history window: every trading day the benchmark has, not a
-    # trailing slice -- naturally bounded by however far back the
-    # Top 10 portfolio can actually be formed (build_top10_equity_table
-    # returns None / truncates via equity_index.reindex if there's no
-    # data yet for early days), so this comes out close to
-    # DOWNLOAD_YEARS without needing a separate window constant.
-    # SMA overlays retained. rebase_pct=False: multi-year compounding
-    # is exactly where log scale earns its keep (equal % moves get
-    # equal visual weight regardless of era), and log scale requires
-    # a strictly positive series -- the raw equity index (cumprod
-    # base=100) satisfies that where the rebased % series would not.
-    equity_table_full = build_top10_equity_table(
-        equity_index,
-        trading_days,
-        avg_rs_series,
-        include_sma=True,
-        rebase_pct=False
-    )
-
-    if equity_table_50d is None:
-        print(
-            "\nTop10 equity curve (50-day): skipped -- not enough "
-            f"history yet for a full Top {TOP10_N} portfolio. "
-            "This resolves itself as more days of data accumulate."
-        )
-    else:
-        print(
-            f"\nTop10 equity curve (50-day) built: "
-            f"{len(equity_index)} days of history, "
-            f"{len(equity_table_50d)} days displayed (no SMA overlays)."
-        )
-
-    if equity_table_1y is None:
-        print(
-            "\nTop10 equity curve (1-year): skipped -- not enough "
-            f"history yet for a full Top {TOP10_N} portfolio plus "
-            f"{max(EQUITY_SMA_PERIODS)}-day SMA warmup over a "
-            f"{EQUITY_1Y_WINDOW}-day window. This resolves itself as "
-            "more days of data accumulate."
-        )
-    else:
-        print(
-            f"Top10 equity curve (1-year) built: "
-            f"{len(equity_table_1y)} days displayed."
-        )
-
-    if equity_table_full is None:
-        print(
-            "\nTop10 equity curve (full history): skipped -- not "
-            f"enough history yet for a full Top {TOP10_N} portfolio "
-            f"plus {max(EQUITY_SMA_PERIODS)}-day SMA warmup. This "
-            "resolves itself as more days of data accumulate."
-        )
-    else:
-        print(
-            f"Top10 equity curve (full history) built: "
-            f"{len(equity_table_full)} days displayed "
-            f"(~{len(equity_table_full) / 252:.1f} years). Plotted as "
-            "a raw equity index (base=100), not rebased % -- check "
-            "Customize > Vertical axis > Log scale on that chart in "
-            "Sheets after this run if you want the log view; the API "
-            "can't set it and the chart is rebuilt every run."
-        )
-
-    stock_series_list = []
-    skipped_symbols = []
-    skip_reasons = {}
-    fill_notes = {}
-
-    for i, (
-        sym,
-        rs,
-        price,
-        avg_vol,
-        rs_20d,
-        rs_accel,
-    ) in enumerate(top_ranking):
-
-        rank = i + 1
-
-        series_df, note = build_stock_series(
-            all_stocks,
-            sym,
-            trading_days_window,
-            rank_maps
-        )
-
-        if series_df is None:
-            skipped_symbols.append(sym)
-            skip_reasons[sym] = note
-            continue
-
-        stock_series_list.append(
-            (rank, sym, series_df)
-        )
-
-        if note:
-            fill_notes[sym] = note
-
-    print(
-        f"\nCharted "
-        f"{len(stock_series_list)}/"
-        f"{len(top_ranking)} stocks "
-        f"({len(skipped_symbols)} truly unplottable -- "
-        f"no valid price data at all in the window):"
-    )
-    for sym in skipped_symbols:
-        print(f"  {sym}: {skip_reasons.get(sym, 'unknown reason')}")
-
-    if fill_notes:
-        print(
-            f"\n{len(fill_notes)} stock(s) had no-trade/circuit days "
-            "carried forward from the last available price:"
-        )
-        for sym, note in fill_notes.items():
-            print(f"  {sym}: {note}")
-
-    write_to_sheet(
-        ranking_df,
-        stock_series_list,
-        skipped_symbols,
-        as_of_date.strftime("%Y-%m-%d"),
-        equity_table_50d,
-        equity_table_1y,
-        equity_table_full,
-        skip_reasons
-    )
-
-    ranking_df.to_csv(
-        "RS_Top50_Ranking.csv",
-        index=False
-    )
-
-    for rank, symbol, df in stock_series_list:
-        df.to_csv(
-            f"RS_Top50_Stock_{rank:02d}_{symbol}.csv",
-            index=False
-        )
-
-    print("\nCSV files also saved.")
-    print("\nSCREENER COMPLETED SUCCESSFULLY.")
+        if composite_error is not None:
+            raise composite_error
 
 
 if __name__ == "__main__":
