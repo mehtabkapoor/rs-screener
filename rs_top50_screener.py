@@ -1,5 +1,6 @@
 """
 RS TOP 50 SCREENER -- INDIVIDUAL RS LINE + PRICE CHARTS
+(TWO-UNIVERSE VERSION: runs code.csv and code1.csv, one sheet tab each)
 
 WHAT THIS DOES (single snapshot, not a backtest)
   1. Downloads price/volume history for the stock universe + benchmark.
@@ -89,6 +90,14 @@ WHAT THIS DOES (single snapshot, not a backtest)
      rank. Nothing downstream (Top N cut, equity curve, charts'
      series count) reacts to these values.
 
+  TWO-UNIVERSE RUN: the UNIVERSES list in the config runs the whole
+  pipeline once per universe file (code.csv, then code1.csv). Each
+  universe is written to its OWN worksheet tab in the same Google
+  Sheet, and its own set of CSV files (tagged with the universe tag
+  so the two runs never overwrite each other). The benchmark is
+  downloaded once and shared. If one universe fails, the other still
+  runs, and the failure is listed in the final summary.
+
 This is a screener, not a trading system.
 """
 
@@ -111,7 +120,32 @@ from google.oauth2.service_account import Credentials
 BENCHMARK = "^CRSLDX"
 BENCHMARK_FALLBACK = "^NSEI"
 
-STOCKS_FILE = "stocks.csv"
+# Universes to run, in order. Each entry:
+#   file      -> CSV with the symbols (column 'symbol'/'ticker'/'name'/
+#                'code', else the first column is used)
+#   label     -> display name used in titles/banners
+#   worksheet -> Google Sheets tab name for this universe
+#   tag       -> short tag used in output CSV filenames
+# NOTE: on Linux / GitHub Actions filenames are case-sensitive, so
+# "code.csv" and "CODE.csv" are different files.
+UNIVERSES = [
+    {
+        "file": "code.csv",
+        "label": "Code",
+        "worksheet": "Screener - RS Top50 - Code",
+        "tag": "Code",
+    },
+    {
+        "file": "code1.csv",
+        "label": "Total Market",
+        "worksheet": "Screener - RS Top50 - Total Market",
+        "tag": "TotalMarket",
+    },
+]
+
+# Pause between universes (seconds) so the second sheet write doesn't
+# land in the same Google Sheets quota window as the first.
+UNIVERSE_PAUSE_SECONDS = 20
 
 DOWNLOAD_YEARS = 3  # bumped from 2: RS_12M lookback (252d) + 200-day SMA
                      # warmup + 50-day display window needs ~500+ trading
@@ -212,7 +246,6 @@ CHART_BATCH_PAUSE_SECONDS = 2
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
-SCREENER_WORKSHEET = "Screener - RS Top50"
 
 # If the most recent available bar is TODAY and the market is still live,
 # yfinance's "Close" for today is a moving intraday price, not a settled
@@ -244,16 +277,22 @@ def normalize_series_index(series):
     return s[~s.index.duplicated(keep="last")].sort_index()
 
 
-def load_tickers():
-    if not os.path.exists(STOCKS_FILE):
-        raise FileNotFoundError(f"Could not find {STOCKS_FILE}")
+def load_tickers(stocks_file):
+    if not os.path.exists(stocks_file):
+        raise FileNotFoundError(f"Could not find {stocks_file}")
 
-    df = pd.read_csv(STOCKS_FILE)
-    if "symbol" not in df.columns:
-        raise ValueError("stocks.csv must contain a column named 'symbol'.")
+    df = pd.read_csv(stocks_file)
 
-    symbols = df["symbol"].dropna().astype(str).str.strip().tolist()
-    symbols = [s for s in symbols if s]
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    for key in ("symbol", "ticker", "name", "code"):
+        if key in cols:
+            col = cols[key]
+            break
+    else:
+        col = df.columns[0]   # fallback: first column
+
+    symbols = df[col].dropna().astype(str).str.strip().str.upper().tolist()
+    symbols = [s for s in symbols if s and s.lower() != "symbol"]
 
     output = [s if s.endswith(".NS") else s + ".NS" for s in symbols]
     return list(dict.fromkeys(output))
@@ -1142,10 +1181,16 @@ def write_to_sheet(
     equity_table_50d=None,
     equity_table_1y=None,
     equity_table_full=None,
-    skip_reasons=None
+    skip_reasons=None,
+    universe_label="",
+    worksheet_name="Screener - RS Top50",
+    csv_tag=""
 ):
     sheet_id = os.environ.get(SHEET_ID_ENV)
     creds_json = os.environ.get(CREDS_ENV)
+
+    csv_prefix_rank = f"RS_Top50_{csv_tag}_" if csv_tag else "RS_Top50_"
+    csv_prefix_eq = f"RS_Top10_{csv_tag}_" if csv_tag else "RS_Top10_"
 
     if not sheet_id or not creds_json:
         print(
@@ -1154,31 +1199,31 @@ def write_to_sheet(
         )
 
         ranking_df.to_csv(
-            "RS_Top50_Ranking.csv",
+            f"{csv_prefix_rank}Ranking.csv",
             index=False
         )
 
         if equity_table_50d is not None:
             equity_table_50d.to_csv(
-                "RS_Top10_Equity_Curve_50d.csv",
+                f"{csv_prefix_eq}Equity_Curve_50d.csv",
                 index=False
             )
 
         if equity_table_1y is not None:
             equity_table_1y.to_csv(
-                "RS_Top10_Equity_Curve_1y.csv",
+                f"{csv_prefix_eq}Equity_Curve_1y.csv",
                 index=False
             )
 
         if equity_table_full is not None:
             equity_table_full.to_csv(
-                "RS_Top10_Equity_Curve_full.csv",
+                f"{csv_prefix_eq}Equity_Curve_full.csv",
                 index=False
             )
 
         for rank, symbol, df in stock_series_list:
             df.to_csv(
-                f"RS_Top50_Stock_{rank:02d}_{symbol}.csv",
+                f"{csv_prefix_rank}Stock_{rank:02d}_{symbol}.csv",
                 index=False
             )
 
@@ -1244,7 +1289,7 @@ def write_to_sheet(
     ws = call_with_quota_retry(
         lambda: get_or_create_worksheet(
             sh,
-            SCREENER_WORKSHEET,
+            worksheet_name,
             rows=n_rows_needed,
             cols=n_cols_needed
         ),
@@ -1306,7 +1351,7 @@ def write_to_sheet(
     next_chart_anchor_row = 0
 
     add_row(left=[
-        f"RS TOP {TOP_N} SCREENER | "
+        f"RS TOP {TOP_N} SCREENER - {universe_label.upper()} | "
         f"run {timestamp} | "
         f"As of: {as_of_date} | "
         f"RS Formula: 40% 3M + 20% 6M + "
@@ -1614,7 +1659,7 @@ def write_to_sheet(
 
     print(
         f"\nScreener results written to "
-        f"'{SCREENER_WORKSHEET}' tab: "
+        f"'{worksheet_name}' tab: "
         f"{len(ranking_df)} ranked stocks, "
         f"{len(chart_requests) - len(failed_charts)}/"
         f"{len(chart_requests)} charts added."
@@ -1630,16 +1675,23 @@ def write_to_sheet(
 
 
 # ============================================================
-# MAIN
+# ONE UNIVERSE RUN
 # ============================================================
 
-def main():
+def run_universe(universe, bench_close):
+    stocks_file = universe["file"]
+    universe_label = universe["label"]
+    worksheet_name = universe["worksheet"]
+    csv_tag = universe["tag"]
+
     print()
     print("=" * 70)
     print(
-        f"RS TOP {TOP_N} SCREENER -- "
+        f"RS TOP {TOP_N} SCREENER ({universe_label}) -- "
         "INDIVIDUAL RS LINE + PRICE CHARTS"
     )
+    print(f"Universe file  : {stocks_file}")
+    print(f"Worksheet tab  : {worksheet_name}")
     print("=" * 70)
 
     print(
@@ -1677,14 +1729,9 @@ def main():
 
     print("=" * 70)
 
-    tickers = load_tickers()
+    tickers = load_tickers(stocks_file)
 
-    print(f"\nLoaded {len(tickers)} tickers.")
-
-    bench_close = download_benchmark()
-    bench_close.index = normalize_dates(
-        bench_close.index
-    )
+    print(f"\nLoaded {len(tickers)} tickers from {stocks_file}.")
 
     all_stocks = {}
     total_bad_points = 0
@@ -2094,27 +2141,79 @@ def main():
         equity_table_50d,
         equity_table_1y,
         equity_table_full,
-        skip_reasons
+        skip_reasons,
+        universe_label=universe_label,
+        worksheet_name=worksheet_name,
+        csv_tag=csv_tag
     )
 
     ranking_df.to_csv(
-        "RS_Top50_Ranking.csv",
+        f"RS_Top50_{csv_tag}_Ranking.csv",
         index=False
     )
 
     for rank, symbol, df in stock_series_list:
         df.to_csv(
-            f"RS_Top50_Stock_{rank:02d}_{symbol}.csv",
+            f"RS_Top50_{csv_tag}_Stock_{rank:02d}_{symbol}.csv",
             index=False
         )
 
-    print("\nCSV files also saved.")
-    print("\nSCREENER COMPLETED SUCCESSFULLY.")
+    print(f"\nCSV files also saved (tag: {csv_tag}).")
+    print(f"\nSCREENER COMPLETED SUCCESSFULLY ({universe_label}).")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    # Benchmark is downloaded ONCE and shared by every universe.
+    bench_close = download_benchmark()
+    bench_close.index = normalize_dates(
+        bench_close.index
+    )
+
+    results = {}
+
+    for n, universe in enumerate(UNIVERSES):
+        label = universe["label"]
+
+        try:
+            run_universe(universe, bench_close)
+            results[label] = "OK"
+
+        except Exception as e:
+            print()
+            print("=" * 70)
+            print(f"SCREENER FAILED ({label})")
+            print("=" * 70)
+            print(f"{type(e).__name__}: {e}")
+            results[label] = f"FAILED: {type(e).__name__}: {e}"
+
+        if n < len(UNIVERSES) - 1:
+            print(
+                f"\nPausing {UNIVERSE_PAUSE_SECONDS}s before the next "
+                "universe (Sheets quota cool-down)..."
+            )
+            time.sleep(UNIVERSE_PAUSE_SECONDS)
+
+    print()
+    print("=" * 70)
+    print("RUN SUMMARY")
+    print("=" * 70)
+    for u in UNIVERSES:
+        print(f"  {u['label']:<15} ({u['file']}): {results.get(u['label'])}")
+
+    if any(v != "OK" for v in results.values()):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
     try:
         main()
+
+    except SystemExit:
+        raise
 
     except Exception as e:
         print()
