@@ -16,7 +16,7 @@ LIQUIDITY
 ELIGIBILITY
 -----------
 NONE. No Price Trend Template. No RS Trend Template. Every stock in
-stocks.csv that clears the two tradability floors above gets an RS
+code.csv that clears the two tradability floors above gets an RS
 score and a rank. That's the entire eligible pool.
 
 RS
@@ -101,7 +101,7 @@ BENCHMARK_FALLBACK = "^NSEI"
 LOOKBACK_DAYS = 250
 HISTORY_PERIOD = "15mo"
 
-STOCKS_FILE = "stocks.csv"
+STOCKS_FILE = "code.csv"
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
