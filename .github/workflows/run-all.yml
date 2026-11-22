@@ -1,0 +1,112 @@
+name: Run All (screeners + backtests)
+
+on:
+  schedule:
+    # Mon-Fri, UTC times (IST = UTC + 5:30)
+    - cron: '30 3 * * 1-5'    #  9:00 AM IST  preview
+    - cron: '30 6 * * 1-5'    # 12:00 PM IST  preview
+    - cron: '30 9 * * 1-5'    #  3:00 PM IST  preview
+    - cron: '30 11 * * 1-5'   #  5:00 PM IST  EOD (must equal EOD_CRON in screener_top10.py)
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'What to run'
+        type: choice
+        options: [all, top10, top50, backtests]
+        default: all
+      force_eod:
+        description: 'Top 10: real EOD mode (updates Portfolio/Holdings) instead of preview'
+        type: boolean
+        default: false
+      only:
+        description: 'Backtests: optional subset, e.g. "s1 s4" (blank = all)'
+        required: false
+        default: ''
+
+# One run at a time; a new trigger waits for the current one to finish.
+concurrency:
+  group: run-all
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Kolkata                 # Sheet timestamps in IST
+  PIP_NO_CACHE_DIR: '1'            # fresh install every run, no cache
+  SHEET_ID: ${{ secrets.SHEET_ID }}
+  GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+# Jobs run one after another (not in parallel) to stay inside the
+# Google Sheets write quota. A failure in one does not stop the next.
+jobs:
+  top10:
+    if: github.event_name == 'schedule' || inputs.run == 'all' || inputs.run == 'top10'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Screener - Top 10
+        env:
+          FORCE_EOD: ${{ inputs.force_eod || false }}
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+        run: python screener_top10.py
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: top10-output
+          path: '*.csv'
+          if-no-files-found: ignore
+          retention-days: 14
+
+  top50:
+    needs: top10
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || inputs.run == 'all' || inputs.run == 'top50') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Screener - Top 50
+        run: python screener_top50.py
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: top50-output
+          path: '*.csv'
+          if-no-files-found: ignore
+          retention-days: 14
+
+  backtests:
+    needs: top50
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || inputs.run == 'all' || inputs.run == 'backtests') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Backtests
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          if [ -n "$ONLY" ]; then
+            python backtest_all.py --only $ONLY
+          else
+            python backtest_all.py
+          fi
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: backtest-output
+          path: |
+            *.csv
+            backtest_outputs/
+          if-no-files-found: ignore
+          retention-days: 30
