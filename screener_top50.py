@@ -1,6 +1,6 @@
 """
 RS TOP 50 SCREENER -- INDIVIDUAL RS LINE + PRICE CHARTS
-(TWO-UNIVERSE VERSION: runs code.csv and code1.csv, one sheet tab each)
+(TWO-UNIVERSE VERSION: runs universe/core.csv and universe/total_market.csv, one sheet tab each)
 
 WHAT THIS DOES (single snapshot, not a backtest)
   1. Downloads price/volume history for the stock universe + benchmark.
@@ -91,7 +91,7 @@ WHAT THIS DOES (single snapshot, not a backtest)
      series count) reacts to these values.
 
   TWO-UNIVERSE RUN: the UNIVERSES list in the config runs the whole
-  pipeline once per universe file (code.csv, then code1.csv). Each
+  pipeline once per universe file (universe/core.csv, then universe/total_market.csv). Each
   universe is written to its OWN worksheet tab in the same Google
   Sheet, and its own set of CSV files (tagged with the universe tag
   so the two runs never overwrite each other). The benchmark is
@@ -130,13 +130,13 @@ BENCHMARK_FALLBACK = "^NSEI"
 # "code.csv" and "CODE.csv" are different files.
 UNIVERSES = [
     {
-        "file": "code.csv",
-        "label": "Code",
+        "file": "universe/core.csv",
+        "label": "Core",
         "worksheet": "Screener - RS Top50 - Code",
         "tag": "Code",
     },
     {
-        "file": "code1.csv",
+        "file": "universe/total_market.csv",
         "label": "Total Market",
         "worksheet": "Screener - RS Top50 - Total Market",
         "tag": "TotalMarket",
@@ -1842,6 +1842,15 @@ def run_universe(universe, bench_close):
         f"\nStocks with usable data: "
         f"{len(all_stocks)}"
     )
+
+    no_data = sorted(
+        {t.replace(".NS", "") for t in tickers} - set(all_stocks)
+    )
+    if no_data:
+        print(
+            f"No usable data ({len(no_data)}) -- check/replace in "
+            f"{stocks_file}: {', '.join(no_data)}"
+        )
 
     print(
         f"Repaired data points: "

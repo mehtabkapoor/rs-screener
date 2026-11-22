@@ -37,7 +37,7 @@ from google.oauth2.service_account import Credentials
 BENCHMARK = "^CRSLDX"
 BENCHMARK_FALLBACK = "^NSEI"
 
-STOCKS_FILE = "stocks.csv"
+STOCKS_FILE = "universe/core.csv"
 
 BACKTEST_START = "2016-04-01"
 BACKTEST_END = None  # None = latest available market data
@@ -125,7 +125,7 @@ def load_tickers():
 
     df = pd.read_csv(STOCKS_FILE)
     if "symbol" not in df.columns:
-        raise ValueError("stocks.csv must contain a column named 'symbol'.")
+        raise ValueError("universe/core.csv must contain a column named 'symbol'.")
 
     symbols = df["symbol"].dropna().astype(str).str.strip().tolist()
     symbols = [s for s in symbols if s]

@@ -16,7 +16,7 @@ LIQUIDITY
 ELIGIBILITY
 -----------
 NONE. No Price Trend Template. No RS Trend Template. Every stock in
-code.csv that clears the two tradability floors above gets an RS
+universe/core.csv that clears the two tradability floors above gets an RS
 score and a rank. That's the entire eligible pool.
 
 RS
@@ -101,7 +101,7 @@ BENCHMARK_FALLBACK = "^NSEI"
 LOOKBACK_DAYS = 250
 HISTORY_PERIOD = "15mo"
 
-STOCKS_FILE = "code.csv"
+STOCKS_FILE = "universe/core.csv"
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
@@ -308,6 +308,7 @@ def main():
     bench_close = download_benchmark(run_mode)
 
     all_stocks = []
+    no_data = []
     batch_size = 50
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
@@ -327,6 +328,7 @@ def main():
                 close = normalize_series_index(sdata["Close"].dropna())
                 volume = normalize_series_index(sdata["Volume"].dropna())
                 if close.empty or len(close) < LOOKBACK_DAYS + 2:
+                    no_data.append(symbol.replace(".NS", ""))
                     continue
                 if run_mode == "PREVIEW":
                     close = append_preview_price(close, intraday_batch_prices.get(symbol))
@@ -360,6 +362,10 @@ def main():
                 print(f"Skipping {symbol}: {e}")
                 continue
         time.sleep(1)
+
+    if no_data:
+        print(f"No usable data ({len(no_data)}) -- check/replace in "
+              f"{STOCKS_FILE}: {', '.join(sorted(no_data))}")
 
     if not all_stocks:
         print("No stocks with sufficient data found.")

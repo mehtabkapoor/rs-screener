@@ -27,11 +27,11 @@ STRATEGIES
 
 USAGE
 -----
-    python rs_backtests_combined.py                # run all
-    python rs_backtests_combined.py --only s1 s4   # run a subset
+    python backtest_all.py                # run all
+    python backtest_all.py --only s1 s4   # run a subset
 
 Env: SHEET_ID, GOOGLE_CREDENTIALS  (missing -> CSVs in ./backtest_outputs)
-Input: stocks.csv with a 'symbol' column.
+Input: universe/core.csv with a 'symbol' column.
 """
 
 import os
@@ -52,7 +52,7 @@ import pandas as pd
 
 BENCHMARK = "^CRSLDX"
 BENCHMARK_FALLBACK = "^NSEI"
-STOCKS_FILE = "stocks.csv"
+STOCKS_FILE = "universe/core.csv"
 
 BACKTEST_START = "2016-04-01"
 BACKTEST_END = None            # None = latest available
@@ -142,7 +142,7 @@ def load_tickers():
         raise FileNotFoundError(f"Could not find {STOCKS_FILE}")
     df = pd.read_csv(STOCKS_FILE)
     if "symbol" not in df.columns:
-        raise ValueError("stocks.csv must contain a column named 'symbol'.")
+        raise ValueError("universe/core.csv must contain a column named 'symbol'.")
     symbols = [s for s in df["symbol"].dropna().astype(str).str.strip().tolist() if s]
     out = [s if s.endswith(".NS") else s + ".NS" for s in symbols]
     return list(dict.fromkeys(out))
@@ -1030,6 +1030,10 @@ def main(only):
                 print(f"Skipping {sym}: {e}")
         time.sleep(1)
 
+    no_data = sorted({t.replace(".NS", "") for t in tickers} - set(store["s2"]))
+    if no_data:
+        print(f"No usable data ({len(no_data)}) -- check/replace in "
+              f"{STOCKS_FILE}: {', '.join(no_data)}")
     print(f"\nUsable stocks - s1: {len(store['s1'])} | s2: {len(store['s2'])} | "
           f"s4: {len(store['s4'])} | repaired points: {bad_total}")
     if not store["p2"]:
