@@ -45,6 +45,7 @@ def migrate_tabs(sh):
     except Exception as e:
         print(f"Tab migration skipped (could not list tabs): {e}")
         return
+    print(f"Sheet tabs: {list(titles)}")
     for old, new in _RENAMES.items():
         if old in titles and new not in titles:
             try:
