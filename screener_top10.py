@@ -364,7 +364,7 @@ def main():
         time.sleep(1)
 
     if no_data:
-        print(f"No usable data ({len(no_data)}) -- check/replace in "
+        print(f"No data / <1yr history, skipped ({len(no_data)}) -- new listings fill in automatically; replace only if delisted/renamed. File "
               f"{STOCKS_FILE}: {', '.join(sorted(no_data))}")
 
     if not all_stocks:

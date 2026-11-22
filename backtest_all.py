@@ -1032,7 +1032,7 @@ def main(only):
 
     no_data = sorted({t.replace(".NS", "") for t in tickers} - set(store["s2"]))
     if no_data:
-        print(f"No usable data ({len(no_data)}) -- check/replace in "
+        print(f"No data / <1yr history, skipped ({len(no_data)}) -- new listings fill in automatically; replace only if delisted/renamed. File "
               f"{STOCKS_FILE}: {', '.join(no_data)}")
     print(f"\nUsable stocks - s1: {len(store['s1'])} | s2: {len(store['s2'])} | "
           f"s4: {len(store['s4'])} | repaired points: {bad_total}")

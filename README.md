@@ -21,7 +21,7 @@ RS (relative-strength) momentum screeners and backtests for NSE stocks. Results 
 
 ## Editing stock lists
 
-Edit `universe/*.csv` (one `symbol` column, NSE symbols without `.NS`). Each run logs a `No usable data (...)` line naming symbols Yahoo returned nothing for — replace those (renamed or delisted).
+Edit `universe/*.csv` (one `symbol` column, NSE symbols without `.NS`). Each run logs a `No data / <1yr history, skipped` line. Mostly recent IPOs (need ~1 year of prices for the 12M RS) — they join automatically. Replace a symbol only if it was delisted or renamed.
 
 ## Conventions
 

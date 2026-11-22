@@ -1848,7 +1848,7 @@ def run_universe(universe, bench_close):
     )
     if no_data:
         print(
-            f"No usable data ({len(no_data)}) -- check/replace in "
+            f"No data / <1yr history, skipped ({len(no_data)}) -- new listings fill in automatically; replace only if delisted/renamed. File "
             f"{stocks_file}: {', '.join(no_data)}"
         )
 
