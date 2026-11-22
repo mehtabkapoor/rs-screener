@@ -16,7 +16,7 @@ LIQUIDITY
 ELIGIBILITY
 -----------
 NONE. No Price Trend Template. No RS Trend Template. Every stock in
-universe/core.csv that clears the two tradability floors above gets an RS
+universe/trend_template.csv that clears the two tradability floors above gets an RS
 score and a rank. That's the entire eligible pool.
 
 RS
@@ -85,6 +85,7 @@ import time
 import pandas as pd
 import yfinance as yf
 import gspread
+from sheet_tabs import *  # noqa: F401,F403  (tab names + migrate_tabs)
 from google.oauth2.service_account import Credentials
 import json
 import os
@@ -101,12 +102,12 @@ BENCHMARK_FALLBACK = "^NSEI"
 LOOKBACK_DAYS = 250
 HISTORY_PERIOD = "15mo"
 
-STOCKS_FILE = "universe/core.csv"
+STOCKS_FILE = "universe/trend_template.csv"
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
 
-WORKSHEET_NAME = "RS_Screener"
+WORKSHEET_NAME = TT_TOP10_SCREENER
 
 MIN_PRICE = 20
 MIN_AVG_VOLUME = 100_000
@@ -126,9 +127,9 @@ STCG_CESS = 0.04
 STCG_EFFECTIVE_RATE = STCG_RATE * (1 + STCG_CESS)
 
 EOD_CRON = "30 11 * * 1-5"
-HOLDINGS_WORKSHEET = "Holdings"
-PORTFOLIO_WORKSHEET = "Portfolio"
-CONFIG_WORKSHEET = "Config"
+HOLDINGS_WORKSHEET = TT_TOP10_HOLDINGS
+PORTFOLIO_WORKSHEET = TT_TOP10_PORTFOLIO
+CONFIG_WORKSHEET = TT_TOP10_CONFIG
 
 PORTFOLIO_HEADER = [
     "Action", "Executed", "Execution Price", "Symbol", "Rank",
@@ -400,7 +401,7 @@ def main():
     write_to_sheet(results_df, run_mode)
 
     if run_mode == "PREVIEW":
-        print("Preview mode: RS_Screener updated. Holdings/Portfolio untouched.")
+        print(f"Preview mode: {WORKSHEET_NAME} updated. Holdings/Portfolio untouched.")
         return
 
     build_portfolio(universe_df)
@@ -542,6 +543,7 @@ def build_portfolio(universe_df):
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
+    migrate_tabs(sh)
 
     capital = read_config(sh)
     apply_confirmed_executions(sh)
@@ -726,6 +728,7 @@ def write_to_sheet(df, run_mode="EOD"):
     n_cols_needed = len(df.columns) + 2 if len(df.columns) else 5
 
     sh = gc.open_by_key(sheet_id)
+    migrate_tabs(sh)
     ws = get_or_create_worksheet(sh, WORKSHEET_NAME, rows=n_rows_needed, cols=n_cols_needed)
     if ws.row_count < n_rows_needed or ws.col_count < n_cols_needed:
         ws.resize(rows=max(ws.row_count, n_rows_needed), cols=max(ws.col_count, n_cols_needed))

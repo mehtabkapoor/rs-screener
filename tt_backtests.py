@@ -4,40 +4,41 @@ RS BACKTESTS - COMBINED RUNNER
 ==============================
 
 One file, one data download, all strategies run in a single execution.
-Each strategy writes to its OWN Google Sheet tab; a "Backtest - Comparison"
+Each strategy writes to its OWN Google Sheet tab; a "Trend Template - Backtest Comparison"
 tab puts the headline metrics side by side.
 
 STRATEGIES
 ----------
- s1  "Backtest - RS Top10 + Price TT"
+ s1  "Trend Template - Backtest RS Top10 + Price TT"
      Eligible = Price>20, 20D avg vol>100k, Price Trend Template 7/7.
      Rank by raw RS (40% 3M + 20% 6M + 20% 9M + 20% 12M). Hold Top 10,
      equal-weight at entry, exit when rank > 15. Daily EOD, T+0.
      (= the THIRD backtest)
 
- s2  "Backtest - RS Top10"
+ s2  "Trend Template - Backtest RS Top10"
      Eligible = Price>20, 20D avg vol>100k. NO trend template.
      Hold exactly today's Top 10 RS. Sell on rank 11+. Freed cash funds
      all missing names; retained positions never resized. Daily EOD, T+0.
      (= the TOP-10 RS ROTATION backtest)
 
- s4  "Backtest - RAM Momentum"   (NEW - designed in this file)
+ s4  "Trend Template - Backtest RAM Momentum"   (NEW - designed in this file)
      Risk-Adjusted Momentum + regime filter + weekly rebalance.
      See the RAM STRATEGY block below for the full rule set.
 
 USAGE
 -----
-    python backtest_all.py                # run all
-    python backtest_all.py --only s1 s4   # run a subset
+    python tt_backtests.py                # run all
+    python tt_backtests.py --only s1 s4   # run a subset
 
 Env: SHEET_ID, GOOGLE_CREDENTIALS  (missing -> CSVs in ./backtest_outputs)
-Input: universe/core.csv with a 'symbol' column.
+Input: universe/trend_template.csv with a 'symbol' column.
 """
 
 import os
 import sys
 import json
 import time
+from sheet_tabs import *  # noqa: F401,F403  (tab names + migrate_tabs)
 import argparse
 import traceback
 from datetime import datetime
@@ -52,7 +53,7 @@ import pandas as pd
 
 BENCHMARK = "^CRSLDX"
 BENCHMARK_FALLBACK = "^NSEI"
-STOCKS_FILE = "universe/core.csv"
+STOCKS_FILE = "universe/trend_template.csv"
 
 BACKTEST_START = "2016-04-01"
 BACKTEST_END = None            # None = latest available
@@ -109,7 +110,7 @@ STCG_EFFECTIVE_RATE = STCG_RATE * (1 + STCG_CESS)
 
 SHEET_ID_ENV = "SHEET_ID"
 CREDS_ENV = "GOOGLE_CREDENTIALS"
-COMPARISON_SHEET = "Backtest - Comparison"
+COMPARISON_SHEET = TT_BT_COMPARISON
 
 
 # ============================================================
@@ -142,7 +143,7 @@ def load_tickers():
         raise FileNotFoundError(f"Could not find {STOCKS_FILE}")
     df = pd.read_csv(STOCKS_FILE)
     if "symbol" not in df.columns:
-        raise ValueError("universe/core.csv must contain a column named 'symbol'.")
+        raise ValueError("universe/trend_template.csv must contain a column named 'symbol'.")
     symbols = [s for s in df["symbol"].dropna().astype(str).str.strip().tolist() if s]
     out = [s if s.endswith(".NS") else s + ".NS" for s in symbols]
     return list(dict.fromkeys(out))
@@ -743,7 +744,7 @@ def summarize(trade_df, equity_df, open_df, marked, liq, meta):
 
 STRATEGIES = {
     "s1": {
-        "sheet": "Backtest - RS Top10 + Price TT",
+        "sheet": TT_BT_RS_TOP10_PRICE_TT,
         "label": "S1: RS Top10 + Price TT (exit rank>15)",
         "fn": run_s1,
         "rules": {
@@ -755,7 +756,7 @@ STRATEGIES = {
         },
     },
     "s2": {
-        "sheet": "Backtest - RS Top10",
+        "sheet": TT_BT_RS_TOP10,
         "label": "S2: Pure RS Top10 rotation",
         "fn": run_s2,
         "rules": {
@@ -767,7 +768,7 @@ STRATEGIES = {
         },
     },
     "s4": {
-        "sheet": "Backtest - RAM Momentum",
+        "sheet": TT_BT_RAM_MOMENTUM,
         "label": "S4: RAM (risk-adj momentum + regime)",
         "fn": run_s4,
         "rules": {
@@ -823,7 +824,9 @@ def open_spreadsheet():
     from google.oauth2.service_account import Credentials
     creds = Credentials.from_service_account_info(
         json.loads(creds_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return gspread.authorize(creds).open_by_key(sheet_id)
+    sh = gspread.authorize(creds).open_by_key(sheet_id)
+    migrate_tabs(sh)
+    return sh
 
 
 def get_or_create_ws(sh, title, rows=1000, cols=16):

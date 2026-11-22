@@ -1,6 +1,6 @@
 """
 RS TOP 50 SCREENER -- INDIVIDUAL RS LINE + PRICE CHARTS
-(TWO-UNIVERSE VERSION: runs universe/core.csv and universe/total_market.csv, one sheet tab each)
+(TWO-UNIVERSE VERSION: runs universe/trend_template.csv and universe/total_market.csv, one sheet tab each)
 
 WHAT THIS DOES (single snapshot, not a backtest)
   1. Downloads price/volume history for the stock universe + benchmark.
@@ -91,7 +91,7 @@ WHAT THIS DOES (single snapshot, not a backtest)
      series count) reacts to these values.
 
   TWO-UNIVERSE RUN: the UNIVERSES list in the config runs the whole
-  pipeline once per universe file (universe/core.csv, then universe/total_market.csv). Each
+  pipeline once per universe file (universe/trend_template.csv, then universe/total_market.csv). Each
   universe is written to its OWN worksheet tab in the same Google
   Sheet, and its own set of CSV files (tagged with the universe tag
   so the two runs never overwrite each other). The benchmark is
@@ -110,6 +110,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import gspread
+from sheet_tabs import *  # noqa: F401,F403  (tab names + migrate_tabs)
 from google.oauth2.service_account import Credentials
 
 
@@ -130,15 +131,15 @@ BENCHMARK_FALLBACK = "^NSEI"
 # "code.csv" and "CODE.csv" are different files.
 UNIVERSES = [
     {
-        "file": "universe/core.csv",
-        "label": "Core",
-        "worksheet": "Screener - RS Top50 - Code",
-        "tag": "Code",
+        "file": "universe/trend_template.csv",
+        "label": "Trend Template",
+        "worksheet": TT_TOP50,
+        "tag": "TrendTemplate",
     },
     {
         "file": "universe/total_market.csv",
         "label": "Total Market",
-        "worksheet": "Screener - RS Top50 - Total Market",
+        "worksheet": TM_TOP50,
         "tag": "TotalMarket",
     },
 ]
@@ -1238,6 +1239,7 @@ def write_to_sheet(
 
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
+    migrate_tabs(sh)
 
     timestamp = datetime.now().strftime(
         "%Y-%m-%d %H:%M IST"

@@ -2,16 +2,24 @@
 
 RS (relative-strength) momentum screeners and backtests for NSE stocks. Results go to Google Sheets via GitHub Actions.
 
-## Layout
+## Naming rule
 
-| File | What it does | Sheet tab(s) |
+Every file and Sheet tab starts with the stock list it uses:
+
+| Prefix | Stock list | File |
 |---|---|---|
-| `screener_top10.py` | Live pure-RS Top 10 portfolio. 5 PM run = EOD (updates Portfolio/Holdings); other runs = preview | `RS_Screener`, `Portfolio`, `Holdings`, `Config` |
-| `screener_top50.py` | Top 100 ranking + per-stock RS/price charts for both universes | `Screener - RS Top50 - Code`, `Screener - RS Top50 - Total Market` |
-| `backtest_all.py` | All backtests in one run: s1 RS Top10 + Price TT, s2 RS Top10, s4 RAM Momentum | `Backtest - RS Top10 + Price TT`, `Backtest - RS Top10`, `Backtest - RAM Momentum`, `Backtest - Comparison` |
-| `universe/core.csv` | Core stock list (~180), used by all three scripts | |
-| `universe/total_market.csv` | Full market list (~940), used by the Top 50 screener | |
-| `archive/` | Older standalone versions of s1 and s2 — superseded by `backtest_all.py`, kept for reference | |
+| `tt_` / **Trend Template** | ~180 stocks | `universe/trend_template.csv` |
+| `tm_` / **Total Market** | ~940 stocks | `universe/total_market.csv` |
+
+## Files → Sheet tabs
+
+| Code | Stock list | Sheet tabs |
+|---|---|---|
+| `tt_top10_screener.py` — live pure-RS Top 10 portfolio. 5 PM run = EOD (updates Portfolio/Holdings); other runs = preview | Trend Template | `Trend Template - Top10 Screener` · `- Top10 Portfolio` · `- Top10 Holdings` · `- Top10 Config` |
+| `tt_tm_top50_screener.py` — Top 100 ranking + per-stock RS/price charts | Trend Template **and** Total Market | `Trend Template - Top50` · `Total Market - Top50` |
+| `tt_backtests.py` — all backtests in one run (s1 RS Top10 + Price TT, s2 RS Top10, s4 RAM Momentum) | Trend Template | `Trend Template - Backtest RS Top10 + Price TT` · `- Backtest RS Top10` · `- Backtest RAM Momentum` · `- Backtest Comparison` |
+| `sheet_tabs.py` — all tab names in one place; renames old tabs automatically | | |
+| `archive/` — older standalone versions of s1/s2, superseded by `tt_backtests.py` | | |
 
 ## Workflow: **Run All** (`.github/workflows/run-all.yml`)
 
@@ -25,6 +33,6 @@ Edit `universe/*.csv` (one `symbol` column, NSE symbols without `.NS`). Each run
 
 ## Conventions
 
-- Scripts: `screener_*.py`, `backtest_*.py` (snake_case). One workflow: `run-all.yml`.
+- Code: `<list>_<what>.py`, snake_case. Sheet tabs: `<List> - <What>`, defined only in `sheet_tabs.py`.
 - Secrets: `SHEET_ID`, `GOOGLE_CREDENTIALS`.
 - CSV outputs from each run are downloadable as artifacts on the run page.

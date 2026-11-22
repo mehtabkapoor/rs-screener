@@ -3,7 +3,7 @@ RS Screener  Backtest - THIRD MODEL
 
 RULES
 -----
-Universe        : universe/core.csv
+Universe        : universe/trend_template.csv
 Price filter    : Price > Rs.20
 Liquidity       : 20-day avg volume > 100,000
 Price TT        : 7/7 required
@@ -67,7 +67,7 @@ from datetime import datetime
 BENCHMARK = "^CRSLDX"
 BENCHMARK_FALLBACK = "^NSEI"
 
-STOCKS_FILE = "universe/core.csv"
+STOCKS_FILE = "universe/trend_template.csv"
 
 DOWNLOAD_YEARS_BEFORE_START = 3
 
@@ -220,7 +220,7 @@ def load_tickers():
     if "symbol" not in df.columns:
 
         raise ValueError(
-            "universe/core.csv must contain "
+            "universe/trend_template.csv must contain "
             "a column named 'symbol'."
         )
 

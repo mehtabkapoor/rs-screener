@@ -6,7 +6,7 @@ on:
     - cron: '30 3 * * 1-5'    #  9:00 AM IST  preview
     - cron: '30 6 * * 1-5'    # 12:00 PM IST  preview
     - cron: '30 9 * * 1-5'    #  3:00 PM IST  preview
-    - cron: '30 11 * * 1-5'   #  5:00 PM IST  EOD (must equal EOD_CRON in screener_top10.py)
+    - cron: '30 11 * * 1-5'   #  5:00 PM IST  EOD (must equal EOD_CRON in tt_top10_screener.py)
   workflow_dispatch:
     inputs:
       run:
@@ -37,7 +37,7 @@ env:
 # Jobs run one after another (not in parallel) to stay inside the
 # Google Sheets write quota. A failure in one does not stop the next.
 jobs:
-  top10:
+  tt_top10:
     if: github.event_name == 'schedule' || inputs.run == 'all' || inputs.run == 'top10'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -47,21 +47,21 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - name: Screener - Top 10
+      - name: Trend Template - Top 10 screener
         env:
           FORCE_EOD: ${{ inputs.force_eod || false }}
           SCHEDULE_CRON: ${{ github.event.schedule }}
-        run: python screener_top10.py
+        run: python tt_top10_screener.py
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: top10-output
+          name: tt-top10-output
           path: '*.csv'
           if-no-files-found: ignore
           retention-days: 14
 
-  top50:
-    needs: top10
+  tt_tm_top50:
+    needs: tt_top10
     if: ${{ !cancelled() && (github.event_name == 'schedule' || inputs.run == 'all' || inputs.run == 'top50') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -71,18 +71,18 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - name: Screener - Top 50
-        run: python screener_top50.py
+      - name: Trend Template + Total Market - Top 50 screener
+        run: python tt_tm_top50_screener.py
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: top50-output
+          name: tt-tm-top50-output
           path: '*.csv'
           if-no-files-found: ignore
           retention-days: 14
 
-  backtests:
-    needs: top50
+  tt_backtests:
+    needs: tt_tm_top50
     if: ${{ !cancelled() && (github.event_name == 'schedule' || inputs.run == 'all' || inputs.run == 'backtests') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -92,19 +92,19 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - name: Backtests
+      - name: Trend Template - backtests
         env:
           ONLY: ${{ inputs.only }}
         run: |
           if [ -n "$ONLY" ]; then
-            python backtest_all.py --only $ONLY
+            python tt_backtests.py --only $ONLY
           else
-            python backtest_all.py
+            python tt_backtests.py
           fi
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: backtest-output
+          name: tt-backtests-output
           path: |
             *.csv
             backtest_outputs/
