@@ -1,0 +1,5 @@
+# Run outputs (uploaded as workflow artifacts instead)
+/*.csv
+backtest_outputs/
+__pycache__/
+*.pyc
